@@ -25,6 +25,9 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   long-lived `copilot --acp` process (Agent Client Protocol over stdio). The CLI
   boots once; later turns skip startup entirely (cold ~10s → warm ~2-3s to first
   token). Tool-permission requests are auto-approved (`allow_once`).
+- **Paste images into chat** — paste a screenshot/image into the composer; it
+  stages as a thumbnail and is sent to HAL as an ACP image block (the model sees
+  the actual image). Images route through the ACP lane automatically.
 - **Stop a running turn** — a Stop button (and `session/cancel`) aborts the
   in-flight turn instantly; queued messages are cleared.
 - **Fast chat toggle** — `chat_fast` ON = ACP persistent lane (fast, no MCP);

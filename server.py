@@ -516,12 +516,20 @@ class AcpProc:
         except Exception:
             pass
 
-    def prompt(self, text: str, emit):
+    def prompt(self, text: str, emit, images: list | None = None):
         """Run one turn; translate ACP session/update stream to the SSE contract."""
         if self.dead or not self.session_id:
             emit("error", {"message": "acp session unavailable"})
             emit("done", {"code": 1})
             return
+        blocks: list[dict] = []
+        if text:
+            blocks.append({"type": "text", "text": text})
+        for im in (images or []):
+            blocks.append({"type": "image", "mimeType": im.get("mime", "image/png"),
+                           "data": im.get("data", "")})
+        if not blocks:
+            blocks = [{"type": "text", "text": text}]
         with self._turn_lock:
             q: queue.Queue = queue.Queue()
             with self._event_lock:
@@ -533,8 +541,7 @@ class AcpProc:
             tools: list[str] = []
             try:
                 self._write({"jsonrpc": "2.0", "id": rid, "method": "session/prompt",
-                             "params": {"sessionId": self.session_id,
-                                        "prompt": [{"type": "text", "text": text}]}})
+                             "params": {"sessionId": self.session_id, "prompt": blocks}})
                 while True:
                     try:
                         resp_q.get_nowait()
@@ -603,6 +610,36 @@ def _acp_close(session: str):
         p.close()
 
 
+# --- image attachment store (paste-to-chat) ---------------------------
+# Browser POSTs base64 image data -> we hand back a short id which the SSE
+# GET /api/chat references (query strings can't carry a whole image). Entries
+# are single-use and expire, so nothing lingers in memory.
+_attach_store: dict[str, tuple[str, str, float]] = {}  # id -> (mime, b64data, ts)
+_attach_lock = threading.Lock()
+ATTACH_TTL = 600.0
+ATTACH_MAX_BYTES = 16 * 1024 * 1024  # cap per image (base64 length)
+
+
+def _attach_put(mime: str, data: str) -> str:
+    now = time.time()
+    with _attach_lock:
+        for k in [k for k, v in _attach_store.items() if now - v[2] > ATTACH_TTL]:
+            _attach_store.pop(k, None)
+        aid = base64.urlsafe_b64encode(os.urandom(9)).decode().rstrip("=")
+        _attach_store[aid] = (mime or "image/png", data, now)
+    return aid
+
+
+def _attach_take(ids: list[str]) -> list[dict]:
+    out: list[dict] = []
+    with _attach_lock:
+        for aid in ids:
+            v = _attach_store.pop(aid, None)  # single-use
+            if v is not None:
+                out.append({"mime": v[0], "data": v[1]})
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -639,7 +676,9 @@ class Handler(BaseHTTPRequestHandler):
         prompt = (qs.get("prompt", [""])[0]).strip()
         session = (qs.get("session", ["default"])[0]).strip() or "default"
         model = (qs.get("model", [""])[0]).strip() or None
-        if not prompt:
+        attach_ids = [a for a in (qs.get("attach", [""])[0] or "").split(",") if a]
+        images = _attach_take(attach_ids) if attach_ids else []
+        if not prompt and not images:
             self.send_error(400, "missing prompt")
             return
         self.send_response(200)
@@ -653,7 +692,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         # Fast lane: persistent ACP process per session (warm, later turns skip boot).
-        if load_config().get("chat_fast", True):
+        # Images are only supported over ACP, so force this lane when any are attached.
+        if load_config().get("chat_fast", True) or images:
             emit("start", {"session": session, "acp": True})
             try:
                 acp = _acp_get(session, model)
@@ -662,7 +702,7 @@ class Handler(BaseHTTPRequestHandler):
                 emit("done", {"code": 1})
                 return
             try:
-                acp.prompt(prompt, emit)
+                acp.prompt(prompt, emit, images=images)
             except (BrokenPipeError, ConnectionResetError):
                 acp.cancel()  # browser hung up mid-turn -> stop the agent
             except Exception as exc:
@@ -764,7 +804,17 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
         except json.JSONDecodeError:
             body = {}
-        if p.path == "/api/hive/add":
+        if p.path == "/api/chat/attach":
+            data = (body.get("data") or "").strip()
+            mime = (body.get("mime") or "image/png").strip()
+            if not data:
+                self._json(400, {"error": "data (base64) is required"})
+                return
+            if len(data) > ATTACH_MAX_BYTES:
+                self._json(413, {"error": "image too large"})
+                return
+            self._json(200, {"id": _attach_put(mime, data)})
+        elif p.path == "/api/hive/add":
             tid = (body.get("id") or "").strip()
             prompt = (body.get("prompt") or "").strip()
             if not tid or not prompt:

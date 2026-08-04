@@ -150,6 +150,17 @@
   #send.working { background:var(--tool); }
   .stopbtn { background:var(--bad,#c0392b); border:1px solid var(--line); color:#fff; }
   .stopbtn:hover { filter:brightness(1.15); }
+  /* pasted-image attachment thumbnails */
+  #attstrip { display:flex; flex-wrap:wrap; gap:8px; padding:0 2px; }
+  #attstrip:not(:empty) { margin:6px 0; }
+  .att { position:relative; width:64px; height:64px; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--panel2); }
+  .att img { width:100%; height:100%; object-fit:cover; display:block; }
+  .att .x { position:absolute; top:2px; right:2px; width:16px; height:16px; line-height:15px; text-align:center;
+            background:rgba(0,0,0,.65); color:#fff; border-radius:50%; cursor:pointer; font-size:12px; font-weight:700; }
+  .att .x:hover { background:var(--bad,#c0392b); }
+  /* image thumbnails inside a chat bubble */
+  .msg .atts { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+  .msg .atts img { max-width:180px; max-height:180px; border:1px solid var(--line); border-radius:8px; }
   /* pinned item context banner */
   .ctxbar { align-self:center; display:flex; align-items:center; gap:8px; max-width:820px; margin-bottom:4px;
     padding:7px 12px; border-radius:10px; background:#1b2027; border:1px solid var(--accent); color:var(--txt); font-size:13px; }
@@ -195,7 +206,8 @@
     <div class="sesstrip" id="sesstrip"></div>
     <div id="log"></div>
     <div id="pending"></div>
-    <div class="hint">Enter to send · Shift+Enter for newline · messages sent while HAL is working are queued and sent in order</div>
+    <div id="attstrip"></div>
+    <div class="hint">Enter to send · Shift+Enter for newline · paste an image to attach it · messages sent while HAL is working are queued and sent in order</div>
     <form class="chat" id="f">
       <select id="model" title="Model for this session">
         <option value="">default (opus-4.8)</option>
@@ -418,7 +430,7 @@
   function closeSession(sid) {
     if (es[sid]) { try { es[sid].close(); } catch(e){} delete es[sid]; }
     fetch(`/api/chat/close?session=${encodeURIComponent(sid)}`).catch(()=>{});  // free the ACP process
-    delete state.sessions[sid]; delete busy[sid]; delete finishers[sid];
+    delete state.sessions[sid]; delete busy[sid]; delete finishers[sid]; delete pendingAtt[sid];
     state.order = state.order.filter(x => x !== sid);
     if (!state.order.length) { const s = newSid(); state.sessions[s] = { label:"Session 1", model:"", messages:[] }; state.order=[s]; }
     if (state.active === sid) state.active = state.order[state.order.length-1];
@@ -473,6 +485,11 @@
       d.innerHTML = `<div class="who">${m.role === "user" ? "you" : "hal"}</div><div class="body"></div>`;
       d.querySelector(".body").textContent = m.text || "";
       if (m.streaming) d.querySelector(".body").classList.add("cursor");
+      if (m.atts && m.atts.length) {
+        const a = document.createElement("div"); a.className = "atts";
+        m.atts.forEach(src => { const im = document.createElement("img"); im.src = src; a.appendChild(im); });
+        d.appendChild(a);
+      }
       if (m.tools && m.tools.length) { const t=document.createElement("div"); t.className="tools"; t.textContent="⚙ tools: "+m.tools.join(", "); d.appendChild(t); }
       // copy-to-clipboard on HAL responses (once they have content)
       if (m.role !== "user" && !m.streaming && m.text) {
@@ -500,15 +517,60 @@
   promptEl.addEventListener("keydown",(e)=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();form.requestSubmit();}});
   $("#model").addEventListener("change", () => { cur().model = $("#model").value; save(); });
 
-  const pendingQ = {};  // sid -> [text,...] messages waiting for the current turn to finish
+  const pendingQ = {};  // sid -> [{text, atts},...] messages waiting for the current turn to finish
+  const pendingAtt = {}; // sid -> [{mime, data, dataUrl},...] images pasted into the composer
+
+  // paste an image into the composer -> stage it as an attachment thumbnail
+  promptEl.addEventListener("paste", (e) => {
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    let grabbed = false;
+    for (const it of items) {
+      if (it.kind === "file" && it.type && it.type.startsWith("image/")) {
+        const f = it.getAsFile(); if (!f) continue;
+        grabbed = true;
+        const rd = new FileReader();
+        rd.onload = () => {
+          const durl = String(rd.result); const b64 = durl.split(",")[1] || "";
+          (pendingAtt[state.active] ||= []).push({ mime: f.type, data: b64, dataUrl: durl });
+          renderAtt();
+        };
+        rd.readAsDataURL(f);
+      }
+    }
+    if (grabbed) e.preventDefault();  // don't paste the binary blob as text
+  });
+
+  function renderAtt() {
+    const box = $("#attstrip"); box.innerHTML = "";
+    const a = pendingAtt[state.active] || [];
+    a.forEach((att, i) => {
+      const d = document.createElement("div"); d.className = "att";
+      d.innerHTML = `<img src="${att.dataUrl}" alt="attachment"/><span class="x" title="Remove">×</span>`;
+      d.querySelector(".x").onclick = () => { (pendingAtt[state.active]||[]).splice(i,1); renderAtt(); };
+      box.appendChild(d);
+    });
+  }
+
+  // upload staged images, return their server-side attachment ids
+  async function uploadAtts(atts) {
+    const ids = [];
+    for (const a of (atts || [])) {
+      try {
+        const r = await fetch("/api/chat/attach", { method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({ mime:a.mime, data:a.data }) });
+        const j = await r.json(); if (j.id) ids.push(j.id);
+      } catch(e) {}
+    }
+    return ids;
+  }
 
   function renderPending() {
     const box = $("#pending"); box.innerHTML = "";
     const q = pendingQ[state.active] || [];
-    q.forEach((text, i) => {
+    q.forEach((item, i) => {
       const d = document.createElement("div"); d.className = "pend";
       d.innerHTML = `<span class="tag">queued</span><span class="txt"></span><span class="cancel" title="Remove">×</span>`;
-      d.querySelector(".txt").textContent = text;
+      d.querySelector(".txt").textContent = (item.text || "") + (item.atts && item.atts.length ? `  📎${item.atts.length}` : "");
       d.querySelector(".cancel").onclick = () => { (pendingQ[state.active]||[]).splice(i,1); renderPending(); };
       box.appendChild(d);
     });
@@ -516,11 +578,14 @@
     $("#send").classList.toggle("working", busyNow);
     $("#send").textContent = busyNow ? (q.length ? "Queued" : "Working…") : "Send";
     $("#stop").style.display = busyNow ? "" : "none";
+    renderAtt();  // keep the attachment strip in sync with the active session
   }
 
-  function startTurn(sid, text) {
+  async function startTurn(sid, text, atts) {
     const s = state.sessions[sid];
-    s.messages.push({ role:"user", text });
+    const userMsg = { role:"user", text };
+    if (atts && atts.length) userMsg.atts = atts.map(a => a.dataUrl);  // thumbnails in transcript
+    s.messages.push(userMsg);
     const bot = { role:"bot", text:"", tools:[], streaming:true };
     s.messages.push(bot);
     // on the first turn of a context-pinned session, silently prepend the item context for the CLI
@@ -528,14 +593,16 @@
     if (s.ctx && s.ctx.preamble && !s.ctxSent) { sendText = s.ctx.preamble + text; s.ctxSent = true; }
     busy[sid] = true; save(); renderStrip(); if (sid===state.active) { renderLog(); renderPending(); }
 
-    const url = `/api/chat?session=${encodeURIComponent(sid)}&model=${encodeURIComponent(s.model||"")}&prompt=${encodeURIComponent(sendText)}`;
+    const ids = await uploadAtts(atts);  // stage images server-side, reference by id
+    let url = `/api/chat?session=${encodeURIComponent(sid)}&model=${encodeURIComponent(s.model||"")}&prompt=${encodeURIComponent(sendText)}`;
+    if (ids.length) url += `&attach=${encodeURIComponent(ids.join(","))}`;
     const source = new EventSource(url); es[sid] = source;
     const finish = () => {
       bot.streaming = false; busy[sid] = false; delete finishers[sid];
       try { source.close(); } catch(e){} delete es[sid];
       save(); renderStrip();
       const q = pendingQ[sid];
-      if (q && q.length) { const next = q.shift(); startTurn(sid, next); }  // drain next queued message
+      if (q && q.length) { const next = q.shift(); startTurn(sid, next.text, next.atts); }  // drain next queued message
       else if (sid===state.active) { renderLog(); renderPending(); }
     };
     finishers[sid] = finish;
@@ -561,11 +628,13 @@
   form.addEventListener("submit",(e)=>{
     e.preventDefault();
     const sid = state.active; const text = promptEl.value.trim();
-    if (!text) return;
+    const atts = (pendingAtt[sid] || []).slice();
+    if (!text && !atts.length) return;
     promptEl.value = ""; promptEl.style.height = "auto";
+    pendingAtt[sid] = []; renderAtt();
     // if a turn is already running for this session, queue the message and send it when free
-    if (busy[sid]) { (pendingQ[sid] ||= []).push(text); renderPending(); return; }
-    startTurn(sid, text);
+    if (busy[sid]) { (pendingQ[sid] ||= []).push({ text, atts }); renderPending(); return; }
+    startTurn(sid, text, atts);
   });
 
   // top-level view tabs
