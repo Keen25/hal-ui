@@ -25,6 +25,11 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   long-lived `copilot --acp` process (Agent Client Protocol over stdio). The CLI
   boots once; later turns skip startup entirely (cold ~10s → warm ~2-3s to first
   token). Tool-permission requests are auto-approved (`allow_once`).
+- **Rich markdown rendering** — HAL responses render as formatted HTML (GitHub
+  tables, headings, bold/italic, inline + fenced code, lists, blockquotes, links)
+  via a small zero-dependency, XSS-safe renderer. The copy button puts **rich
+  HTML** on the clipboard (`text/html` + `text/plain`), so tables and formatting
+  survive a paste into Teams, ADO, or email.
 - **Paste images into chat** — paste a screenshot/image into the composer; it
   stages as a thumbnail and is sent to HAL as an ACP image block (the model sees
   the actual image). Images route through the ACP lane automatically.

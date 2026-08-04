@@ -54,6 +54,25 @@
   .msg.bot { align-self:flex-start; background:var(--panel); }
   .msg .who { font-size:11px; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.6px; }
   .msg.bot .who { color:var(--accent2); }
+  /* rendered markdown inside HAL bubbles */
+  .body.md { white-space:normal; }
+  .body.md > :first-child { margin-top:0; }
+  .body.md > :last-child { margin-bottom:0; }
+  .body.md p { margin:8px 0; }
+  .body.md h1,.body.md h2,.body.md h3,.body.md h4 { margin:12px 0 6px; line-height:1.25; }
+  .body.md h1 { font-size:1.35em; } .body.md h2 { font-size:1.2em; } .body.md h3 { font-size:1.08em; }
+  .body.md ul,.body.md ol { margin:6px 0; padding-left:22px; }
+  .body.md li { margin:2px 0; }
+  .body.md a { color:var(--accent); }
+  .body.md code { background:var(--panel2); border:1px solid var(--line); border-radius:5px; padding:1px 5px; font-size:.92em; }
+  .body.md pre { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:10px 12px; overflow-x:auto; margin:8px 0; }
+  .body.md pre code { background:none; border:none; padding:0; }
+  .body.md blockquote { border-left:3px solid var(--line); margin:8px 0; padding:2px 12px; color:var(--muted); }
+  .body.md hr { border:none; border-top:1px solid var(--line); margin:12px 0; }
+  .body.md table.md { border-collapse:collapse; margin:8px 0; font-size:.94em; display:block; overflow-x:auto; max-width:100%; }
+  .body.md table.md th,.body.md table.md td { border:1px solid var(--line); padding:5px 10px; text-align:left; }
+  .body.md table.md thead th { background:var(--panel2); font-weight:700; }
+  .body.md table.md tbody tr:nth-child(even) { background:rgba(255,255,255,.02); }
   .tools { font-size:12px; color:var(--tool); margin-top:6px; }
   .status { align-self:center; color:var(--muted); font-size:12px; font-style:italic; }
   .copybtn { position:absolute; top:8px; right:8px; padding:2px 8px; font-size:11px; font-weight:600;
@@ -380,6 +399,87 @@
     if (btn) { const old = btn.textContent; btn.textContent = ok ? "copied ✓" : "copy failed";
       btn.classList.toggle("ok", ok); setTimeout(() => { btn.textContent = old; btn.classList.remove("ok"); }, 1400); }
   }
+
+  // --- minimal, safe markdown -> HTML (zero deps) ---------------------
+  // Renders headings, bold/italic/strike, inline+fenced code, links, blockquotes,
+  // ordered/unordered lists, horizontal rules, and GitHub-style tables.
+  function mdInline(t) {
+    t = esc(t);
+    t = t.replace(/`([^`]+)`/g, (m, c) => `<code>${c}</code>`);
+    t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    t = t.replace(/(^|[^*_])[*_]([^*_\n]+)[*_](?![*_])/g, "$1<em>$2</em>");
+    t = t.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+    t = t.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return t;
+  }
+  function mdSplitRow(line) {
+    let s = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+    return s.split("|").map(c => c.trim());
+  }
+  function mdToHtml(src) {
+    const lines = String(src || "").replace(/\r\n?/g, "\n").split("\n");
+    const out = []; let i = 0;
+    const isSep = (l) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l) && l.includes("-");
+    while (i < lines.length) {
+      const line = lines[i];
+      if (/^\s*```/.test(line)) {                    // fenced code block
+        i++; const buf = [];
+        while (i < lines.length && !/^\s*```/.test(lines[i])) { buf.push(lines[i]); i++; }
+        i++; out.push(`<pre><code>${esc(buf.join("\n"))}</code></pre>`); continue;
+      }
+      if (line.includes("|") && i + 1 < lines.length && isSep(lines[i + 1])) {  // table
+        const heads = mdSplitRow(line);
+        const aligns = mdSplitRow(lines[i + 1]).map(c => c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : "");
+        i += 2; const rows = [];
+        while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") { rows.push(mdSplitRow(lines[i])); i++; }
+        const th = heads.map((h, k) => `<th${aligns[k] ? ` style="text-align:${aligns[k]}"` : ""}>${mdInline(h)}</th>`).join("");
+        const trs = rows.map(r => "<tr>" + heads.map((_, k) => `<td${aligns[k] ? ` style="text-align:${aligns[k]}"` : ""}>${mdInline(r[k] || "")}</td>`).join("") + "</tr>").join("");
+        out.push(`<table class="md"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>`); continue;
+      }
+      let m;
+      if ((m = line.match(/^(#{1,6})\s+(.*)$/))) { out.push(`<h${m[1].length}>${mdInline(m[2])}</h${m[1].length}>`); i++; continue; }
+      if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(line)) { out.push("<hr>"); i++; continue; }
+      if (/^\s*>/.test(line)) {                       // blockquote
+        const buf = [];
+        while (i < lines.length && /^\s*>/.test(lines[i])) { buf.push(lines[i].replace(/^\s*>\s?/, "")); i++; }
+        out.push(`<blockquote>${mdInline(buf.join("\n")).replace(/\n/g, "<br>")}</blockquote>`); continue;
+      }
+      if (/^\s*[-*+]\s+/.test(line)) {                // unordered list
+        const buf = [];
+        while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) { buf.push(`<li>${mdInline(lines[i].replace(/^\s*[-*+]\s+/, ""))}</li>`); i++; }
+        out.push(`<ul>${buf.join("")}</ul>`); continue;
+      }
+      if (/^\s*\d+\.\s+/.test(line)) {                // ordered list
+        const buf = [];
+        while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) { buf.push(`<li>${mdInline(lines[i].replace(/^\s*\d+\.\s+/, ""))}</li>`); i++; }
+        out.push(`<ol>${buf.join("")}</ol>`); continue;
+      }
+      if (line.trim() === "") { i++; continue; }      // blank
+      const buf = [];                                 // paragraph
+      while (i < lines.length && lines[i].trim() !== "" && !/^\s*(```|#{1,6}\s|>|[-*+]\s|\d+\.\s|---+\s*$)/.test(lines[i]) &&
+             !(lines[i].includes("|") && i + 1 < lines.length && isSep(lines[i + 1]))) { buf.push(lines[i]); i++; }
+      out.push(`<p>${mdInline(buf.join("\n")).replace(/\n/g, "<br>")}</p>`);
+    }
+    return out.join("\n");
+  }
+
+  // copy a HAL response as rich HTML (tables/formatting survive paste), plain-text fallback
+  async function copyRich(md, btn) {
+    let ok = false;
+    const html = `<meta charset="utf-8">` + mdToHtml(md);
+    try {
+      if (navigator.clipboard && window.ClipboardItem && window.isSecureContext) {
+        await navigator.clipboard.write([new window.ClipboardItem({
+          "text/html": new Blob([html], { type: "text/html" }),
+          "text/plain": new Blob([md], { type: "text/plain" }),
+        })]);
+        ok = true;
+      }
+    } catch (e) {}
+    if (!ok) { try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(md); ok = true; } } catch (e) {} }
+    if (btn) { const old = btn.textContent; btn.textContent = ok ? "copied ✓" : "copy failed";
+      btn.classList.toggle("ok", ok); setTimeout(() => { btn.textContent = old; btn.classList.remove("ok"); }, 1400); }
+  }
   // action cell that opens the item as a fresh HAL session with pinned context
   // ctx = { banner, preamble, url }
   const chatCell = (label, ctx) => `<td><span class="tochat" title="Open as a new HAL session" data-open="${b64({label, ctx})}">💬 session</span></td>`;
@@ -483,19 +583,21 @@
       const d = document.createElement("div");
       d.className = "msg " + (m.role === "user" ? "user" : "bot") + (m.streaming ? " " : "");
       d.innerHTML = `<div class="who">${m.role === "user" ? "you" : "hal"}</div><div class="body"></div>`;
-      d.querySelector(".body").textContent = m.text || "";
-      if (m.streaming) d.querySelector(".body").classList.add("cursor");
+      const body = d.querySelector(".body");
+      if (m.role !== "user" && !m.streaming && m.text) { body.innerHTML = mdToHtml(m.text); body.classList.add("md"); }  // render HAL markdown
+      else body.textContent = m.text || "";
+      if (m.streaming) body.classList.add("cursor");
       if (m.atts && m.atts.length) {
         const a = document.createElement("div"); a.className = "atts";
         m.atts.forEach(src => { const im = document.createElement("img"); im.src = src; a.appendChild(im); });
         d.appendChild(a);
       }
       if (m.tools && m.tools.length) { const t=document.createElement("div"); t.className="tools"; t.textContent="⚙ tools: "+m.tools.join(", "); d.appendChild(t); }
-      // copy-to-clipboard on HAL responses (once they have content)
+      // copy-to-clipboard on HAL responses (once they have content) — rich HTML so tables survive
       if (m.role !== "user" && !m.streaming && m.text) {
         const cp = document.createElement("button"); cp.className = "copybtn"; cp.type = "button";
-        cp.textContent = "copy"; cp.title = "Copy response to clipboard";
-        cp.onclick = () => copyText(m.text, cp);
+        cp.textContent = "copy"; cp.title = "Copy formatted response (tables/markdown) to clipboard";
+        cp.onclick = () => copyRich(m.text, cp);
         d.appendChild(cp);
       }
       log.appendChild(d);
