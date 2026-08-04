@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>HAL-UI · Copilot control plane</title>
+<style>
+  :root {
+    --bg:#0b0d10; --panel:#14181d; --panel2:#1b2027; --line:#262d36;
+    --txt:#e6e9ee; --muted:#8b97a6; --accent:#ff3b30; --accent2:#ff6a45;
+    --user:#1f6feb; --tool:#b48a00; --ok:#2ea043; --warn:#d29922; --bad:#f85149;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+    font:14px/1.5 -apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif; display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px;
+    background:var(--panel); border-bottom:1px solid var(--line); }
+  .eye { width:22px; height:22px; border-radius:50%;
+    background:radial-gradient(circle at 50% 50%,var(--accent2) 0 30%,var(--accent) 31% 60%,#300 61% 100%);
+    box-shadow:0 0 12px var(--accent); }
+  header h1 { font-size:15px; font-weight:600; margin:0; letter-spacing:.3px; }
+  header .sub { color:var(--muted); font-size:12px; }
+  .tabs { margin-left:auto; display:flex; gap:4px; }
+  .tab { padding:6px 14px; border-radius:8px; cursor:pointer; color:var(--muted);
+    border:1px solid transparent; user-select:none; }
+  .tab.active { color:var(--txt); background:var(--panel2); border-color:var(--line); }
+  main { flex:1; min-height:0; display:flex; }
+  .view { flex:1; min-height:0; display:none; flex-direction:column; }
+  .view.active { display:flex; }
+
+  /* session tab strip */
+  .sesstrip { display:flex; align-items:center; gap:6px; padding:6px 10px; background:var(--panel);
+    border-bottom:1px solid var(--line); overflow-x:auto; }
+  .stab { display:flex; align-items:center; gap:8px; padding:5px 10px; border-radius:8px; cursor:pointer;
+    border:1px solid var(--line); background:var(--panel2); color:var(--muted); white-space:nowrap; }
+  .stab.active { color:var(--txt); border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .stab .lbl { font-size:13px; }
+  .stab .live { width:7px; height:7px; border-radius:50%; background:var(--accent2); box-shadow:0 0 6px var(--accent2);
+    animation:pulse 1s infinite; display:none; }
+  .stab.streaming .live { display:inline-block; }
+  @keyframes pulse { 50% { opacity:.3; } }
+  .stab .x { color:var(--muted); font-weight:700; padding:0 2px; border-radius:4px; }
+  .stab .x:hover { color:#fff; background:var(--bad); }
+  .newsess { padding:5px 12px; border-radius:8px; border:1px dashed var(--line); background:transparent;
+    color:var(--muted); cursor:pointer; font-weight:700; }
+  .newsess:hover { color:var(--txt); border-color:var(--accent); }
+
+  /* chat */
+  #log { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:14px; }
+  .msg { max-width:820px; padding:12px 14px; border-radius:12px; white-space:pre-wrap;
+    word-wrap:break-word; border:1px solid var(--line); position:relative; }
+  .msg.user { align-self:flex-end; background:#12233f; border-color:#1f6feb55; }
+  .msg.bot { align-self:flex-start; background:var(--panel); }
+  .msg .who { font-size:11px; color:var(--muted); margin-bottom:4px; text-transform:uppercase; letter-spacing:.6px; }
+  .msg.bot .who { color:var(--accent2); }
+  .tools { font-size:12px; color:var(--tool); margin-top:6px; }
+  .status { align-self:center; color:var(--muted); font-size:12px; font-style:italic; }
+  .copybtn { position:absolute; top:8px; right:8px; padding:2px 8px; font-size:11px; font-weight:600;
+    background:var(--panel2); color:var(--muted); border:1px solid var(--line); border-radius:7px; cursor:pointer;
+    opacity:0; transition:opacity .12s; }
+  .msg.bot:hover .copybtn { opacity:1; }
+  .copybtn:hover { color:var(--txt); border-color:var(--accent); }
+  .copybtn.ok { color:#7ee787; border-color:#2ea04355; opacity:1; }
+  .cursor::after { content:"▋"; color:var(--accent); animation:blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity:0; } }
+  form.chat { display:flex; gap:10px; padding:14px 16px; border-top:1px solid var(--line); background:var(--panel); }
+  #prompt { flex:1; resize:none; background:var(--panel2); color:var(--txt);
+    border:1px solid var(--line); border-radius:10px; padding:10px 12px; font:inherit; max-height:160px; }
+  #prompt:focus { outline:none; border-color:var(--accent); }
+  button { background:var(--accent); color:#fff; border:0; border-radius:10px;
+    padding:8px 18px; font-weight:600; cursor:pointer; }
+  button.ghost { background:var(--panel2); border:1px solid var(--line); color:var(--txt); }
+  button:disabled { opacity:.5; cursor:default; }
+  select,input,textarea { background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:10px; padding:8px 10px; font:inherit; }
+  select:focus,input:focus,textarea:focus { outline:none; border-color:var(--accent); }
+  .hint { color:var(--muted); font-size:12px; padding:4px 16px; }
+
+  /* dashboards */
+  .scroll { flex:1; overflow-y:auto; padding:18px; }
+  .cards { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px 16px; min-width:120px; }
+  .card .n { font-size:22px; font-weight:700; }
+  .card .k { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+  h3 { font-size:13px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); margin:18px 0 8px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  td.title { max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; border:1px solid var(--line); }
+  .s-running,.s-claimed { color:#7ee787; border-color:#2ea04355; }
+  .s-queued,.s-pending { color:#79c0ff; border-color:#1f6feb55; }
+  .s-merged,.s-reviewed { color:#a5d6ff; border-color:#388bfd55; }
+  .s-failed,.s-dead,.s-error { color:var(--bad); border-color:#f8514955; }
+  .s-cancelled { color:var(--muted); }
+  .s-needs_attention { color:var(--warn); border-color:#d2992255; }
+  .r-author { color:#a5d6ff; border-color:#388bfd55; }
+  .r-reviewer { color:#d2a8ff; border-color:#a371f755; }
+  .r-both { color:#7ee787; border-color:#2ea04355; }
+  .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
+  .dot.on { background:var(--ok); box-shadow:0 0 6px var(--ok); }
+  .dot.off { background:#555; }
+  .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+  .grow { flex:1; }
+  .addform { display:grid; grid-template-columns:160px 1fr; gap:10px; background:var(--panel); border:1px solid var(--line);
+    border-radius:12px; padding:16px; max-width:760px; }
+  .addform textarea { grid-column:1/3; min-height:90px; resize:vertical; }
+  .addform .row2 { grid-column:1/3; display:flex; gap:10px; align-items:center; }
+  .muted { color:var(--muted); }
+  a { color:#79c0ff; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .msgbox { padding:8px 12px; border-radius:8px; margin-top:8px; font-size:13px; }
+  .msgbox.ok { background:#12261a; color:#7ee787; border:1px solid #2ea04355; }
+  .msgbox.err { background:#2a1416; color:#ffa198; border:1px solid #f8514955; }
+
+  /* overlay for drawer + modal */
+  .overlay { position:fixed; inset:0; background:#0008; backdrop-filter:blur(1px); z-index:40; display:none; }
+  .overlay.open { display:block; }
+
+  /* right-side task drawer */
+  .drawer { position:fixed; top:0; right:0; height:100%; width:min(560px,92vw); z-index:50;
+    background:var(--panel); border-left:1px solid var(--line); box-shadow:-8px 0 30px #000a;
+    transform:translateX(100%); transition:transform .18s ease; display:flex; flex-direction:column; }
+  .drawer.open { transform:translateX(0); }
+  .drawer .dhead { display:flex; align-items:center; gap:10px; padding:14px 16px; border-bottom:1px solid var(--line); }
+  .drawer .dhead code { font-size:13px; }
+  .drawer .dbody { flex:1; overflow-y:auto; padding:16px; }
+  .drawer .x { margin-left:auto; cursor:pointer; color:var(--muted); font-size:18px; font-weight:700; padding:0 6px; }
+  .drawer .x:hover { color:#fff; }
+  .kv { display:grid; grid-template-columns:130px 1fr; gap:4px 12px; font-size:13px; margin-bottom:14px; }
+  .kv .k { color:var(--muted); }
+  .kv .v { word-break:break-word; }
+  .logtail { background:#0a0c0f; border:1px solid var(--line); border-radius:8px; padding:10px 12px;
+    font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; word-break:break-word;
+    max-height:46vh; overflow:auto; color:#c9d3df; }
+  tr.click { cursor:pointer; }
+  tr.click:hover td { background:var(--panel2); }
+  .tochat { cursor:pointer; user-select:none; color:var(--accent2); border:1px solid var(--line);
+    border-radius:7px; padding:2px 8px; font-size:12px; white-space:nowrap; }
+  .tochat:hover { border-color:var(--accent); color:#fff; background:var(--accent); }
+  /* queued (pending) outgoing messages */
+  #pending { display:flex; flex-direction:column; gap:6px; padding:0 16px; }
+  #pending:empty { display:none; }
+  .pend { align-self:flex-end; max-width:820px; display:flex; align-items:center; gap:8px; padding:7px 12px;
+    border-radius:10px; background:#12233f88; border:1px dashed #1f6feb88; color:var(--muted); font-size:13px; }
+  .pend .tag { font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:#79c0ff; }
+  .pend .txt { white-space:pre-wrap; word-break:break-word; color:var(--txt); opacity:.85; }
+  .pend .cancel { cursor:pointer; color:var(--muted); font-weight:700; padding:0 4px; }
+  .pend .cancel:hover { color:#fff; background:var(--bad); border-radius:4px; }
+  #send.working { background:var(--tool); }
+  /* pinned item context banner */
+  .ctxbar { align-self:center; display:flex; align-items:center; gap:8px; max-width:820px; margin-bottom:4px;
+    padding:7px 12px; border-radius:10px; background:#1b2027; border:1px solid var(--accent); color:var(--txt); font-size:13px; }
+  .ctxbar .pin { filter:grayscale(.2); }
+  .ctxbar .ctxt { white-space:pre-wrap; }
+  .ctxbar .ctxopen { margin-left:2px; }
+  .ctxbar .ctxx { cursor:pointer; color:var(--muted); font-weight:700; padding:0 4px; }
+  .ctxbar .ctxx:hover { color:#fff; background:var(--bad); border-radius:4px; }
+
+  /* centered modal (send to hive) */
+  .modal { position:fixed; z-index:50; top:50%; left:50%; transform:translate(-50%,-50%);
+    width:min(680px,94vw); background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    box-shadow:0 20px 60px #000b; display:none; flex-direction:column; }
+  .modal.open { display:flex; }
+  .modal .mhead { display:flex; align-items:center; padding:14px 16px; border-bottom:1px solid var(--line); font-weight:600; }
+  .modal .mhead .x { margin-left:auto; cursor:pointer; color:var(--muted); font-weight:700; font-size:18px; padding:0 6px; }
+  .modal .mhead .x:hover { color:#fff; }
+  .modal .mbody { padding:16px; display:grid; grid-template-columns:150px 1fr; gap:10px; }
+  .modal .mbody textarea { grid-column:1/3; min-height:110px; resize:vertical; }
+  .modal .mbody .lbl { color:var(--muted); align-self:center; font-size:13px; }
+  .modal .mrow { grid-column:1/3; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .modal .mrow .grow { flex:1; }
+</style>
+</head>
+<body>
+<header>
+  <div class="eye" title="I'm afraid I can't let you freeze that, Dave."></div>
+  <div>
+    <h1>HAL-UI</h1>
+    <div class="sub">Copilot control plane · Phase 2</div>
+  </div>
+  <div class="tabs">
+    <div class="tab active" data-view="chat">Chat</div>
+    <div class="tab" data-view="hive">Hive</div>
+    <div class="tab" data-view="github">GitHub</div>
+    <div class="tab" data-view="ado">ADO</div>
+    <div class="tab" data-view="settings">⚙</div>
+  </div>
+</header>
+<main>
+  <!-- CHAT -->
+  <section class="view active" id="view-chat">
+    <div class="sesstrip" id="sesstrip"></div>
+    <div id="log"></div>
+    <div id="pending"></div>
+    <div class="hint">Enter to send · Shift+Enter for newline · messages sent while HAL is working are queued and sent in order</div>
+    <form class="chat" id="f">
+      <select id="model" title="Model for this session">
+        <option value="">default (opus-4.8)</option>
+        <option value="claude-sonnet-4.5">sonnet-4.5</option>
+        <option value="gpt-5.4">gpt-5.4</option>
+      </select>
+      <textarea id="prompt" rows="1" placeholder="Message HAL…" autofocus></textarea>
+      <button id="tohive" type="button" class="ghost" title="Queue this session's work as a hive task">→ Hive</button>
+      <button id="send" type="submit">Send</button>
+    </form>
+  </section>
+
+  <!-- HIVE -->
+  <section class="view" id="view-hive">
+    <div class="scroll">
+      <div class="toolbar">
+        <strong>Fleet</strong>
+        <span class="muted" id="hive-updated">—</span>
+        <span class="grow"></span>
+        <label class="muted"><input type="checkbox" id="autopoll" checked style="width:auto;padding:0"> auto-refresh</label>
+        <button class="ghost" id="hive-refresh" type="button">Refresh</button>
+      </div>
+      <div class="cards" id="hive-cards"></div>
+
+      <h3>Workers</h3>
+      <table id="workers"><thead><tr>
+        <th>Host</th><th>Lane</th><th>Status</th><th>Current task</th><th>Last seen</th><th>Caps</th>
+      </tr></thead><tbody></tbody></table>
+
+      <h3>Queue <span class="muted" id="q-count"></span></h3>
+      <div class="toolbar">
+        <input id="q-filter" placeholder="filter title / id / status…" style="min-width:260px">
+        <select id="q-status">
+          <option value="active">active only</option>
+          <option value="">all statuses</option>
+          <option value="running">running</option>
+          <option value="queued">queued</option>
+          <option value="needs_attention">needs_attention</option>
+          <option value="failed">failed</option>
+          <option value="merged">merged</option>
+        </select>
+      </div>
+      <table id="tasks"><thead><tr>
+        <th>ID</th><th>Title</th><th>Status</th><th>Kind</th><th>Prio</th><th>Worker</th><th>Model</th><th>Created</th>
+      </tr></thead><tbody></tbody></table>
+
+      <h3>Add task</h3>
+      <form class="addform" id="addf">
+        <input id="a-id" placeholder="task id (e.g. task-foo)" />
+        <input id="a-title" placeholder="short title (optional)" />
+        <textarea id="a-prompt" placeholder="Prompt for the worker…"></textarea>
+        <div class="row2">
+          <label class="muted">complexity</label>
+          <select id="a-complexity"><option value="">auto</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+          <label class="muted">priority</label>
+          <input id="a-priority" type="number" value="5" style="width:70px" />
+          <label class="muted">requires</label>
+          <input id="a-requires" placeholder="e.g. os:windows" style="width:160px" />
+          <span class="grow"></span>
+          <button type="submit">Queue task</button>
+        </div>
+        <div id="add-msg"></div>
+      </form>
+    </div>
+  </section>
+
+  <!-- GITHUB -->
+  <section class="view" id="view-github">
+    <div class="scroll">
+      <div class="toolbar"><strong>My Work</strong><span class="muted" id="gh-updated">—</span>
+        <span class="grow"></span><button class="ghost" id="gh-refresh" type="button">Refresh</button></div>
+      <h3>Open pull requests</h3>
+      <table id="prs"><thead><tr><th>Repo</th><th>#</th><th>Title</th><th>Updated</th><th></th></tr></thead><tbody></tbody></table>
+      <h3>Assigned issues</h3>
+      <table id="issues"><thead><tr><th>Repo</th><th>#</th><th>Title</th><th>Updated</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- ADO -->
+  <section class="view" id="view-ado">
+    <div class="scroll">
+      <div class="toolbar"><strong>Azure DevOps</strong><span class="muted" id="ado-updated">—</span>
+        <span class="grow"></span><button class="ghost" id="ado-refresh" type="button">Refresh</button></div>
+      <div id="ado-err"></div>
+      <h3>My active pull requests <span class="muted" id="adopr-count"></span></h3>
+      <table id="adoprs"><thead><tr><th>ID</th><th>Role</th><th>Project / Repo</th><th>Title</th><th>Created</th><th></th></tr></thead><tbody></tbody></table>
+      <h3>Assigned work items <span class="muted" id="wi-count"></span></h3>
+      <table id="workitems"><thead><tr><th>ID</th><th>Type</th><th>State</th><th>Project</th><th>Title</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section class="view" id="view-settings">
+    <div class="scroll">
+      <div class="toolbar"><strong>Settings</strong><span class="muted">stored server-side at ~/.config/hal-ui/config.json (0600)</span></div>
+      <form class="addform" id="setf" style="max-width:640px">
+        <label class="muted">ADO org URL</label>
+        <input id="s-ado_org" placeholder="https://dev.azure.com/1id" />
+        <label class="muted">ADO PAT</label>
+        <input id="s-ado_pat" type="password" placeholder="blank = use az login (leave blank to keep)" />
+        <label class="muted">ADO UPN</label>
+        <input id="s-ado_upn" placeholder="blank = az account user (for identity lookup)" />
+        <label class="muted">Hive URL</label>
+        <input id="s-hive_url" placeholder="http://127.0.0.1:5001" />
+        <label class="muted">Hive token</label>
+        <input id="s-hive_token" type="password" placeholder="blank = ~/.hive/worker.token (leave blank to keep)" />
+        <label class="muted">Default model</label>
+        <select id="s-default_model"><option value="">default (opus-4.8)</option><option value="claude-sonnet-4.5">sonnet-4.5</option><option value="gpt-5.4">gpt-5.4</option></select>
+        <label class="muted">Fast chat</label>
+        <label class="row2" style="gap:8px;cursor:pointer"><input id="s-chat_fast" type="checkbox" style="width:auto" /> <span class="muted">Disable MCP servers in chat for faster startup (~5-7s/msg). Turn off if you need MCP tools mid-chat.</span></label>
+        <div class="row2"><span class="grow"></span><button type="submit">Save settings</button></div>
+        <div id="set-msg"></div>
+      </form>
+    </div>
+  </section>
+</main>
+
+<!-- task-detail / logs drawer -->
+<div class="overlay" id="drawer-ov"></div>
+<aside class="drawer" id="task-drawer">
+  <div class="dhead">
+    <span>Task <code id="td-id">—</code></span>
+    <span class="pill" id="td-status">—</span>
+    <button class="ghost" id="td-refresh" type="button">Refresh</button>
+    <span class="x" id="td-close" title="Close">✕</span>
+  </div>
+  <div class="dbody">
+    <div class="kv" id="td-kv"></div>
+    <h3>Log tail</h3>
+    <pre class="logtail" id="td-log">—</pre>
+  </div>
+</aside>
+
+<!-- send-this-chat-to-hive modal -->
+<div class="overlay" id="hive-ov"></div>
+<div class="modal" id="hive-modal">
+  <div class="mhead">Send to hive <span class="x" id="hm-close" title="Close">✕</span></div>
+  <form class="mbody" id="hm-form">
+    <span class="lbl">Task id</span><input id="hm-id" />
+    <span class="lbl">Title</span><input id="hm-title" placeholder="short summary" />
+    <span class="lbl">Prompt</span>
+    <textarea id="hm-prompt" placeholder="what the worker should do…"></textarea>
+    <div class="mrow">
+      <label class="lbl">Priority</label><input id="hm-priority" type="number" value="5" style="width:80px" />
+      <label class="lbl">Complexity</label>
+      <select id="hm-complexity"><option value="">auto</option><option>trivial</option><option>simple</option><option>medium</option><option>complex</option></select>
+      <label class="lbl">Model</label>
+      <select id="hm-model"><option value="">default</option><option value="claude-sonnet-4.5">sonnet-4.5</option><option value="gpt-5.4">gpt-5.4</option></select>
+    </div>
+    <div class="mrow"><span class="grow"></span><button type="button" class="ghost" id="hm-cancel">Cancel</button><button type="submit">Queue task</button></div>
+    <div class="mrow"><div id="hm-msg"></div></div>
+  </form>
+</div>
+
+<script>
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])));
+  const ago = (iso) => { if (!iso) return "—"; const t = new Date(iso.replace(" ","T")); const s=(Date.now()-t.getTime())/1000; if(isNaN(s))return iso; if(s<60)return Math.round(s)+"s"; if(s<3600)return Math.round(s/60)+"m"; if(s<86400)return Math.round(s/3600)+"h"; return Math.round(s/86400)+"d"; };
+  const b64 = (o) => btoa(unescape(encodeURIComponent(JSON.stringify(o))));
+  const unb64 = (s) => JSON.parse(decodeURIComponent(escape(atob(s))));
+  // copy text to clipboard with a graceful fallback + button feedback
+  async function copyText(text, btn) {
+    let ok = false;
+    try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); ok = true; } } catch (e) {}
+    if (!ok) {
+      try { const ta = document.createElement("textarea"); ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+        document.body.appendChild(ta); ta.focus(); ta.select(); ok = document.execCommand("copy"); document.body.removeChild(ta); } catch (e) {}
+    }
+    if (btn) { const old = btn.textContent; btn.textContent = ok ? "copied ✓" : "copy failed";
+      btn.classList.toggle("ok", ok); setTimeout(() => { btn.textContent = old; btn.classList.remove("ok"); }, 1400); }
+  }
+  // action cell that opens the item as a fresh HAL session with pinned context
+  // ctx = { banner, preamble, url }
+  const chatCell = (label, ctx) => `<td><span class="tochat" title="Open as a new HAL session" data-open="${b64({label, ctx})}">💬 session</span></td>`;
+  // delegated: click any .tochat -> new context-pinned session
+  document.addEventListener("click", (e) => {
+    const el = e.target.closest(".tochat"); if (!el) return;
+    const m = unb64(el.dataset.open); openInSession(m.label, m.ctx);
+  });
+
+  /* ================= SESSION MANAGER ================= */
+  // Persisted state: { order:[sid...], active:sid, sessions:{ sid:{label,model,messages:[{role,text,tools}]} } }
+  const LS_KEY = "hal-ui-sessions-v1";
+  const newSid = () => "hal-ui-" + Math.random().toString(36).slice(2, 10);
+  let state = load();
+  const es = {};        // sid -> EventSource (active streams)
+  const busy = {};      // sid -> bool
+
+  function load() {
+    try { const s = JSON.parse(localStorage.getItem(LS_KEY)); if (s && s.order && s.order.length) return s; } catch (e) {}
+    const sid = newSid();
+    return { order:[sid], active:sid, sessions:{ [sid]:{ label:"Session 1", model:"", messages:[] } } };
+  }
+  function save() {
+    // cap transcript size to keep localStorage sane
+    for (const sid of state.order) { const m = state.sessions[sid].messages; if (m.length > 200) state.sessions[sid].messages = m.slice(-200); }
+    localStorage.setItem(LS_KEY, JSON.stringify(state));
+  }
+  function cur() { return state.sessions[state.active]; }
+
+  function newSession() {
+    const sid = newSid();
+    const n = state.order.length + 1;
+    state.sessions[sid] = { label:"Session " + n, model: (cur() ? cur().model : "") || window.__defaultModel || "", messages:[] };
+    state.order.push(sid); state.active = sid; save(); renderStrip(); renderLog(); syncModel(); renderPending(); $("#prompt").focus();
+  }
+  // Open a work item / PR / issue as a fresh chat session with pinned context (composer stays empty).
+  function openInSession(label, ctx) {
+    const sid = newSid();
+    state.sessions[sid] = { label: label || ("Session " + (state.order.length + 1)),
+      model: (cur() ? cur().model : "") || window.__defaultModel || "",
+      ctx: ctx || null, ctxSent: false, messages:[] };
+    state.order.push(sid); state.active = sid; save();
+    document.querySelector('.tab[data-view="chat"]').click();
+    renderStrip(); renderLog(); syncModel(); renderPending();
+    const p = $("#prompt"); p.value = ""; p.style.height = "auto"; p.focus();
+  }
+  function closeSession(sid) {
+    if (es[sid]) { try { es[sid].close(); } catch(e){} delete es[sid]; }
+    delete state.sessions[sid]; delete busy[sid];
+    state.order = state.order.filter(x => x !== sid);
+    if (!state.order.length) { const s = newSid(); state.sessions[s] = { label:"Session 1", model:"", messages:[] }; state.order=[s]; }
+    if (state.active === sid) state.active = state.order[state.order.length-1];
+    delete pendingQ[sid];
+    save(); renderStrip(); renderLog(); syncModel(); renderPending();
+  }
+  function switchTo(sid) { state.active = sid; save(); renderStrip(); renderLog(); syncModel(); renderPending(); $("#prompt").focus(); }
+  function renameSession(sid) {
+    const name = prompt("Rename session:", state.sessions[sid].label);
+    if (name && name.trim()) { state.sessions[sid].label = name.trim(); save(); renderStrip(); }
+  }
+  function syncModel() { $("#model").value = cur().model || ""; }
+
+  function renderStrip() {
+    const strip = $("#sesstrip"); strip.innerHTML = "";
+    state.order.forEach(sid => {
+      const s = state.sessions[sid];
+      const el = document.createElement("div");
+      el.className = "stab" + (sid === state.active ? " active" : "") + (busy[sid] ? " streaming" : "");
+      el.innerHTML = `<span class="live"></span><span class="lbl">${esc(s.label)}</span><span class="x" title="close">×</span>`;
+      el.querySelector(".lbl").onclick = () => switchTo(sid);
+      el.querySelector(".lbl").ondblclick = () => renameSession(sid);
+      el.querySelector(".x").onclick = (e) => { e.stopPropagation(); closeSession(sid); };
+      el.onclick = () => switchTo(sid);
+      strip.appendChild(el);
+    });
+    const plus = document.createElement("button");
+    plus.className = "newsess"; plus.textContent = "+"; plus.title = "New session"; plus.onclick = newSession;
+    strip.appendChild(plus);
+  }
+
+  const log = $("#log");
+  function renderLog() {
+    log.innerHTML = "";
+    const s = cur();
+    const head = document.createElement("div");
+    head.className = "status";
+    head.innerHTML = `Session <code>${esc(state.active)}</code> · ${busy[state.active] ? "streaming…" : "idle"} · shell + hive at hand`;
+    log.appendChild(head);
+    if (s.ctx && s.ctx.banner) {
+      const c = document.createElement("div"); c.className = "ctxbar";
+      c.innerHTML = `<span class="pin">📌</span><span class="ctxt"></span>`
+        + (s.ctx.url ? ` <a href="${esc(s.ctx.url)}" target="_blank" class="ctxopen">open ↗</a>` : "")
+        + `<span class="ctxx" title="Unpin context">×</span>`;
+      c.querySelector(".ctxt").textContent = s.ctx.banner + (s.ctxSent ? "" : " · will be shared with HAL on your first message");
+      c.querySelector(".ctxx").onclick = () => { cur().ctx = null; cur().ctxSent = true; save(); renderLog(); };
+      log.appendChild(c);
+    }
+    s.messages.forEach(m => {
+      const d = document.createElement("div");
+      d.className = "msg " + (m.role === "user" ? "user" : "bot") + (m.streaming ? " " : "");
+      d.innerHTML = `<div class="who">${m.role === "user" ? "you" : "hal"}</div><div class="body"></div>`;
+      d.querySelector(".body").textContent = m.text || "";
+      if (m.streaming) d.querySelector(".body").classList.add("cursor");
+      if (m.tools && m.tools.length) { const t=document.createElement("div"); t.className="tools"; t.textContent="⚙ tools: "+m.tools.join(", "); d.appendChild(t); }
+      // copy-to-clipboard on HAL responses (once they have content)
+      if (m.role !== "user" && !m.streaming && m.text) {
+        const cp = document.createElement("button"); cp.className = "copybtn"; cp.type = "button";
+        cp.textContent = "copy"; cp.title = "Copy response to clipboard";
+        cp.onclick = () => copyText(m.text, cp);
+        d.appendChild(cp);
+      }
+      log.appendChild(d);
+    });
+    log.scrollTop = log.scrollHeight;
+  }
+  // Update only the streaming bubble of the active session (cheap live update)
+  function liveUpdate(sid) {
+    if (sid !== state.active) return;
+    const s = cur(); const last = s.messages[s.messages.length-1];
+    if (!last || last.role !== "bot") return;
+    const bodies = log.querySelectorAll(".msg.bot .body");
+    const el = bodies[bodies.length-1]; if (el) { el.textContent = last.text; log.scrollTop = log.scrollHeight; }
+  }
+
+  /* ================= CHAT SEND ================= */
+  const promptEl = $("#prompt"), sendBtn = $("#send"), form = $("#f");
+  promptEl.addEventListener("input",()=>{promptEl.style.height="auto";promptEl.style.height=Math.min(promptEl.scrollHeight,160)+"px";});
+  promptEl.addEventListener("keydown",(e)=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();form.requestSubmit();}});
+  $("#model").addEventListener("change", () => { cur().model = $("#model").value; save(); });
+
+  const pendingQ = {};  // sid -> [text,...] messages waiting for the current turn to finish
+
+  function renderPending() {
+    const box = $("#pending"); box.innerHTML = "";
+    const q = pendingQ[state.active] || [];
+    q.forEach((text, i) => {
+      const d = document.createElement("div"); d.className = "pend";
+      d.innerHTML = `<span class="tag">queued</span><span class="txt"></span><span class="cancel" title="Remove">×</span>`;
+      d.querySelector(".txt").textContent = text;
+      d.querySelector(".cancel").onclick = () => { (pendingQ[state.active]||[]).splice(i,1); renderPending(); };
+      box.appendChild(d);
+    });
+    const busyNow = !!busy[state.active];
+    $("#send").classList.toggle("working", busyNow);
+    $("#send").textContent = busyNow ? (q.length ? "Queued" : "Working…") : "Send";
+  }
+
+  function startTurn(sid, text) {
+    const s = state.sessions[sid];
+    s.messages.push({ role:"user", text });
+    const bot = { role:"bot", text:"", tools:[], streaming:true };
+    s.messages.push(bot);
+    // on the first turn of a context-pinned session, silently prepend the item context for the CLI
+    let sendText = text;
+    if (s.ctx && s.ctx.preamble && !s.ctxSent) { sendText = s.ctx.preamble + text; s.ctxSent = true; }
+    busy[sid] = true; save(); renderStrip(); if (sid===state.active) { renderLog(); renderPending(); }
+
+    const url = `/api/chat?session=${encodeURIComponent(sid)}&model=${encodeURIComponent(s.model||"")}&prompt=${encodeURIComponent(sendText)}`;
+    const source = new EventSource(url); es[sid] = source;
+    const finish = () => {
+      bot.streaming = false; busy[sid] = false;
+      try { source.close(); } catch(e){} delete es[sid];
+      save(); renderStrip();
+      const q = pendingQ[sid];
+      if (q && q.length) { const next = q.shift(); startTurn(sid, next); }  // drain next queued message
+      else if (sid===state.active) { renderLog(); renderPending(); }
+    };
+    source.addEventListener("delta",(ev)=>{ bot.text += JSON.parse(ev.data).text; liveUpdate(sid); });
+    source.addEventListener("message",(ev)=>{ const d=JSON.parse(ev.data); if(d.text) bot.text=d.text; if(d.tools&&d.tools.length) bot.tools=d.tools; liveUpdate(sid); });
+    source.addEventListener("done",(ev)=>{ const d=JSON.parse(ev.data||"{}"); if(d.code&&d.code!==0&&d.stderr&&!bot.text) bot.text="[exit "+d.code+": "+d.stderr+"]"; finish(); });
+    source.addEventListener("error",()=>{ if(!bot.text) bot.text="[stream error — is server.py running?]"; finish(); });
+  }
+
+  form.addEventListener("submit",(e)=>{
+    e.preventDefault();
+    const sid = state.active; const text = promptEl.value.trim();
+    if (!text) return;
+    promptEl.value = ""; promptEl.style.height = "auto";
+    // if a turn is already running for this session, queue the message and send it when free
+    if (busy[sid]) { (pendingQ[sid] ||= []).push(text); renderPending(); return; }
+    startTurn(sid, text);
+  });
+
+  // top-level view tabs
+  document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+    document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+    document.querySelectorAll(".view").forEach(x => x.classList.remove("active"));
+    t.classList.add("active"); $("#view-" + t.dataset.view).classList.add("active");
+    if (t.dataset.view === "hive") loadHive();
+    if (t.dataset.view === "github") loadGithub();
+    if (t.dataset.view === "ado") loadAdo();
+    if (t.dataset.view === "settings") loadSettings();
+    if (t.dataset.view === "chat") $("#prompt").focus();
+  });
+
+  // boot chat
+  renderStrip(); renderLog(); syncModel(); renderPending();
+  // pull default model from settings for new sessions
+  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; }).catch(()=>{});
+
+  /* ================= HIVE ================= */
+  const ACTIVE = new Set(["queued","pending","claimed","running","probing","reviewing","needs_attention","merging"]);
+  let hiveData=null;
+  async function loadHive(){
+    try{
+      const r=await fetch("/api/hive/status"); const d=await r.json(); hiveData=d;
+      if(d.error){ $("#hive-cards").innerHTML=`<div class="msgbox err">hive: ${esc(d.error)}</div>`; return; }
+      $("#hive-updated").textContent="updated "+new Date().toLocaleTimeString();
+      const c=d.counts||{}; const workers=d.workers||[]; const online=workers.filter(w=>w.online).length;
+      const active=(d.tasks||[]).filter(t=>ACTIVE.has(t.status)).length;
+      const u=d.usage_totals||{};
+      const cards=[["workers online",`${online}/${workers.length}`],["active tasks",active],
+        ["merged",c.merged||0],["reviewed",c.reviewed||0],["cancelled",c.cancelled||0],["dead",c.dead||0],
+        ["lines +/−",`${u.linesAdded||0}/${u.linesRemoved||0}`]];
+      $("#hive-cards").innerHTML=cards.map(([k,n])=>`<div class="card"><div class="n">${esc(n)}</div><div class="k">${esc(k)}</div></div>`).join("");
+      $("#workers tbody").innerHTML=workers.map(w=>`<tr>
+        <td><span class="dot ${w.online?'on':'off'}"></span>${esc(w.hostname||w.host)}</td>
+        <td>${esc(w.lane||"")}</td><td>${w.online?'online':'offline'}</td>
+        <td>${esc(w.current_task||"—")}</td><td>${w.age_s!=null?w.age_s+'s':esc(ago(w.last_seen))}</td>
+        <td class="muted" style="font-size:11px">${esc((w.caps||"").split(" ").filter(x=>x.startsWith('os:')||x.startsWith('build:')||x.startsWith('role:')).join(" "))}</td>
+      </tr>`).join("")||`<tr><td colspan="6" class="muted">no workers</td></tr>`;
+      renderTasks();
+    }catch(e){ $("#hive-cards").innerHTML=`<div class="msgbox err">fetch failed: ${esc(e.message)}</div>`; }
+  }
+  function renderTasks(){
+    if(!hiveData) return; const f=($("#q-filter").value||"").toLowerCase(); const sf=$("#q-status").value;
+    let tasks=(hiveData.tasks||[]).slice();
+    tasks.sort((a,b)=>(b.created_at||"").localeCompare(a.created_at||""));
+    tasks=tasks.filter(t=>{
+      if(sf==="active") { if(!ACTIVE.has(t.status)) return false; }
+      else if(sf && t.status!==sf) return false;
+      if(f && !((t.id||"")+" "+(t.title||"")+" "+(t.status||"")).toLowerCase().includes(f)) return false;
+      return true;
+    });
+    $("#q-count").textContent=`(${tasks.length})`;
+    $("#tasks tbody").innerHTML=tasks.slice(0,200).map(t=>`<tr class="click" data-id="${esc(t.id)}">
+      <td>${esc(t.id)}</td><td class="title" title="${esc(t.title)}">${esc(t.title||"")}</td>
+      <td><span class="pill s-${esc(t.status)}">${esc(t.status)}</span></td>
+      <td>${esc(t.kind||"")}</td><td>${esc(t.priority)}</td><td>${esc(t.worker_id||t.worker||"—")}</td>
+      <td class="muted">${esc(t.model||"")}</td><td class="muted">${esc(t.created_at||"")}</td>
+    </tr>`).join("")||`<tr><td colspan="8" class="muted">no matching tasks</td></tr>`;
+  }
+  $("#tasks").addEventListener("click",(e)=>{ const tr=e.target.closest("tr.click"); if(tr&&tr.dataset.id) openTaskDrawer(tr.dataset.id); });
+  $("#q-filter").addEventListener("input",renderTasks);
+  $("#q-status").addEventListener("change",renderTasks);
+  $("#hive-refresh").addEventListener("click",loadHive);
+  setInterval(()=>{ if($("#autopoll").checked && $("#view-hive").classList.contains("active")) loadHive(); },5000);
+
+  $("#addf").addEventListener("submit",async(e)=>{
+    e.preventDefault(); const m=$("#add-msg"); m.className=""; m.textContent="";
+    const title=$("#a-title").value.trim(); let promptTxt=$("#a-prompt").value.trim();
+    if(!promptTxt && title) promptTxt=title;
+    const payload={ id:$("#a-id").value.trim(), prompt:promptTxt,
+      priority:parseInt($("#a-priority").value||"5",10), requires:$("#a-requires").value.trim(),
+      complexity:$("#a-complexity").value };
+    if(!payload.id||!payload.prompt){ m.className="msgbox err"; m.textContent="id and prompt are required"; return; }
+    try{
+      const r=await fetch("/api/hive/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      const d=await r.json();
+      if(r.ok){ m.className="msgbox ok"; m.textContent="queued: "+(d.id||payload.id); $("#a-id").value="";$("#a-prompt").value="";$("#a-title").value=""; loadHive(); }
+      else { m.className="msgbox err"; m.textContent="error "+r.status+": "+(d.error||JSON.stringify(d)); }
+    }catch(err){ m.className="msgbox err"; m.textContent=err.message; }
+  });
+
+  /* ========== TASK DETAIL / LOGS DRAWER ========== */
+  const DRAWER_FIELDS=[["status","status"],["kind","kind"],["priority","priority"],["worker_id","worker"],
+    ["worker","host"],["model","model"],["complexity","complexity"],["attempts","attempts"],["max_attempts","max attempts"],
+    ["branch","branch"],["base_ref","base"],["commit_hash","commit"],["exit_code","exit code"],["verified","verified"],
+    ["requires","requires"],["created_at","created"],["claimed_at","claimed"],["started_at","started"],
+    ["done_at","done"],["last_activity","last activity"],["log_path","log path"],["error","error"],["summary","summary"]];
+  let drawerId=null;
+  function closeDrawer(){ $("#task-drawer").classList.remove("open"); $("#drawer-ov").classList.remove("open"); drawerId=null; }
+  async function openTaskDrawer(id){
+    drawerId=id;
+    $("#task-drawer").classList.add("open"); $("#drawer-ov").classList.add("open");
+    $("#td-id").textContent=id; $("#td-status").textContent="…"; $("#td-status").className="pill";
+    $("#td-kv").innerHTML=`<div class="k">loading…</div><div class="v"></div>`; $("#td-log").textContent="…";
+    try{
+      const r=await fetch("/api/hive/task?id="+encodeURIComponent(id)); const t=await r.json();
+      if(t.error){ $("#td-kv").innerHTML=`<div class="k">error</div><div class="v">${esc(t.error)}</div>`; $("#td-log").textContent="—"; return; }
+      $("#td-status").textContent=t.status||"—"; $("#td-status").className="pill s-"+esc(t.status||"");
+      const fmtVal=(k,v)=>{ if(v==null||v==="") return '<span class="muted">—</span>';
+        if(Array.isArray(v)) return v.length?v.map(esc).join(", "):'<span class="muted">—</span>'; return esc(v); };
+      let kv=DRAWER_FIELDS.filter(([k])=>k!=="status").map(([k,lbl])=>
+        `<div class="k">${esc(lbl)}</div><div class="v">${fmtVal(k,t[k])}</div>`).join("");
+      if(t.progress&&typeof t.progress==="object"){
+        kv+=`<div class="k">progress</div><div class="v">phase ${esc(t.progress.phase||"?")} · turn ${esc(t.progress.turn??"?")} · ${esc(t.progress.elapsed_s??"?")}s`
+          +(t.progress.last_tool?` · ${esc(t.progress.last_tool.tool||"")}: ${esc(t.progress.last_tool.detail||"")}`:"")+`</div>`;
+      }
+      if(t.usage&&typeof t.usage==="object"){
+        const u=t.usage; kv+=`<div class="k">usage</div><div class="v">${esc(u.total_tokens??u.tokens??"")} tok${u.cost_usd?` · $${esc(u.cost_usd)}`:""}</div>`;
+      }
+      $("#td-kv").innerHTML=kv;
+      $("#td-log").textContent=t.log_tail||"(no log output captured)";
+      $("#td-log").scrollTop=$("#td-log").scrollHeight;
+    }catch(e){ $("#td-kv").innerHTML=`<div class="k">error</div><div class="v">${esc(e.message)}</div>`; }
+  }
+  $("#td-close").addEventListener("click",closeDrawer);
+  $("#drawer-ov").addEventListener("click",closeDrawer);
+  $("#td-refresh").addEventListener("click",()=>{ if(drawerId) openTaskDrawer(drawerId); });
+
+  /* ========== SEND THIS CHAT TO THE HIVE ========== */
+  function slugify(s){ return (s||"").toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"").slice(0,28); }
+  function openHiveModal(){
+    const s=cur(); const msgs=(s&&s.messages)||[];
+    const firstUser=msgs.find(m=>m.role==="user");
+    const title=firstUser?firstUser.text.split("\n")[0].slice(0,80):(s?s.label:"");
+    // build a prompt from the whole conversation so the worker has full context
+    const convo=msgs.map(m=>(m.role==="user"?"USER: ":"HAL: ")+(m.text||"")).join("\n\n").trim();
+    const idBase=slugify(title)||slugify(s&&s.label)||"chat";
+    $("#hm-id").value="task-"+idBase+"-"+Date.now().toString(36).slice(-4);
+    $("#hm-title").value=title;
+    $("#hm-prompt").value=convo||"";
+    $("#hm-model").value=(s&&s.model)||"";
+    $("#hm-priority").value="5"; $("#hm-complexity").value="";
+    $("#hm-msg").className=""; $("#hm-msg").textContent="";
+    $("#hive-modal").classList.add("open"); $("#hive-ov").classList.add("open");
+    $("#hm-prompt").focus();
+  }
+  function closeHiveModal(){ $("#hive-modal").classList.remove("open"); $("#hive-ov").classList.remove("open"); }
+  $("#tohive").addEventListener("click",openHiveModal);
+  $("#hm-close").addEventListener("click",closeHiveModal);
+  $("#hm-cancel").addEventListener("click",closeHiveModal);
+  $("#hive-ov").addEventListener("click",closeHiveModal);
+  $("#hm-form").addEventListener("submit",async(e)=>{
+    e.preventDefault(); const m=$("#hm-msg"); m.className=""; m.textContent="";
+    const payload={ id:$("#hm-id").value.trim(), prompt:$("#hm-prompt").value.trim(),
+      priority:parseInt($("#hm-priority").value||"5",10),
+      complexity:$("#hm-complexity").value, model:$("#hm-model").value };
+    if(!payload.id||!payload.prompt){ m.className="msgbox err"; m.textContent="id and prompt are required"; return; }
+    try{
+      const r=await fetch("/api/hive/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      const d=await r.json();
+      if(r.ok){ m.className="msgbox ok"; m.textContent="queued: "+(d.id||payload.id)+" — jumping to Hive…";
+        setTimeout(()=>{ closeHiveModal(); document.querySelector('.tab[data-view="hive"]').click(); },700); }
+      else { m.className="msgbox err"; m.textContent="error "+r.status+": "+(d.error||JSON.stringify(d)); }
+    }catch(err){ m.className="msgbox err"; m.textContent=err.message; }
+  });
+
+  /* ================= GITHUB ================= */
+  async function loadGithub(){
+    try{
+      const r=await fetch("/api/github/mywork"); const d=await r.json();
+      $("#gh-updated").textContent="updated "+new Date().toLocaleTimeString();
+      const rowsPR=(Array.isArray(d.prs)?d.prs:[]).map(p=>{
+        const repo=p.repository&&p.repository.nameWithOwner||"";
+        const short=`${repo.split("/").pop()}#${p.number}`;
+        const ctx={ banner:`GitHub PR ${repo}#${p.number} — ${p.title}`, url:p.url,
+          preamble:`We'll be discussing this GitHub pull request; keep it in context for our whole conversation:\n${repo}#${p.number} — "${p.title}"\n${p.url}\n\n` };
+        return `<tr>
+        <td class="muted">${esc(repo)}</td><td>#${esc(p.number)}</td>
+        <td><a href="${esc(p.url)}" target="_blank">${esc(p.title)}${p.isDraft?' <span class="muted">(draft)</span>':''}</a></td>
+        <td class="muted">${esc(ago(p.updatedAt))}</td>${chatCell(short, ctx)}</tr>`;}).join("");
+      $("#prs tbody").innerHTML=rowsPR||`<tr><td colspan="5" class="muted">${d.prs&&d.prs.error?esc(d.prs.error):'none'}</td></tr>`;
+      const rowsIss=(Array.isArray(d.issues)?d.issues:[]).map(i=>{
+        const repo=i.repository&&i.repository.nameWithOwner||"";
+        const short=`${repo.split("/").pop()}#${i.number}`;
+        const ctx={ banner:`GitHub issue ${repo}#${i.number} — ${i.title}`, url:i.url,
+          preamble:`We'll be discussing this GitHub issue; keep it in context for our whole conversation:\n${repo}#${i.number} — "${i.title}"\n${i.url}\n\n` };
+        return `<tr>
+        <td class="muted">${esc(repo)}</td><td>#${esc(i.number)}</td>
+        <td><a href="${esc(i.url)}" target="_blank">${esc(i.title)}</a></td>
+        <td class="muted">${esc(ago(i.updatedAt))}</td>${chatCell(short, ctx)}</tr>`;}).join("");
+      $("#issues tbody").innerHTML=rowsIss||`<tr><td colspan="5" class="muted">${d.issues&&d.issues.error?esc(d.issues.error):'none'}</td></tr>`;
+    }catch(e){ $("#prs tbody").innerHTML=`<tr><td colspan="5" class="msgbox err">${esc(e.message)}</td></tr>`; }
+  }
+  $("#gh-refresh").addEventListener("click",loadGithub);
+
+  /* ================= ADO ================= */
+  async function loadAdo(){
+    const err=$("#ado-err"); err.innerHTML="";
+    try{
+      const r=await fetch("/api/ado/mywork"); const d=await r.json();
+      $("#ado-updated").textContent="updated "+new Date().toLocaleTimeString();
+      if(d.error){ err.innerHTML=`<div class="msgbox err">${esc(d.error)}</div>`; }
+      const wi=Array.isArray(d.workitems)?d.workitems:[];
+      $("#wi-count").textContent=`(${wi.length})`;
+      $("#workitems tbody").innerHTML=wi.map(w=>{
+        const ctx={ banner:`ADO ${w.type} ${w.id} · ${w.project} — ${w.title}`,
+          url:w.url,
+          preamble:`We'll be discussing this Azure DevOps work item; keep it in context for our whole conversation:\nWork item ${w.id} — ${w.type}, state "${w.state}", project "${w.project}"\n"${w.title}"\n${w.url}\n\n` };
+        return `<tr>
+        <td><a href="${esc(w.url)}" target="_blank">${esc(w.id)}</a></td>
+        <td class="muted">${esc(w.type)}</td>
+        <td><span class="pill s-${esc((w.state||'').toLowerCase().replace(/ /g,'_'))}">${esc(w.state)}</span></td>
+        <td class="muted">${esc(w.project)}</td>
+        <td class="title" title="${esc(w.title)}">${esc(w.title)}</td>${chatCell("WI "+w.id, ctx)}</tr>`;}).join("")
+        ||`<tr><td colspan="6" class="muted">none</td></tr>`;
+      const pr=Array.isArray(d.prs)?d.prs:[];
+      $("#adopr-count").textContent=`(${pr.length})`;
+      $("#adoprs tbody").innerHTML=pr.map(p=>{
+        const asRev=p.role==='reviewer';
+        const ctx={ banner:`ADO PR !${p.id} · ${p.project}/${p.repo}${asRev?' (you: reviewer)':''} — ${p.title}`,
+          url:p.url,
+          preamble:`We'll be discussing this Azure DevOps pull request${asRev?" (I'm assigned as a reviewer)":""}; keep it in context for our whole conversation:\nPR !${p.id} in ${p.project}/${p.repo}${p.author&&p.role!=='author'?` by ${p.author}`:''}\n"${p.title}"\n${p.url}\n\n` };
+        const roleCls=p.role==='reviewer'?'r-reviewer':(p.role==='author+reviewer'?'r-both':'r-author');
+        return `<tr>
+        <td><a href="${esc(p.url)}" target="_blank">!${esc(p.id)}</a></td>
+        <td><span class="pill ${roleCls}">${esc(p.role||'author')}</span></td>
+        <td class="muted">${esc(p.project)} / ${esc(p.repo)}</td>
+        <td class="title" title="${esc(p.title)}">${esc(p.title)}${p.isDraft?' <span class="muted">(draft)</span>':''}</td>
+        <td class="muted">${esc(ago(p.created))}</td>${chatCell("PR !"+p.id, ctx)}</tr>`;}).join("")
+        ||`<tr><td colspan="6" class="muted">none</td></tr>`;
+    }catch(e){ err.innerHTML=`<div class="msgbox err">${esc(e.message)}</div>`; }
+  }
+  $("#ado-refresh").addEventListener("click",loadAdo);
+
+  /* ================= SETTINGS ================= */
+  async function loadSettings(){
+    try{
+      const c=await (await fetch("/api/settings")).json();
+      $("#s-ado_org").value=c.ado_org||"";
+      $("#s-ado_upn").value=c.ado_upn||"";
+      $("#s-hive_url").value=c.hive_url||"";
+      $("#s-default_model").value=c.default_model||"";
+      $("#s-chat_fast").checked=c.chat_fast!==false;
+      $("#s-ado_pat").placeholder=c.ado_pat_set?"•••• set (leave blank to keep)":"blank = use az login";
+      $("#s-hive_token").placeholder=c.hive_token_set?"•••• set (leave blank to keep)":"blank = ~/.hive/worker.token";
+    }catch(e){}
+  }
+  $("#setf").addEventListener("submit",async(e)=>{
+    e.preventDefault(); const m=$("#set-msg"); m.className=""; m.textContent="";
+    const payload={ ado_org:$("#s-ado_org").value.trim(), ado_upn:$("#s-ado_upn").value.trim(),
+      hive_url:$("#s-hive_url").value.trim(), default_model:$("#s-default_model").value,
+      chat_fast:$("#s-chat_fast").checked,
+      ado_pat:$("#s-ado_pat").value, hive_token:$("#s-hive_token").value };
+    try{
+      const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      const c=await r.json();
+      window.__defaultModel=c.default_model||"";
+      $("#s-ado_pat").value=""; $("#s-hive_token").value=""; loadSettings();
+      m.className="msgbox ok"; m.textContent="saved"; 
+    }catch(err){ m.className="msgbox err"; m.textContent=err.message; }
+  });
+</script>
+</body>
+</html>
