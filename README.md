@@ -77,6 +77,27 @@ python3 server.py --port 8900 --host 127.0.0.1
 # open http://127.0.0.1:8900
 ```
 
+### Autostart (systemd user service)
+
+Runs HAL-UI on login/boot and restarts it on crash — no manual launch needed.
+`hal-ui.service` (in this repo) is a linger-friendly user unit:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp hal-ui.service ~/.config/systemd/user/
+loginctl enable-linger "$USER"          # start at boot without an active login
+systemctl --user daemon-reload
+systemctl --user enable --now hal-ui.service
+```
+
+Manage it:
+
+```bash
+systemctl --user status hal-ui        # state + pid
+systemctl --user restart hal-ui       # after a server.py change
+journalctl --user -u hal-ui -f        # live logs (replaces server.log)
+```
+
 ### Requirements
 - Python 3.10+
 - [`copilot`](https://github.com/github/copilot-cli) CLI on `PATH`

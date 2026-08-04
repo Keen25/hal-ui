@@ -1,0 +1,18 @@
+[Unit]
+Description=HAL-UI - Copilot CLI control plane
+Documentation=https://github.com/Keen25/hal-ui
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hal-ui
+ExecStart=/usr/bin/python3 %h/hal-ui/server.py --port 8900 --host 127.0.0.1
+Restart=on-failure
+RestartSec=3
+# stdout/stderr -> journalctl --user -u hal-ui
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
