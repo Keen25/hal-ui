@@ -21,8 +21,16 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   ("this is what we'll discuss") without dumping boilerplate in the composer.
 - **Settings pane** — wire ADO org/PAT/UPN, Hive URL/token, default model, and the
   `chat_fast` toggle. Stored server-side at `~/.config/hal-ui/config.json` (0600).
-- **Fast chat lane** — `chat_fast` disables MCP servers for the chat process,
-  cutting per-message startup latency (~12s → ~5-6s).
+- **Persistent ACP chat lane** — with `chat_fast` on, each session runs one
+  long-lived `copilot --acp` process (Agent Client Protocol over stdio). The CLI
+  boots once; later turns skip startup entirely (cold ~10s → warm ~2-3s to first
+  token). Tool-permission requests are auto-approved (`allow_once`).
+- **Stop a running turn** — a Stop button (and `session/cancel`) aborts the
+  in-flight turn instantly; queued messages are cleared.
+- **Fast chat toggle** — `chat_fast` ON = ACP persistent lane (fast, no MCP);
+  OFF = legacy per-turn spawn with full MCP servers available mid-chat.
+- **Hive drawer auto-poll** — an open task drawer refreshes progress + log tail
+  every 4s while the task is non-terminal, then stops.
 
 ## Architecture
 
@@ -39,9 +47,12 @@ server.py (Python stdlib http.server, threaded)
 
 ### Backend — `server.py`
 - Python 3 **stdlib only**: `http.server.ThreadingHTTPServer`, thread-per-request.
-- Chat: shells to `copilot -p … --output-format json --allow-all-tools`
-  (`-n <session>` first turn, `--resume <session>` after), parses the CLI JSON
-  event stream, re-emits as Server-Sent Events.
+- Chat, fast lane (`chat_fast` on): persistent `copilot --acp` process per session
+  (JSON-RPC over stdio — `initialize` → `session/new` → `session/prompt`, streamed
+  `session/update` → SSE). `session/cancel` powers Stop; permission requests
+  auto-answered `allow_once`.
+- Chat, legacy lane (`chat_fast` off): per-turn `copilot -p … --output-format json`
+  spawn with full MCP servers.
 - Data: `gh` CLI (TTL-cached), `az account get-access-token` → ADO REST, Hive REST.
 - Config: `~/.config/hal-ui/config.json` (0600); secrets masked on read, preserved
   if POSTed blank.
@@ -64,5 +75,7 @@ python3 server.py --port 8900 --host 127.0.0.1
 - `gh` CLI (for GitHub views), `az` CLI (for ADO views) — optional per view
 
 ## Roadmap
-- `--acp` persistent Copilot process per session (warm MCP, sub-second later turns).
-- Stop/abort a running turn; drawer auto-poll for running Hive tasks.
+- Convert `~/.copilot/mcp-config.json` to ACP `mcpServers` so the fast lane can
+  keep chosen MCP servers warm (best of both lanes).
+- Multi-turn ACP session persistence across server restarts (`session/load`).
+- Per-turn token/cost usage surfaced in the chat UI (ACP `usage_update`).

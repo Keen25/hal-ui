@@ -148,6 +148,8 @@
   .pend .cancel { cursor:pointer; color:var(--muted); font-weight:700; padding:0 4px; }
   .pend .cancel:hover { color:#fff; background:var(--bad); border-radius:4px; }
   #send.working { background:var(--tool); }
+  .stopbtn { background:var(--bad,#c0392b); border:1px solid var(--line); color:#fff; }
+  .stopbtn:hover { filter:brightness(1.15); }
   /* pinned item context banner */
   .ctxbar { align-self:center; display:flex; align-items:center; gap:8px; max-width:820px; margin-bottom:4px;
     padding:7px 12px; border-radius:10px; background:#1b2027; border:1px solid var(--accent); color:var(--txt); font-size:13px; }
@@ -202,6 +204,7 @@
       </select>
       <textarea id="prompt" rows="1" placeholder="Message HAL…" autofocus></textarea>
       <button id="tohive" type="button" class="ghost" title="Queue this session's work as a hive task">→ Hive</button>
+      <button id="stop" type="button" class="stopbtn" title="Stop the current turn" style="display:none">■ Stop</button>
       <button id="send" type="submit">Send</button>
     </form>
   </section>
@@ -381,6 +384,7 @@
   let state = load();
   const es = {};        // sid -> EventSource (active streams)
   const busy = {};      // sid -> bool
+  const finishers = {}; // sid -> finish() of the in-flight turn (for Stop)
 
   function load() {
     try { const s = JSON.parse(localStorage.getItem(LS_KEY)); if (s && s.order && s.order.length) return s; } catch (e) {}
@@ -413,7 +417,8 @@
   }
   function closeSession(sid) {
     if (es[sid]) { try { es[sid].close(); } catch(e){} delete es[sid]; }
-    delete state.sessions[sid]; delete busy[sid];
+    fetch(`/api/chat/close?session=${encodeURIComponent(sid)}`).catch(()=>{});  // free the ACP process
+    delete state.sessions[sid]; delete busy[sid]; delete finishers[sid];
     state.order = state.order.filter(x => x !== sid);
     if (!state.order.length) { const s = newSid(); state.sessions[s] = { label:"Session 1", model:"", messages:[] }; state.order=[s]; }
     if (state.active === sid) state.active = state.order[state.order.length-1];
@@ -510,6 +515,7 @@
     const busyNow = !!busy[state.active];
     $("#send").classList.toggle("working", busyNow);
     $("#send").textContent = busyNow ? (q.length ? "Queued" : "Working…") : "Send";
+    $("#stop").style.display = busyNow ? "" : "none";
   }
 
   function startTurn(sid, text) {
@@ -525,18 +531,32 @@
     const url = `/api/chat?session=${encodeURIComponent(sid)}&model=${encodeURIComponent(s.model||"")}&prompt=${encodeURIComponent(sendText)}`;
     const source = new EventSource(url); es[sid] = source;
     const finish = () => {
-      bot.streaming = false; busy[sid] = false;
+      bot.streaming = false; busy[sid] = false; delete finishers[sid];
       try { source.close(); } catch(e){} delete es[sid];
       save(); renderStrip();
       const q = pendingQ[sid];
       if (q && q.length) { const next = q.shift(); startTurn(sid, next); }  // drain next queued message
       else if (sid===state.active) { renderLog(); renderPending(); }
     };
+    finishers[sid] = finish;
     source.addEventListener("delta",(ev)=>{ bot.text += JSON.parse(ev.data).text; liveUpdate(sid); });
     source.addEventListener("message",(ev)=>{ const d=JSON.parse(ev.data); if(d.text) bot.text=d.text; if(d.tools&&d.tools.length) bot.tools=d.tools; liveUpdate(sid); });
     source.addEventListener("done",(ev)=>{ const d=JSON.parse(ev.data||"{}"); if(d.code&&d.code!==0&&d.stderr&&!bot.text) bot.text="[exit "+d.code+": "+d.stderr+"]"; finish(); });
     source.addEventListener("error",()=>{ if(!bot.text) bot.text="[stream error — is server.py running?]"; finish(); });
   }
+
+  // Stop the in-flight turn for the active session (ACP session/cancel + free the UI).
+  function stopTurn() {
+    const sid = state.active; if (!busy[sid]) return;
+    fetch(`/api/chat/stop?session=${encodeURIComponent(sid)}`).catch(()=>{});
+    const s = state.sessions[sid]; const last = s.messages[s.messages.length-1];
+    if (last && last.role === "bot" && !last.text) last.text = "[stopped]";
+    pendingQ[sid] = [];  // stop means stop — don't auto-send queued messages
+    const f = finishers[sid];
+    if (f) { f(); }
+    else { busy[sid]=false; if(es[sid]){try{es[sid].close();}catch(e){}delete es[sid];} save(); renderStrip(); if(sid===state.active){renderLog();renderPending();} }
+  }
+  $("#stop").addEventListener("click", stopTurn);
 
   form.addEventListener("submit",(e)=>{
     e.preventDefault();
@@ -635,15 +655,20 @@
     ["branch","branch"],["base_ref","base"],["commit_hash","commit"],["exit_code","exit code"],["verified","verified"],
     ["requires","requires"],["created_at","created"],["claimed_at","claimed"],["started_at","started"],
     ["done_at","done"],["last_activity","last activity"],["log_path","log path"],["error","error"],["summary","summary"]];
-  let drawerId=null;
-  function closeDrawer(){ $("#task-drawer").classList.remove("open"); $("#drawer-ov").classList.remove("open"); drawerId=null; }
-  async function openTaskDrawer(id){
+  let drawerId=null, drawerPoll=null;
+  const TERMINAL_STATES=new Set(["merged","done","completed","complete","failed","error","cancelled","canceled","needs_attention"]);
+  function closeDrawer(){ $("#task-drawer").classList.remove("open"); $("#drawer-ov").classList.remove("open"); drawerId=null; if(drawerPoll){clearTimeout(drawerPoll);drawerPoll=null;} }
+  async function openTaskDrawer(id, silent){
     drawerId=id;
+    if(drawerPoll){ clearTimeout(drawerPoll); drawerPoll=null; }
     $("#task-drawer").classList.add("open"); $("#drawer-ov").classList.add("open");
-    $("#td-id").textContent=id; $("#td-status").textContent="…"; $("#td-status").className="pill";
-    $("#td-kv").innerHTML=`<div class="k">loading…</div><div class="v"></div>`; $("#td-log").textContent="…";
+    if(!silent){
+      $("#td-id").textContent=id; $("#td-status").textContent="…"; $("#td-status").className="pill";
+      $("#td-kv").innerHTML=`<div class="k">loading…</div><div class="v"></div>`; $("#td-log").textContent="…";
+    }
     try{
       const r=await fetch("/api/hive/task?id="+encodeURIComponent(id)); const t=await r.json();
+      if(drawerId!==id) return;  // drawer moved/closed while fetching
       if(t.error){ $("#td-kv").innerHTML=`<div class="k">error</div><div class="v">${esc(t.error)}</div>`; $("#td-log").textContent="—"; return; }
       $("#td-status").textContent=t.status||"—"; $("#td-status").className="pill s-"+esc(t.status||"");
       const fmtVal=(k,v)=>{ if(v==null||v==="") return '<span class="muted">—</span>';
@@ -658,9 +683,15 @@
         const u=t.usage; kv+=`<div class="k">usage</div><div class="v">${esc(u.total_tokens??u.tokens??"")} tok${u.cost_usd?` · $${esc(u.cost_usd)}`:""}</div>`;
       }
       $("#td-kv").innerHTML=kv;
+      const atBottom = Math.abs($("#td-log").scrollHeight-$("#td-log").scrollTop-$("#td-log").clientHeight)<40;
       $("#td-log").textContent=t.log_tail||"(no log output captured)";
-      $("#td-log").scrollTop=$("#td-log").scrollHeight;
-    }catch(e){ $("#td-kv").innerHTML=`<div class="k">error</div><div class="v">${esc(e.message)}</div>`; }
+      if(!silent||atBottom) $("#td-log").scrollTop=$("#td-log").scrollHeight;
+      // auto-poll while the task is still working
+      if(drawerId===id && !TERMINAL_STATES.has((t.status||"").toLowerCase())){
+        $("#td-status").textContent=(t.status||"—")+" ⟳";
+        drawerPoll=setTimeout(()=>{ if(drawerId===id) openTaskDrawer(id,true); }, 4000);
+      }
+    }catch(e){ if(drawerId===id&&!silent) $("#td-kv").innerHTML=`<div class="k">error</div><div class="v">${esc(e.message)}</div>`; }
   }
   $("#td-close").addEventListener("click",closeDrawer);
   $("#drawer-ov").addEventListener("click",closeDrawer);

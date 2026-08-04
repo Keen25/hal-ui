@@ -21,6 +21,7 @@ import argparse
 import base64
 import json
 import os
+import queue
 import shutil
 import subprocess
 import threading
@@ -350,6 +351,7 @@ def _mcp_server_names() -> list[str]:
 
 
 def _build_argv(prompt: str, session: str, model: str | None) -> list[str]:
+    """Legacy per-turn spawn (used when chat_fast is OFF => full MCP available)."""
     argv = [COPILOT_BIN, "-p", prompt, "--output-format", "json", "--allow-all-tools"]
     with _sessions_lock:
         resume = session in _known_sessions
@@ -357,12 +359,248 @@ def _build_argv(prompt: str, session: str, model: str | None) -> list[str]:
     argv += (["--resume", session] if resume else ["-n", session])
     if model:
         argv += ["--model", model]
-    # fast chat lane: skip MCP servers (pagerduty/salesforce/playwright/... reload every turn)
-    if load_config().get("chat_fast", True):
-        argv.append("--disable-builtin-mcps")
-        for name in _mcp_server_names():
-            argv += ["--disable-mcp-server", name]
     return argv
+
+
+# ======================================================================
+# ACP persistent chat lane (chat_fast ON): one long-lived `copilot --acp`
+# process per browser session. MCP stays cold (mcpServers:[]) so first turn
+# boots once and later turns skip the ~5-7s CLI+MCP startup entirely.
+# Protocol (JSON-RPC over stdio):
+#   initialize -> session/new{cwd,mcpServers:[]} -> sessionId
+#   session/set_model{modelId}    (optional)
+#   session/prompt{sessionId,prompt:[{type:text,text}]} -> streams
+#       session/update notifications, ends with the request's response (stopReason)
+#   agent->client session/request_permission -> auto-answer allow_once
+#   session/cancel{sessionId}     (notification) -> abort the running turn
+# ======================================================================
+class AcpProc:
+    BOOT_TIMEOUT = 90
+
+    def __init__(self, model: str | None = None):
+        self.model = None
+        self.session_id: str | None = None
+        self.dead = False
+        self._id = 0
+        self._io_lock = threading.Lock()          # guards stdin writes + id counter
+        self._pending: dict[int, queue.Queue] = {}  # req id -> Queue for its response
+        self._turn_lock = threading.Lock()        # one turn at a time per process
+        self._event_q: queue.Queue | None = None  # active turn's notification sink
+        self._event_lock = threading.Lock()
+        self.proc = subprocess.Popen(
+            [COPILOT_BIN, "--acp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1, cwd=os.path.expanduser("~"))
+        threading.Thread(target=self._reader, daemon=True).start()
+        self._boot(model)
+
+    # --- low level ----------------------------------------------------
+    def _next_id(self) -> int:
+        self._id += 1
+        return self._id
+
+    def _write(self, obj: dict):
+        line = json.dumps(obj) + "\n"
+        with self._io_lock:
+            if self.proc.stdin:
+                self.proc.stdin.write(line)
+                self.proc.stdin.flush()
+
+    def _request(self, method: str, params: dict, timeout: float = 120):
+        rid = self._next_id()
+        q: queue.Queue = queue.Queue()
+        self._pending[rid] = q
+        self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        try:
+            resp = q.get(timeout=timeout)
+        finally:
+            self._pending.pop(rid, None)
+        if "error" in resp:
+            raise RuntimeError(resp["error"])
+        return resp.get("result", {})
+
+    def _notify(self, method: str, params: dict):
+        self._write({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _reader(self):
+        try:
+            assert self.proc.stdout is not None
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "method" in obj and "id" in obj:          # request from agent
+                    self._on_agent_request(obj)
+                elif "method" in obj:                         # notification
+                    if obj["method"] == "session/update":
+                        with self._event_lock:
+                            if self._event_q is not None:
+                                self._event_q.put(obj["params"]["update"])
+                elif "id" in obj:                             # response to our request
+                    q = self._pending.get(obj["id"])
+                    if q is not None:
+                        q.put(obj)
+        except Exception:
+            pass
+        finally:
+            self.dead = True
+            with self._event_lock:
+                if self._event_q is not None:
+                    self._event_q.put({"sessionUpdate": "__dead__"})
+
+    def _on_agent_request(self, obj: dict):
+        method = obj.get("method", "")
+        rid = obj["id"]
+        if method == "session/request_permission":
+            opts = obj.get("params", {}).get("options", []) or []
+            pick = None
+            for o in opts:
+                oid = (o.get("optionId") or "").lower()
+                if o.get("kind") == "allow_once" or oid == "allow_once":
+                    pick = o
+                    break
+            if pick is None:
+                for o in opts:
+                    if "allow" in (o.get("optionId") or "").lower() or "allow" in (o.get("kind") or "").lower():
+                        pick = o
+                        break
+            if pick is None and opts:
+                pick = opts[0]
+            result = ({"outcome": {"outcome": "selected", "optionId": pick["optionId"]}}
+                      if pick else {"outcome": {"outcome": "cancelled"}})
+            self._write({"jsonrpc": "2.0", "id": rid, "result": result})
+        else:
+            # unknown agent->client request: answer empty so the agent never blocks
+            self._write({"jsonrpc": "2.0", "id": rid, "result": {}})
+
+    # --- lifecycle ----------------------------------------------------
+    def _boot(self, model: str | None):
+        self._request("initialize", {
+            "protocolVersion": 1,
+            "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
+        }, timeout=self.BOOT_TIMEOUT)
+        res = self._request("session/new", {
+            "cwd": os.path.expanduser("~"), "mcpServers": [],
+        }, timeout=self.BOOT_TIMEOUT)
+        self.session_id = res.get("sessionId")
+        if model:
+            self.set_model(model)
+
+    def set_model(self, model: str | None):
+        if not model or model == self.model or not self.session_id:
+            return
+        try:
+            self._request("session/set_model", {"sessionId": self.session_id, "modelId": model}, timeout=30)
+            self.model = model
+        except Exception:
+            pass  # unknown model id => keep default
+
+    def cancel(self):
+        if self.session_id and not self.dead:
+            try:
+                self._notify("session/cancel", {"sessionId": self.session_id})
+            except Exception:
+                pass
+
+    def close(self):
+        try:
+            self.cancel()
+        except Exception:
+            pass
+        try:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+        except Exception:
+            pass
+
+    def prompt(self, text: str, emit):
+        """Run one turn; translate ACP session/update stream to the SSE contract."""
+        if self.dead or not self.session_id:
+            emit("error", {"message": "acp session unavailable"})
+            emit("done", {"code": 1})
+            return
+        with self._turn_lock:
+            q: queue.Queue = queue.Queue()
+            with self._event_lock:
+                self._event_q = q
+            rid = self._next_id()
+            resp_q: queue.Queue = queue.Queue()
+            self._pending[rid] = resp_q
+            full = []
+            tools: list[str] = []
+            try:
+                self._write({"jsonrpc": "2.0", "id": rid, "method": "session/prompt",
+                             "params": {"sessionId": self.session_id,
+                                        "prompt": [{"type": "text", "text": text}]}})
+                while True:
+                    try:
+                        resp_q.get_nowait()
+                        break
+                    except queue.Empty:
+                        pass
+                    try:
+                        upd = q.get(timeout=0.2)
+                    except queue.Empty:
+                        if self.dead:
+                            emit("error", {"message": "acp process exited"})
+                            break
+                        continue
+                    su = upd.get("sessionUpdate")
+                    if su == "__dead__":
+                        emit("error", {"message": "acp process exited"})
+                        break
+                    if su == "agent_message_chunk":
+                        t = (upd.get("content") or {}).get("text", "")
+                        if t:
+                            full.append(t)
+                            emit("delta", {"text": t})
+                    elif su == "agent_thought_chunk":
+                        emit("thinking", {})
+                    elif su == "tool_call":
+                        name = upd.get("title") or upd.get("kind") or "tool"
+                        if name not in tools:
+                            tools.append(name)
+                        emit("tool", {"type": "tool_call", "name": name})
+                    # tool_call_update / usage_update / config_option_update: ignored
+            finally:
+                self._pending.pop(rid, None)
+                with self._event_lock:
+                    self._event_q = None
+            emit("message", {"text": "".join(full), "model": self.model, "tools": tools})
+            emit("idle", {})
+            emit("done", {"code": 0})
+
+
+_acp_procs: dict[str, AcpProc] = {}
+_acp_lock = threading.Lock()
+
+
+def _acp_get(session: str, model: str | None) -> AcpProc:
+    with _acp_lock:
+        p = _acp_procs.get(session)
+        if p is not None and not p.dead and p.proc.poll() is None:
+            p.set_model(model)
+            return p
+        p = AcpProc(model)
+        _acp_procs[session] = p
+        return p
+
+
+def _acp_stop(session: str):
+    with _acp_lock:
+        p = _acp_procs.get(session)
+    if p is not None:
+        p.cancel()
+
+
+def _acp_close(session: str):
+    with _acp_lock:
+        p = _acp_procs.pop(session, None)
+    if p is not None:
+        p.close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -413,6 +651,27 @@ class Handler(BaseHTTPRequestHandler):
         def emit(event: str, data: dict):
             self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
             self.wfile.flush()
+
+        # Fast lane: persistent ACP process per session (warm, later turns skip boot).
+        if load_config().get("chat_fast", True):
+            emit("start", {"session": session, "acp": True})
+            try:
+                acp = _acp_get(session, model)
+            except Exception as exc:
+                emit("error", {"message": f"acp launch failed: {exc}"})
+                emit("done", {"code": 1})
+                return
+            try:
+                acp.prompt(prompt, emit)
+            except (BrokenPipeError, ConnectionResetError):
+                acp.cancel()  # browser hung up mid-turn -> stop the agent
+            except Exception as exc:
+                try:
+                    emit("error", {"message": str(exc)})
+                    emit("done", {"code": 1})
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            return
 
         argv = _build_argv(prompt, session, model)
         emit("start", {"session": session, "resumed": "--resume" in argv})
@@ -470,6 +729,14 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path)
         if p.path == "/api/chat":
             self._sse_chat(parse_qs(p.query))
+        elif p.path == "/api/chat/stop":
+            session = (parse_qs(p.query).get("session", [""])[0] or "").strip()
+            _acp_stop(session)
+            self._json(200, {"stopped": bool(session)})
+        elif p.path == "/api/chat/close":
+            session = (parse_qs(p.query).get("session", [""])[0] or "").strip()
+            _acp_close(session)
+            self._json(200, {"closed": bool(session)})
         elif p.path == "/api/hive/status":
             code, data = _hive_request("/status")
             self._json(200 if code == 200 else 502, data)
