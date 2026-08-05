@@ -425,16 +425,22 @@ def _mcp_server_names() -> list[str]:
     return names
 
 
-def _build_argv(prompt: str, session: str, model: str | None) -> list[str]:
+def _build_argv(prompt: str, session: str, model: str | None,
+                copilot_id: str | None = None) -> list[str]:
     """Legacy per-turn spawn (used when chat_fast is OFF => full MCP available).
 
     Resumes by a stable per-session UUID via --session-id: copilot creates the
     session on the first turn and resumes it thereafter. This is idempotent and
     unambiguous, unlike resuming by name (-n/--resume=<name>), which broke when a
     hal-ui restart re-created a session and left two copilot sessions sharing a
-    name ("Multiple sessions match the name ...")."""
+    name ("Multiple sessions match the name ...").
+
+    When copilot_id is given (a session revived from disk in the History tab), we
+    resume THAT real copilot session id directly so the conversation continues
+    with its full server-side context, instead of our uuid5-derived id."""
+    sid = copilot_id or _copilot_session_id(session)
     argv = [COPILOT_BIN, "-p", prompt, "--output-format", "json",
-            "--allow-all-tools", "--session-id", _copilot_session_id(session)]
+            "--allow-all-tools", "--session-id", sid]
     if model:
         argv += ["--model", model]
     return argv
@@ -455,7 +461,8 @@ def _build_argv(prompt: str, session: str, model: str | None) -> list[str]:
 class AcpProc:
     BOOT_TIMEOUT = 90
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, load_id: str | None = None,
+                 cwd: str | None = None):
         self.model = None
         self.session_id: str | None = None
         self.dead = False
@@ -469,7 +476,7 @@ class AcpProc:
             [COPILOT_BIN, "--acp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1, cwd=os.path.expanduser("~"))
         threading.Thread(target=self._reader, daemon=True).start()
-        self._boot(model)
+        self._boot(model, load_id, cwd)
 
     # --- low level ----------------------------------------------------
     def _next_id(self) -> int:
@@ -555,15 +562,28 @@ class AcpProc:
             self._write({"jsonrpc": "2.0", "id": rid, "result": {}})
 
     # --- lifecycle ----------------------------------------------------
-    def _boot(self, model: str | None):
+    def _boot(self, model: str | None, load_id: str | None = None,
+              cwd: str | None = None):
         self._request("initialize", {
             "protocolVersion": 1,
             "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
         }, timeout=self.BOOT_TIMEOUT)
-        res = self._request("session/new", {
-            "cwd": os.path.expanduser("~"), "mcpServers": [],
-        }, timeout=self.BOOT_TIMEOUT)
-        self.session_id = res.get("sessionId")
+        wd = cwd or os.path.expanduser("~")
+        if load_id:
+            # Resume an existing on-disk session (revived from the History tab).
+            # session/load replays the full history as session/update notifications
+            # before returning; we have no active turn sink yet, so that replay is
+            # harmlessly dropped here — the transcript is shown from /api/session/
+            # transcript instead. The session is left ready to continue.
+            self._request("session/load", {
+                "sessionId": load_id, "cwd": wd, "mcpServers": [],
+            }, timeout=self.BOOT_TIMEOUT)
+            self.session_id = load_id
+        else:
+            res = self._request("session/new", {
+                "cwd": wd, "mcpServers": [],
+            }, timeout=self.BOOT_TIMEOUT)
+            self.session_id = res.get("sessionId")
         if model:
             self.set_model(model)
 
@@ -663,13 +683,14 @@ _acp_procs: dict[str, AcpProc] = {}
 _acp_lock = threading.Lock()
 
 
-def _acp_get(session: str, model: str | None) -> AcpProc:
+def _acp_get(session: str, model: str | None,
+             load_id: str | None = None, cwd: str | None = None) -> AcpProc:
     with _acp_lock:
         p = _acp_procs.get(session)
         if p is not None and not p.dead and p.proc.poll() is None:
             p.set_model(model)
             return p
-        p = AcpProc(model)
+        p = AcpProc(model, load_id=load_id, cwd=cwd)
         _acp_procs[session] = p
         return p
 
@@ -761,6 +782,245 @@ def _list_models() -> dict:
 
 
 
+def _acp_oneshot():
+    """Spawn a short-lived `copilot --acp` and return (proc, send, pump) helpers
+    for one-off queries (session/list, session/load). pump(target) reads lines
+    until the response to request id `target` arrives, auto-answering any
+    agent->client requests, and returns (result_obj, notifications) where
+    notifications is the list of session/update payloads seen meanwhile."""
+    p = subprocess.Popen([COPILOT_BIN, "--acp"], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         text=True, bufsize=1)
+    state = {"id": 0}
+
+    def send(method, params):
+        state["id"] += 1
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": state["id"],
+                                  "method": method, "params": params}) + "\n")
+        p.stdin.flush()
+        return state["id"]
+
+    def pump(target, timeout=120):
+        notes = []
+        end = time.time() + timeout
+        while time.time() < end:
+            line = p.stdout.readline()
+            if not line:
+                break
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("method") == "session/update":
+                upd = (obj.get("params") or {}).get("update")
+                if upd is not None:
+                    notes.append(upd)
+                continue
+            if obj.get("method") and "id" in obj:      # agent->client request
+                p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": obj["id"],
+                                          "result": {}}) + "\n")
+                p.stdin.flush()
+                continue
+            if obj.get("id") == target and ("result" in obj or "error" in obj):
+                return obj, notes
+        return None, notes
+
+    return p, send, pump
+
+
+def _list_sessions(cap: int = 200) -> dict:
+    """Enumerate on-disk copilot sessions via ACP session/list (paginated).
+
+    Returns every session copilot knows about — console, other tools, and ones
+    hal-ui created — newest first, so the History tab can surface them. Cached by
+    the caller. On failure returns {"error": ...}."""
+    try:
+        p, send, pump = _acp_oneshot()
+    except Exception as exc:
+        return {"error": f"launch failed: {exc}"}
+    try:
+        send("initialize", {"protocolVersion": 1,
+                            "clientCapabilities": {"fs": {"readTextFile": False,
+                                                          "writeTextFile": False}}})
+        pump(1)
+        out, cursor, guard = [], None, 0
+        while guard < 20 and len(out) < cap:
+            guard += 1
+            params = {"cursor": cursor} if cursor else {}
+            i = send("session/list", params)
+            resp, _ = pump(i)
+            res = (resp or {}).get("result", {}) or {}
+            for s in res.get("sessions", []) or []:
+                out.append({"id": s.get("sessionId", ""),
+                            "title": s.get("title", "") or "",
+                            "cwd": s.get("cwd", "") or "",
+                            "updatedAt": s.get("updatedAt", "")})
+            cursor = res.get("nextCursor")
+            if not cursor:
+                break
+        out.sort(key=lambda s: s.get("updatedAt") or "", reverse=True)
+        return {"sessions": out[:cap]}
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
+# Full-text search over on-disk sessions. copilot stores each session's raw
+# event stream at ~/.copilot/session-state/<id>/events.jsonl; the user/assistant
+# message bodies live there. session/list only returns titles, so to let the
+# History search match transcript CONTENT (e.g. "coffee") we scan those files.
+_SESSION_STATE_DIR = os.path.expanduser("~/.copilot/session-state")
+_BODY_CAP = 60_000   # per-session text budget so the index stays memory-bounded
+
+
+def _session_body(session_id: str) -> str:
+    """Concatenated user+assistant message text for one on-disk session (capped)."""
+    path = os.path.join(_SESSION_STATE_DIR, session_id, "events.jsonl")
+    parts: list[str] = []
+    total = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"user.message"' not in line and '"assistant.message"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("type") not in ("user.message", "assistant.message"):
+                    continue
+                d = o.get("data") or o
+                c = d.get("content")
+                if isinstance(c, str) and c:
+                    parts.append(c)
+                    total += len(c)
+                    if total >= _BODY_CAP:
+                        break
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
+    return "\n".join(parts)
+
+
+def _search_sessions(query: str, cap: int = 100) -> dict:
+    """Search on-disk sessions by transcript body, title and cwd. Returns matches
+    newest-first with a highlighted-ready snippet around the first body hit.
+
+    Metadata (title/cwd/updatedAt) comes from the cached session list so results
+    line up with the browse view; the body scan reads events.jsonl per session."""
+    q = (query or "").strip()
+    if not q:
+        return {"sessions": []}
+    ql = q.lower()
+    meta = cached("sessions", 20.0, _list_sessions)
+    if isinstance(meta, dict) and meta.get("error"):
+        return {"error": meta["error"]}
+    out = []
+    for s in (meta.get("sessions") or []):
+        sid = s.get("id") or ""
+        title = s.get("title") or ""
+        cwd = s.get("cwd") or ""
+        snippet = ""
+        hit = False
+        body = _session_body(sid)
+        i = body.lower().find(ql)
+        if i >= 0:
+            hit = True
+            start = max(0, i - 40)
+            snippet = ("…" if start > 0 else "") + body[start:i + len(q) + 70].replace("\n", " ")
+        elif ql in title.lower() or ql in cwd.lower():
+            hit = True
+            snippet = (title[:120] or cwd[:120])
+        if hit:
+            out.append({"id": sid, "title": title, "cwd": cwd,
+                        "updatedAt": s.get("updatedAt", ""), "snippet": snippet})
+        if len(out) >= cap:
+            break
+    return {"sessions": out}
+
+
+# Agent chunks copilot injects that are pure plumbing, not conversation.
+_TRANSCRIPT_NOISE = ("Info: Remote control connected",
+                     "Warning: Failed to connect to MCP server")
+
+
+def _load_transcript(session_id: str, cwd: str | None = None) -> dict:
+    """Replay a copilot session's full history via ACP session/load and coalesce
+    it into the client transcript shape: [{role:'user'|'bot', text, tools?}].
+
+    Consecutive assistant chunks fold into one bubble; tool_call titles attach to
+    the assistant turn that issued them; user chunks start a user bubble."""
+    try:
+        p, send, pump = _acp_oneshot()
+    except Exception as exc:
+        return {"error": f"launch failed: {exc}"}
+    try:
+        send("initialize", {"protocolVersion": 1,
+                            "clientCapabilities": {"fs": {"readTextFile": False,
+                                                          "writeTextFile": False}}})
+        pump(1)
+        wd = cwd or os.path.expanduser("~")
+        i = send("session/load", {"sessionId": session_id, "cwd": wd, "mcpServers": []})
+        resp, notes = pump(i, timeout=180)
+        if resp is None or "error" in (resp or {}):
+            return {"error": (resp or {}).get("error", "load failed") if resp else "load timeout"}
+
+        messages: list[dict] = []
+        cur = {"role": None, "text": "", "tools": []}
+
+        def flush():
+            if cur["role"] is None:
+                return
+            txt = cur["text"].strip()
+            if cur["role"] == "bot":
+                if txt or cur["tools"]:
+                    messages.append({"role": "bot", "text": txt, "tools": list(cur["tools"])})
+            else:
+                if txt:
+                    messages.append({"role": "user", "text": txt})
+            cur["role"], cur["text"], cur["tools"] = None, "", []
+
+        def content_text(c):
+            if isinstance(c, dict):
+                return c.get("text", "") or ""
+            return ""
+
+        for u in notes:
+            kind = u.get("sessionUpdate")
+            if kind == "agent_message_chunk":
+                t = content_text(u.get("content"))
+                if any(t.startswith(n) for n in _TRANSCRIPT_NOISE):
+                    continue
+                if cur["role"] != "bot":
+                    flush(); cur["role"] = "bot"
+                cur["text"] += t
+            elif kind == "user_message_chunk":
+                t = content_text(u.get("content"))
+                if cur["role"] != "user":
+                    flush(); cur["role"] = "user"
+                cur["text"] += t
+            elif kind == "tool_call":
+                if cur["role"] != "bot":
+                    flush(); cur["role"] = "bot"
+                title = u.get("title") or u.get("kind") or "tool"
+                cur["tools"].append(title)
+            # tool_call_update / plan / thought: ignored for the transcript
+        flush()
+        return {"messages": messages}
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
 # A turn is driven by a background worker thread that appends SSE events into a
 # per-session LiveTurn buffer instead of writing straight to one HTTP socket.
 # The HTTP request that started the turn (and any later /api/chat/resume request)
@@ -807,10 +1067,13 @@ _live_turns: dict[str, LiveTurn] = {}
 _live_lock = threading.Lock()
 
 
-def _run_acp_turn(session, model, prompt, images, lt: LiveTurn):
-    """Fast lane: run one turn on the persistent ACP process, buffering events."""
+def _run_acp_turn(session, model, prompt, images, lt: LiveTurn,
+                  copilot_id=None, copilot_cwd=None):
+    """Fast lane: run one turn on the persistent ACP process, buffering events.
+    When copilot_id is set (a revived on-disk session) the process boots by
+    session/load-ing that id so the turn continues its real context."""
     try:
-        acp = _acp_get(session, model)
+        acp = _acp_get(session, model, load_id=copilot_id, cwd=copilot_cwd)
     except Exception as exc:
         lt.append("error", {"message": f"acp launch failed: {exc}"})
         lt.append("done", {"code": 1})
@@ -823,12 +1086,12 @@ def _run_acp_turn(session, model, prompt, images, lt: LiveTurn):
         lt.append("done", {"code": 1})
 
 
-def _run_subprocess_turn(session, model, prompt, lt: LiveTurn):
+def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
     """Legacy lane (chat_fast OFF => full MCP): spawn `copilot -p ...` per turn,
     parse its JSONL, buffer events. Survives browser close because it runs in the
     turn worker thread, not the HTTP request."""
     emit = lt.append
-    argv = _build_argv(prompt, session, model)
+    argv = _build_argv(prompt, session, model, copilot_id=copilot_id)
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 cwd=os.path.expanduser("~"), text=True, bufsize=1)
@@ -874,13 +1137,17 @@ def _run_subprocess_turn(session, model, prompt, lt: LiveTurn):
         emit("done", {"code": proc.returncode, "stderr": err.strip()})
 
 
-def _start_turn(session: str, model: str | None, prompt: str, images: list) -> LiveTurn:
+def _start_turn(session: str, model: str | None, prompt: str, images: list,
+                copilot_id: str | None = None, copilot_cwd: str | None = None) -> LiveTurn:
     """Begin a turn in a background worker thread that buffers its SSE events into
     a LiveTurn. Returns the buffer immediately so the HTTP request can relay it.
     Because the turn runs off-thread, a browser close does not end it — a reopened
     tab reattaches via /api/chat/resume. Replaces any prior buffer for the session.
     Lane choice mirrors _sse_chat: ACP fast lane, or legacy subprocess when
-    chat_fast is off (images always force the ACP lane)."""
+    chat_fast is off (images always force the ACP lane).
+
+    copilot_id (optional) pins this session to a real on-disk copilot session id
+    revived from the History tab so the turn resumes that conversation."""
     turn_id = uuid.uuid4().hex
     lt = LiveTurn(turn_id)
     with _live_lock:
@@ -891,9 +1158,10 @@ def _start_turn(session: str, model: str | None, prompt: str, images: list) -> L
     def worker():
         try:
             if fast:
-                _run_acp_turn(session, model, prompt, images, lt)
+                _run_acp_turn(session, model, prompt, images, lt,
+                              copilot_id=copilot_id, copilot_cwd=copilot_cwd)
             else:
-                _run_subprocess_turn(session, model, prompt, lt)
+                _run_subprocess_turn(session, model, prompt, lt, copilot_id=copilot_id)
         finally:
             lt.finish()
 
@@ -1021,6 +1289,8 @@ class Handler(BaseHTTPRequestHandler):
         model = (qs.get("model", [""])[0]).strip() or None
         attach_ids = [a for a in (qs.get("attach", [""])[0] or "").split(",") if a]
         images = _attach_take(attach_ids) if attach_ids else []
+        copilot_id = (qs.get("copilot", [""])[0]).strip() or None
+        copilot_cwd = (qs.get("cwd", [""])[0]).strip() or None
         if not prompt and not images:
             self.send_error(400, "missing prompt")
             return
@@ -1033,7 +1303,8 @@ class Handler(BaseHTTPRequestHandler):
         # this request just relays them. If the browser closes we stop relaying but
         # DO NOT cancel — the worker keeps running and a reopened tab reattaches via
         # /api/chat/resume. Lane (ACP vs subprocess) is chosen inside _start_turn.
-        lt = _start_turn(session, model, prompt, images)
+        lt = _start_turn(session, model, prompt, images,
+                         copilot_id=copilot_id, copilot_cwd=copilot_cwd)
         self._relay_live(lt, 0)
 
     # --- routing -------------------------------------------------------
@@ -1073,6 +1344,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, cached("ado_mywork", 30.0, _ado_mywork))
         elif p.path == "/api/models":
             self._json(200, cached("models", 600.0, _list_models))
+        elif p.path == "/api/sessions":
+            self._json(200, cached("sessions", 20.0, _list_sessions))
+        elif p.path == "/api/sessions/search":
+            qs = parse_qs(p.query)
+            q = (qs.get("q", [""])[0]).strip()
+            self._json(200, _search_sessions(q))
+        elif p.path == "/api/session/transcript":
+            qs = parse_qs(p.query)
+            sid = (qs.get("id", [""])[0]).strip()
+            cwd = (qs.get("cwd", [""])[0]).strip() or None
+            if not sid:
+                self._json(400, {"error": "missing id"})
+            else:
+                self._json(200, _load_transcript(sid, cwd))
         elif p.path == "/api/settings":
             self._json(200, masked_config())
         else:

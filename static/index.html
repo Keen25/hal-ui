@@ -363,7 +363,7 @@
         <span class="grow"></span>
         <input id="hist-q" placeholder="Search label or message text…" style="min-width:280px" autocomplete="off" />
       </div>
-      <div class="muted" style="margin:2px 0 12px">Closed sessions are archived here. Click one to revive it (transcript restored; keep chatting to continue).</div>
+      <div class="muted" style="margin:2px 0 12px">Closed sessions are archived here. Below them, every copilot session on this machine (console and other tools) can be revived — transcript restored; keep chatting to continue.</div>
       <div id="hist-list"></div>
     </div>
   </section>
@@ -584,6 +584,7 @@
     if (!s || !s.messages || !s.messages.length) return;   // nothing worth keeping
     state.history ||= {};
     state.history[sid] = { label: s.label, model: s.model || "",
+      copilotId: s.copilotId || "", copilotCwd: s.copilotCwd || "",
       messages: s.messages.slice(-120), closedAt: Date.now() };
     // evict oldest beyond the cap
     const ids = Object.keys(state.history).sort((a,b)=>(state.history[b].closedAt||0)-(state.history[a].closedAt||0));
@@ -607,6 +608,7 @@
     const h = state.history && state.history[sid]; if (!h) return;
     const nsid = state.sessions[sid] ? newSid() : sid;    // avoid colliding with a live session id
     state.sessions[nsid] = { label: h.label, model: h.model || "", messages: h.messages || [] };
+    if (h.copilotId) { state.sessions[nsid].copilotId = h.copilotId; state.sessions[nsid].copilotCwd = h.copilotCwd || ""; }
     state.order.push(nsid); state.active = nsid;
     delete state.history[sid];
     save();
@@ -621,6 +623,11 @@
   }
 
   /* ---- searchable session history ---- */
+  let diskSessions = [];   // on-disk copilot sessions (from /api/sessions)
+  let diskErr = "";        // last /api/sessions error, shown in the On-disk section
+  let diskSearchQ = null;      // query the current body-search results belong to
+  let diskSearchResults = null;// results from /api/sessions/search for diskSearchQ
+  let diskSearchTimer = null;  // debounce handle for the body search
   function histAgo(ts) {
     if (!ts) return "";
     const s = Math.floor((Date.now() - ts) / 1000);
@@ -669,15 +676,103 @@
         <div class="hdel" title="Delete from history" data-del="${esc(sid)}">🗑</div></div>`);
     }
     $("#hist-count").textContent = ids.length ? `${shown} / ${ids.length}` : "empty";
-    box.innerHTML = rows.length ? rows.join("")
+    const archivedHtml = rows.length ? rows.join("")
       : `<div class="muted">${ids.length ? "No sessions match your search." : "No archived sessions yet. Close a session (× on its tab) to archive it here."}</div>`;
+
+    // On-disk section: every copilot session on this machine (console + other
+    // tools + ours). With no query we browse the cached list; with a query we
+    // show server-side FULL-TEXT matches (transcript body, title, cwd).
+    const ql = q.toLowerCase();
+    function hi(text) {   // highlight the query inside a plain string
+      if (!q) return esc(text);
+      const i = text.toLowerCase().indexOf(ql);
+      if (i < 0) return esc(text);
+      return esc(text.slice(0,i)) + "<mark>" + esc(text.slice(i,i+q.length)) + "</mark>" + esc(text.slice(i+q.length));
+    }
+    function diskRow(d, sub, subIsSnippet) {
+      const title = d.title || "(untitled session)";
+      const ts = d.updatedAt ? Date.parse(d.updatedAt) : 0;
+      return `<div class="hitem ditem" data-id="${esc(d.id)}" data-title="${esc(title)}" data-cwd="${esc(d.cwd||"")}">
+        <div class="hmain"><div class="hlabel">${hi(title)}</div>
+        <div class="hsnip ${subIsSnippet?"":"muted"}">${subIsSnippet ? hi(sub) : esc(sub||"")}</div></div>
+        <div class="hmeta">on disk<br>${histAgo(ts)}</div></div>`;
+    }
+    let diskHtml = "";
+    if (diskErr) {
+      diskHtml = `<div class="muted">On-disk sessions unavailable: ${esc(diskErr)}</div>`;
+    } else if (q) {
+      // full-text search mode: results come from /api/sessions/search (debounced)
+      const ready = diskSearchQ === q && Array.isArray(diskSearchResults);
+      const res = ready ? diskSearchResults : [];
+      const rowsD = res.map(d => diskRow(d, d.snippet, true));
+      diskHtml = `<div class="toolbar" style="margin-top:14px"><strong>On disk</strong>
+        <span class="muted">${ready ? res.length + " match" + (res.length===1?"":"es") : "searching contents…"}</span></div>`
+        + (ready ? (rowsD.length ? rowsD.join("") : `<div class="muted">No on-disk sessions mention "${esc(q)}".</div>`)
+                 : `<div class="muted">Searching transcripts…</div>`);
+    } else {
+      const rowsD = (diskSessions || []).map(d => diskRow(d, d.cwd, false));
+      diskHtml = `<div class="toolbar" style="margin-top:14px"><strong>On disk</strong>
+        <span class="muted">${(diskSessions||[]).length} copilot session${(diskSessions||[]).length===1?"":"s"}</span></div>`
+        + (rowsD.length ? rowsD.join("") : `<div class="muted">Loading on-disk sessions…</div>`);
+    }
+    box.innerHTML = archivedHtml + diskHtml;
     box.querySelectorAll(".hdel").forEach(el => el.onclick = (e) => {
       e.stopPropagation(); delete state.history[el.dataset.del]; save(); renderHistory();
     });
-    box.querySelectorAll(".hitem").forEach(el => el.onclick = () => reviveSession(el.dataset.sid));
+    box.querySelectorAll(".hitem").forEach(el => el.onclick = () => {
+      if (el.classList.contains("ditem")) reviveOnDisk(el.dataset.id, el.dataset.title, el.dataset.cwd);
+      else reviveSession(el.dataset.sid);
+    });
   }
-  function loadHistory() { renderHistory(); setTimeout(() => $("#hist-q").focus(), 0); }
-  $("#hist-q").addEventListener("input", renderHistory);
+  // Revive a session that lives only on disk: open a fresh chat tab, replay its
+  // full transcript (server-side via ACP session/load), and pin it to the real
+  // copilot session id so continuing the chat resumes that conversation.
+  async function reviveOnDisk(id, title, cwd) {
+    const nsid = newSid();
+    state.sessions[nsid] = { label: title || "Session", model: "",
+      copilotId: id, copilotCwd: cwd || "",
+      messages: [{ role:"bot", text:"⏳ Loading transcript…" }] };
+    state.order.push(nsid); state.active = nsid;
+    save();
+    document.querySelector('.tab[data-view="chat"]').click();
+    renderStrip(); renderLog(); syncModel(); renderPending();
+    try {
+      const r = await fetch(`/api/session/transcript?id=${encodeURIComponent(id)}${cwd?`&cwd=${encodeURIComponent(cwd)}`:""}`);
+      const d = await r.json();
+      const s = state.sessions[nsid]; if (!s) return;
+      if (d && d.error) s.messages = [{ role:"bot", text:"[couldn't load transcript: "+d.error+"] You can still continue the conversation below." }];
+      else s.messages = (d.messages && d.messages.length) ? d.messages : [{ role:"bot", text:"(empty transcript — continue below to resume this session)" }];
+      save(); if (state.active === nsid) renderLog();
+    } catch (e) {
+      const s = state.sessions[nsid]; if (s) { s.messages = [{ role:"bot", text:"[transcript fetch failed — server.py running?]" }]; save(); if (state.active===nsid) renderLog(); }
+    }
+  }
+  function loadHistory() {
+    renderHistory();
+    setTimeout(() => $("#hist-q").focus(), 0);
+    fetch("/api/sessions").then(r => r.json()).then(d => {
+      if (d && d.error) { diskErr = d.error; diskSessions = []; }
+      else { diskErr = ""; diskSessions = d.sessions || []; }
+      renderHistory();
+    }).catch(() => { diskErr = "server unreachable"; renderHistory(); });
+  }
+  // Debounced full-text search of on-disk transcripts. Instant repaint keeps the
+  // archived list + browse view responsive; the body scan lands ~250ms later.
+  function scheduleDiskSearch() {
+    const q = ($("#hist-q").value || "").trim();
+    if (diskSearchTimer) clearTimeout(diskSearchTimer);
+    if (!q) { diskSearchQ = null; diskSearchResults = null; return; }
+    diskSearchTimer = setTimeout(() => {
+      fetch("/api/sessions/search?q=" + encodeURIComponent(q)).then(r => r.json()).then(d => {
+        if (($("#hist-q").value || "").trim() !== q) return;   // user moved on
+        diskSearchQ = q;
+        diskSearchResults = (d && d.error) ? [] : (d.sessions || []);
+        renderHistory();
+      }).catch(() => { diskSearchQ = q; diskSearchResults = []; renderHistory(); });
+    }, 250);
+  }
+  function onHistInput() { renderHistory(); scheduleDiskSearch(); }
+  $("#hist-q").addEventListener("input", onHistInput);
   function syncModel() { $("#model").value = cur().model || ""; }
 
   // Populate the three model <select>s from the live catalog (/api/models),
@@ -876,6 +971,10 @@
     const ids = await uploadAtts(atts);  // stage images server-side, reference by id
     let url = `/api/chat?session=${encodeURIComponent(sid)}&model=${encodeURIComponent(s.model||"")}&prompt=${encodeURIComponent(sendText)}`;
     if (ids.length) url += `&attach=${encodeURIComponent(ids.join(","))}`;
+    if (s.copilotId) {                                 // revived on-disk session: resume its real copilot session
+      url += `&copilot=${encodeURIComponent(s.copilotId)}`;
+      if (s.copilotCwd) url += `&cwd=${encodeURIComponent(s.copilotCwd)}`;
+    }
     const source = new EventSource(url);
     wireStream(sid, source, bot);
   }
