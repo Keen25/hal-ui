@@ -25,6 +25,7 @@
   .tab { padding:6px 14px; border-radius:8px; cursor:pointer; color:var(--muted);
     border:1px solid transparent; user-select:none; }
   .tab.active { color:var(--txt); background:var(--panel2); border-color:var(--line); }
+  .hive-off .tab[data-view="hive"], .hive-off #tohive { display:none !important; }
   main { flex:1; min-height:0; display:flex; }
   .view { flex:1; min-height:0; display:none; flex-direction:column; }
   .view.active { display:flex; }
@@ -943,8 +944,17 @@
   renderStrip(); renderLog(); syncModel(); renderPending();
   // reattach to any turns that were still running server-side when we last closed
   for (const sid of state.order) { if (state.sessions[sid] && state.sessions[sid].pendingTurn) resumeTurn(sid); }
+  // Hive is optional: when no hive URL is configured the server reports
+  // hive_enabled:false, so we hide the Hive tab + "→ Hive" button (CSS) and,
+  // if the Hive view is open, fall back to Chat.
+  function applyHive(enabled){
+    document.body.classList.toggle("hive-off", !enabled);
+    if(!enabled && $("#view-hive").classList.contains("active"))
+      document.querySelector('.tab[data-view="chat"]').click();
+  }
+
   // pull default model from settings for new sessions
-  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; }).catch(()=>{});
+  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; applyHive(c.hive_enabled!==false); }).catch(()=>{});
 
   /* ================= HIVE ================= */
   const ACTIVE = new Set(["queued","pending","claimed","running","probing","reviewing","needs_attention","merging"]);
@@ -1235,6 +1245,7 @@
       const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
       const c=await r.json();
       window.__defaultModel=c.default_model||"";
+      applyHive(c.hive_enabled!==false);
       $("#s-ado_pat").value=""; $("#s-hive_token").value=""; loadSettings();
       m.className="msgbox ok"; m.textContent="saved"; 
     }catch(err){ m.className="msgbox err"; m.textContent=err.message; }

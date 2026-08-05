@@ -89,6 +89,7 @@ def masked_config() -> dict:
     out = {k: ("" if k in _SECRET_KEYS else v) for k, v in cfg.items()}
     for k in _SECRET_KEYS:
         out[k + "_set"] = bool(cfg.get(k))
+    out["hive_enabled"] = _hive_enabled()
     return out
 
 # Fixed namespace so a given browser session always maps to the same copilot
@@ -133,6 +134,13 @@ def _hive_token() -> str:
 
 def _hive_url() -> str:
     return (load_config().get("hive_url") or HIVE_URL_DEFAULT).rstrip("/")
+
+
+def _hive_enabled() -> bool:
+    """Hive integration is optional: enabled only when a hive URL is configured.
+    Clear the Hive URL in Settings to decommission the hive (hides its tab and
+    buttons, and disables the hive API routes)."""
+    return bool((load_config().get("hive_url") or "").strip())
 
 
 def _hive_request(path: str, method: str = "GET", body: dict | None = None):
@@ -974,9 +982,15 @@ class Handler(BaseHTTPRequestHandler):
             _acp_close(session)
             self._json(200, {"closed": bool(session)})
         elif p.path == "/api/hive/status":
-            code, data = _hive_request("/status")
-            self._json(200 if code == 200 else 502, data)
+            if not _hive_enabled():
+                self._json(404, {"error": "hive disabled"})
+            else:
+                code, data = _hive_request("/status")
+                self._json(200 if code == 200 else 502, data)
         elif p.path == "/api/hive/task":
+            if not _hive_enabled():
+                self._json(404, {"error": "hive disabled"})
+                return
             tid = (parse_qs(p.query).get("id", [""])[0] or "").strip()
             if not tid:
                 self._json(400, {"error": "id is required"})
@@ -1011,6 +1025,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, {"id": _attach_put(mime, data)})
         elif p.path == "/api/hive/add":
+            if not _hive_enabled():
+                self._json(404, {"error": "hive disabled"})
+                return
             tid = (body.get("id") or "").strip()
             prompt = (body.get("prompt") or "").strip()
             if not tid or not prompt:
