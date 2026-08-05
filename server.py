@@ -24,6 +24,7 @@ import concurrent.futures
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -40,6 +41,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 COPILOT_BIN = shutil.which("copilot") or os.path.expanduser("~/.local/bin/copilot")
 GH_BIN = shutil.which("gh") or "/usr/bin/gh"
 AZ_BIN = shutil.which("az") or "/usr/bin/az"
+SF_BIN = shutil.which("sf") or "sf"
+SF_EXPECTED_ORG_ID = "00D30000000n44BEAQ"   # Quest/One Identity Salesforce org
 HIVE_URL_DEFAULT = os.environ.get("HIVE_URL", "http://127.0.0.1:5001")
 HIVE_TOKEN_FILE = os.path.expanduser("~/.hive/worker.token")
 ADO_RESOURCE = "499b84ac-1321-427f-aa17-267ca6975798"  # Azure DevOps AAD app id
@@ -55,6 +58,8 @@ DEFAULT_CONFIG = {
     "hive_token": "",       # optional override; blank => ~/.hive/worker.token
     "default_model": "",
     "chat_fast": True,      # disable MCP servers in the chat lane for faster startup
+    "sf_org": "",           # Salesforce target org username/alias; blank => auto-resolve
+    "sf_products": "ActiveRolesServer,PasswordManager",  # default R&D queues for the CR tab
 }
 _SECRET_KEYS = {"ado_pat", "hive_token"}
 _config_lock = threading.Lock()
@@ -90,6 +95,7 @@ def masked_config() -> dict:
     for k in _SECRET_KEYS:
         out[k + "_set"] = bool(cfg.get(k))
     out["hive_enabled"] = _hive_enabled()
+    out["sf_enabled"] = _sf_enabled()
     return out
 
 # Fixed namespace so a given browser session always maps to the same copilot
@@ -405,6 +411,205 @@ def _ado_mywork():
         _enrich_pr_threads(org, prs)
     return {"workitems": workitems, "prs": prs,
             "identity_resolved": bool(ident)}
+
+
+# ======================================================================
+# Salesforce Collaboration Requests (CRs). Support escalates customer cases to
+# R&D as CRs (custom object Collaboration_Request__c). We shell out to the `sf`
+# CLI (already authenticated to the Quest org) and surface three views in the UI:
+#   - Mine       : CRs owned by the authenticated Salesforce user
+#   - Unassigned : CRs still owned by a queue (Owner.Type == 'Queue')
+#   - All        : every open R&D CR for the selected product queues
+# The filter mirrors the Salesforce list view the team uses:
+#   Status != 'Completed'  AND  Type__c = 'R&D'  AND  R_D_Queue__c IN (products)
+# ======================================================================
+_SF_DEFAULT_PRODUCTS = ["ActiveRolesServer", "PasswordManager"]
+_SF_CR_FIELDS = ("Id,Name,Status__c,CR_Priority__c,Case_Subject__c,"
+                 "Support_Product__c,R_D_Queue__c,CreatedDate,LastModifiedDate,"
+                 "Case_Number__c,External_Tracking_ID__c,OwnerId,Owner.Type,"
+                 "Owner.Name,At_Risk__c,Case_Escalated__c")
+
+
+def _soql_esc(s: str) -> str:
+    """Escape a value for inlining into a SOQL string literal."""
+    return str(s).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _sf_prio_n(priority) -> int:
+    """Sortable priority: first integer in the value (e.g. 'Level 2'->2, 'P1'->1);
+    missing/unknown sinks to the bottom."""
+    m = re.search(r"(\d+)", str(priority or ""))
+    return int(m.group(1)) if m else 99
+
+
+def _sf_run(args: list, timeout: float = 60) -> dict:
+    """Run an `sf` subcommand with --json and return the parsed object, or
+    {'error': ...} on any failure."""
+    try:
+        out = subprocess.run([SF_BIN, *args, "--json"],
+                             capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return {"error": "sf CLI not found"}
+    except subprocess.TimeoutExpired:
+        return {"error": "sf CLI timed out"}
+    except Exception as exc:
+        return {"error": str(exc)}
+    try:
+        return json.loads(out.stdout or "{}")
+    except json.JSONDecodeError:
+        return {"error": (out.stderr or out.stdout or "sf: no output").strip()[:200]}
+
+
+def _sf_org() -> str:
+    """Resolve (and cache) the authenticated Salesforce org username. Config
+    sf_org overrides; otherwise pick the Connected org matching the expected
+    orgId, falling back to any Connected org."""
+    cfg = load_config()
+    if cfg.get("sf_org"):
+        return cfg["sf_org"]
+
+    def producer():
+        d = _sf_run(["org", "list"])
+        res = d.get("result") or {}
+        fallback = ""
+        for grp in ("nonScratchOrgs", "sandboxes", "scratchOrgs", "other"):
+            for o in res.get(grp) or []:
+                if o.get("connectedStatus") != "Connected":
+                    continue
+                uname = o.get("username") or o.get("alias") or ""
+                if o.get("orgId") == SF_EXPECTED_ORG_ID:
+                    return uname
+                fallback = fallback or uname
+        return fallback
+
+    return cached("sf_org", 300.0, producer)
+
+
+def _sf_enabled() -> bool:
+    """True when the sf CLI is present and an org is resolvable => show the CR tab."""
+    if not (shutil.which("sf") or (SF_BIN and os.path.sep in SF_BIN and os.path.exists(SF_BIN))):
+        return False
+    return bool(_sf_org())
+
+
+def _sf_query(soql: str, timeout: float = 60):
+    """Run a SOQL query via the sf CLI. Returns (records, error_or_None)."""
+    org = _sf_org()
+    if not org:
+        return None, "no Salesforce org (run: sf org login web)"
+    d = _sf_run(["data", "query", "-o", org, "--query", soql], timeout=timeout)
+    if "result" not in d:
+        return None, (d.get("message") or d.get("name") or d.get("error")
+                      or "sf query failed")[:200]
+    return (d["result"].get("records") or []), None
+
+
+def _sf_identity() -> str:
+    """The authenticated user's Salesforce User Id (owner of the 'Mine' view)."""
+    def producer():
+        org = _sf_org()
+        if not org:
+            return ""
+        disp = _sf_run(["org", "display", "-o", org])
+        uname = ((disp.get("result") or {}).get("username")) or org
+        recs, err = _sf_query(
+            f"SELECT Id FROM User WHERE Username = '{_soql_esc(uname)}' LIMIT 1")
+        if err or not recs:
+            return ""
+        return recs[0].get("Id", "")
+    return cached("sf_identity", 600.0, producer)
+
+
+def _sf_lightning_base() -> str:
+    """Lightning base URL for building CR record links (…/lightning/r/…)."""
+    def producer():
+        org = _sf_org()
+        if not org:
+            return ""
+        disp = _sf_run(["org", "display", "-o", org])
+        inst = ((disp.get("result") or {}).get("instanceUrl")) or ""
+        if not inst:
+            return ""
+        # https://<host>.my.salesforce.com -> https://<host>.lightning.force.com
+        return inst.replace(".my.salesforce.com", ".lightning.force.com")
+    return cached("sf_lightning", 600.0, producer)
+
+
+def _sf_products() -> dict:
+    """Distinct R&D queues among open R&D CRs (with counts) for the product picker."""
+    recs, err = _sf_query(
+        "SELECT R_D_Queue__c FROM Collaboration_Request__c "
+        "WHERE Status__c != 'Completed' AND Type__c = 'R&D' "
+        "AND R_D_Queue__c != null LIMIT 5000")
+    if err:
+        return {"error": err}
+    counts: dict[str, int] = {}
+    for r in recs:
+        q = r.get("R_D_Queue__c")
+        if q:
+            counts[q] = counts.get(q, 0) + 1
+    items = sorted(({"queue": k, "count": v} for k, v in counts.items()),
+                   key=lambda x: (-x["count"], x["queue"].lower()))
+    return {"products": items, "default": _SF_DEFAULT_PRODUCTS}
+
+
+def _sf_yes(v) -> bool:
+    """These SF fields come back as strings ('YES'/'NO', sometimes HTML-wrapped
+    like '<img ... alt="Yes"/> YES'), not booleans. Treat only a real YES as true."""
+    return "YES" in str(v or "").upper()
+
+
+def _sf_cr_row(r: dict, base: str) -> dict:
+    owner = r.get("Owner") or {}
+    rid = r.get("Id") or ""
+    return {
+        "id": rid,
+        "name": r.get("Name") or "",
+        "status": r.get("Status__c") or "",
+        "priority": r.get("CR_Priority__c") or "",
+        "prio_n": _sf_prio_n(r.get("CR_Priority__c")),
+        "subject": r.get("Case_Subject__c") or "",
+        "product": r.get("Support_Product__c") or "",
+        "queue": r.get("R_D_Queue__c") or "",
+        "created": r.get("CreatedDate") or "",
+        "modified": r.get("LastModifiedDate") or "",
+        "case": r.get("Case_Number__c") or "",
+        "ado": r.get("External_Tracking_ID__c") or "",
+        "atRisk": _sf_yes(r.get("At_Risk__c")),
+        "escalated": _sf_yes(r.get("Case_Escalated__c")),
+        "owner": owner.get("Name") or "",
+        "ownerType": owner.get("Type") or "",
+        "url": (f"{base}/lightning/r/Collaboration_Request__c/{rid}/view"
+                if base and rid else ""),
+    }
+
+
+def _sf_crs(products: list) -> dict:
+    """Fetch open R&D CRs for the given R&D queues and partition into
+    mine / unassigned / all."""
+    products = [p.strip() for p in products if p and p.strip()]
+    if not products:
+        products = list(_SF_DEFAULT_PRODUCTS)
+    in_list = ", ".join("'" + _soql_esc(p) + "'" for p in products)
+    soql = (f"SELECT {_SF_CR_FIELDS} FROM Collaboration_Request__c "
+            f"WHERE Status__c != 'Completed' AND Type__c = 'R&D' "
+            f"AND R_D_Queue__c IN ({in_list}) "
+            f"ORDER BY CreatedDate ASC LIMIT 500")
+    recs, err = _sf_query(soql, timeout=90)
+    if err:
+        return {"error": err, "products": products}
+    me = _sf_identity()
+    base = _sf_lightning_base()
+    mine, unassigned, allrows = [], [], []
+    for r in recs:
+        row = _sf_cr_row(r, base)
+        allrows.append(row)
+        if me and r.get("OwnerId") == me:
+            mine.append(row)
+        if (r.get("Owner") or {}).get("Type") == "Queue":
+            unassigned.append(row)
+    return {"mine": mine, "unassigned": unassigned, "all": allrows,
+            "products": products, "identity_resolved": bool(me)}
 
 
 def _mcp_server_names() -> list[str]:
@@ -1342,6 +1547,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, cached("mywork", 30.0, _github_mywork))
         elif p.path == "/api/ado/mywork":
             self._json(200, cached("ado_mywork", 30.0, _ado_mywork))
+        elif p.path == "/api/sf/products":
+            if not _sf_enabled():
+                self._json(404, {"error": "salesforce disabled"})
+            else:
+                self._json(200, cached("sf_products", 300.0, _sf_products))
+        elif p.path == "/api/sf/crs":
+            if not _sf_enabled():
+                self._json(404, {"error": "salesforce disabled"})
+            else:
+                raw = (parse_qs(p.query).get("products", [""])[0] or "").strip()
+                products = [x for x in raw.split(",") if x] if raw else []
+                key = "sf_crs:" + ",".join(sorted(products))
+                self._json(200, cached(key, 30.0, lambda: _sf_crs(products)))
         elif p.path == "/api/models":
             self._json(200, cached("models", 600.0, _list_models))
         elif p.path == "/api/sessions":

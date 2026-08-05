@@ -26,6 +26,7 @@
     border:1px solid transparent; user-select:none; }
   .tab.active { color:var(--txt); background:var(--panel2); border-color:var(--line); }
   .hive-off .tab[data-view="hive"], .hive-off #tohive { display:none !important; }
+  .sf-off .tab[data-view="sf"] { display:none !important; }
   main { flex:1; min-height:0; display:flex; }
   .view { flex:1; min-height:0; display:none; flex-direction:column; }
   .view.active { display:flex; }
@@ -108,6 +109,25 @@
   th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
   td.title { max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; border:1px solid var(--line); }
+  .prodpick { position:relative; }
+  .prodpick > summary { cursor:pointer; list-style:none; padding:3px 10px; border:1px solid var(--line);
+    border-radius:6px; background:var(--panel2); font-size:12px; user-select:none; }
+  .prodpick > summary::-webkit-details-marker { display:none; }
+  .prodlist { position:absolute; right:0; top:26px; z-index:30; background:var(--panel); border:1px solid var(--line);
+    border-radius:8px; padding:6px; min-width:230px; max-height:320px; overflow:auto; box-shadow:0 8px 24px #0008; }
+  .prodlist label { display:flex; gap:8px; align-items:center; padding:4px 6px; font-size:12px; border-radius:5px; cursor:pointer; }
+  .prodlist label:hover { background:var(--panel2); }
+  .prodlist .pcount { margin-left:auto; color:var(--muted); }
+  .atrisk { color:var(--bad); font-weight:600; }
+  .esc { color:#f0883e; font-weight:600; }
+  /* Fixed layout so the three CR tables share identical column alignment. */
+  table.sf-table { table-layout:fixed; }
+  table.sf-table td, table.sf-table th { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sf-table .c-cr{width:8.5%} .sf-table .c-pri{width:6%} .sf-table .c-st{width:15%}
+  .sf-table .c-prod{width:11%} .sf-table .c-subj{width:auto} .sf-table .c-own{width:13%}
+  .sf-table .c-ado{width:7%} .sf-table .c-chat{width:7.5%}
+  .prio-1,.prio-2 { color:#f85149; font-weight:600; }
+  .prio-3 { color:#d29922; }
   .s-running,.s-claimed { color:#7ee787; border-color:#2ea04355; }
   .s-queued,.s-pending { color:#79c0ff; border-color:#1f6feb55; }
   .s-merged,.s-reviewed { color:#a5d6ff; border-color:#388bfd55; }
@@ -238,6 +258,7 @@
     <div class="tab" data-view="hive">Hive</div>
     <div class="tab" data-view="github">GitHub</div>
     <div class="tab" data-view="ado">ADO</div>
+    <div class="tab" data-view="sf">CRs</div>
     <div class="tab" data-view="history">History</div>
     <div class="tab" data-view="settings">⚙</div>
   </div>
@@ -352,6 +373,35 @@
         <select id="adowi-type" class="mini"><option value="">all</option></select></div>
       <table id="workitems"><thead><tr><th>ID</th><th>Type</th><th>State</th><th>Project</th><th>Title</th>
         <th class="sortable" id="adowi-sort">Changed <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- SALESFORCE CRs -->
+  <section class="view" id="view-sf">
+    <div class="scroll">
+      <div class="toolbar"><strong>Collaboration Requests</strong><span class="muted" id="sf-updated">—</span>
+        <span class="grow"></span>
+        <span class="muted mini-l">products</span>
+        <details id="sf-prodbox" class="prodpick"><summary id="sf-prodsum">ARS + PM</summary>
+          <div id="sf-prodlist" class="prodlist"></div></details>
+        <button class="ghost" id="sf-refresh" type="button">Refresh</button></div>
+      <div class="muted" style="margin:2px 0 10px">Open R&amp;D CRs (Type = R&amp;D, not Completed) for the selected R&amp;D queues. Escalated from Support — R&amp;D investigates; Support owns closure.</div>
+      <div id="sf-err"></div>
+
+      <div class="lhead"><h3>Assigned to me</h3><span class="muted" id="sf-mine-count"></span></div>
+      <table id="sf-mine" class="sf-table"><colgroup><col class="c-cr"><col class="c-pri"><col class="c-st"><col class="c-prod"><col class="c-subj"><col class="c-own"><col class="c-ado"><col class="c-chat"></colgroup>
+        <thead><tr><th>CR</th><th class="sortable" id="sf-mine-sort">Priority <span class="arr">▲</span></th><th>Status</th><th>Product</th><th>Subject</th>
+        <th>Case</th><th>ADO</th><th></th></tr></thead><tbody></tbody></table>
+
+      <div class="lhead"><h3>Unassigned (in queue)</h3><span class="muted" id="sf-un-count"></span></div>
+      <table id="sf-un" class="sf-table"><colgroup><col class="c-cr"><col class="c-pri"><col class="c-st"><col class="c-prod"><col class="c-subj"><col class="c-own"><col class="c-ado"><col class="c-chat"></colgroup>
+        <thead><tr><th>CR</th><th class="sortable" id="sf-un-sort">Priority <span class="arr">▲</span></th><th>Status</th><th>Product</th><th>Subject</th>
+        <th>Case</th><th>ADO</th><th></th></tr></thead><tbody></tbody></table>
+
+      <div class="lhead"><h3>All (customer contact queue)</h3><span class="muted" id="sf-all-count"></span></div>
+      <table id="sf-all" class="sf-table"><colgroup><col class="c-cr"><col class="c-pri"><col class="c-st"><col class="c-prod"><col class="c-subj"><col class="c-own"><col class="c-ado"><col class="c-chat"></colgroup>
+        <thead><tr><th>CR</th><th class="sortable" id="sf-all-sort">Priority <span class="arr">▲</span></th><th>Status</th><th>Product</th><th>Subject</th>
+        <th>Owner</th><th>ADO</th><th></th></tr></thead><tbody></tbody></table>
     </div>
   </section>
 
@@ -575,6 +625,8 @@
     document.querySelector('.tab[data-view="chat"]').click();
     renderStrip(); renderLog(); syncModel(); renderPending();
     const p = $("#prompt"); p.value = ""; p.style.height = "auto"; p.focus();
+    // context-pinned sessions with a kickoff (e.g. a CR investigation) fire immediately
+    if (ctx && ctx.kickoff) startTurn(sid, ctx.kickoff, []);
   }
   // Archive a session into searchable history (skip empty ones), capped so
   // localStorage stays sane. Keeps label, model, transcript + a closedAt stamp.
@@ -881,7 +933,12 @@
       }
       if (!el) return;
       const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
-      el.textContent = last.text;
+      // Render markdown live so long streaming replies (tables, headings) stay
+      // readable instead of showing raw ###/**/| until the turn completes.
+      // Very large in-flight text falls back to plain text to avoid per-frame
+      // O(n) re-parses janking the stream; the final renderLog formats it fully.
+      if (last.text.length <= 40000) { el.innerHTML = mdToHtml(last.text); el.classList.add("md"); }
+      else el.textContent = last.text;
       if (atBottom) log.scrollTop = log.scrollHeight;   // stick-to-bottom, don't yank
     });
   }
@@ -1057,6 +1114,7 @@
     if (t.dataset.view === "hive") loadHive();
     if (t.dataset.view === "github") loadGithub();
     if (t.dataset.view === "ado") loadAdo();
+    if (t.dataset.view === "sf") loadSf();
     if (t.dataset.view === "history") loadHistory();
     if (t.dataset.view === "settings") loadSettings();
     if (t.dataset.view === "chat") $("#prompt").focus();
@@ -1074,9 +1132,15 @@
     if(!enabled && $("#view-hive").classList.contains("active"))
       document.querySelector('.tab[data-view="chat"]').click();
   }
+  // Salesforce CRs are optional too: hidden when the sf CLI/org isn't available.
+  function applySf(enabled){
+    document.body.classList.toggle("sf-off", !enabled);
+    if(!enabled && $("#view-sf").classList.contains("active"))
+      document.querySelector('.tab[data-view="chat"]').click();
+  }
 
   // pull default model from settings for new sessions
-  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; applyHive(c.hive_enabled!==false); }).catch(()=>{});
+  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); }).catch(()=>{});
   // populate model selectors from the live catalog (mirrors the console picker)
   fetch("/api/models").then(r=>r.json()).then(d=>{ if(!d.error){ window.__models=d; fillModelSelects(d); } }).catch(()=>{});
 
@@ -1345,6 +1409,142 @@
   $("#adopr-role").addEventListener("change",renderAdo);
   $("#adowi-sort").addEventListener("click",()=>{ adoSort.wi=-adoSort.wi; renderAdo(); });
   $("#adopr-sort").addEventListener("click",()=>{ adoSort.pr=-adoSort.pr; renderAdo(); });
+
+  /* ================= SALESFORCE CRs ================= */
+  const sfData={mine:[],unassigned:[],all:[]};
+  const sfSort={mine:1,un:1,all:1};   // 1 = highest priority first (rank asc)
+  let sfProducts=null;                    // [{queue,count}] from /api/sf/products
+  let sfSelected=(localStorage.getItem("hal-ui-sf-products")||"ActiveRolesServer,PasswordManager").split(",").filter(Boolean);
+
+  function sfProdSummary(){
+    const n=sfSelected.length;
+    if(!n) return "select products";
+    const short={ActiveRolesServer:"ARS",PasswordManager:"PM"};
+    if(n<=2) return sfSelected.map(q=>short[q]||q).join(" + ");
+    return n+" products";
+  }
+  function renderProdPicker(){
+    $("#sf-prodsum").textContent=sfProdSummary();
+    const box=$("#sf-prodlist"); if(!sfProducts){ box.innerHTML=`<div class="muted" style="padding:6px">loading…</div>`; return; }
+    const sel=new Set(sfSelected);
+    // selected-but-not-in-list queues still get a row so they can be unchecked
+    const known=new Set(sfProducts.map(p=>p.queue));
+    const extra=sfSelected.filter(q=>!known.has(q)).map(q=>({queue:q,count:0}));
+    box.innerHTML=[...extra,...sfProducts].map(p=>`<label><input type="checkbox" value="${esc(p.queue)}" ${sel.has(p.queue)?"checked":""}>
+      <span>${esc(p.queue)}</span><span class="pcount">${p.count}</span></label>`).join("");
+    box.querySelectorAll("input[type=checkbox]").forEach(cb=>cb.onchange=()=>{
+      if(cb.checked) sfSelected.push(cb.value); else sfSelected=sfSelected.filter(q=>q!==cb.value);
+      sfSelected=[...new Set(sfSelected)];
+      localStorage.setItem("hal-ui-sf-products",sfSelected.join(","));
+      $("#sf-prodsum").textContent=sfProdSummary();
+    });
+  }
+  // reload when the picker closes (if the selection changed)
+  let sfPickerOpenSel="";
+  $("#sf-prodbox").addEventListener("toggle",()=>{
+    if($("#sf-prodbox").open){ sfPickerOpenSel=sfSelected.join(","); renderProdPicker(); }
+    else if(sfSelected.join(",")!==sfPickerOpenSel){ loadSf(); }
+  });
+
+  // Prioritisation (our SLA, not support response time):
+  //   L1  >  At-Risk / Case-Escalated (any level)  >  L2  >  L3  >  L4  >  other
+  function crRank(r){
+    if(r.prio_n===1) return 0;
+    if(r.atRisk || r.escalated) return 1;
+    if(r.prio_n===2) return 2;
+    if(r.prio_n===3) return 3;
+    if(r.prio_n===4) return 4;
+    return 5;
+  }
+  // Secondary importance within a rank: Unassigned > In-progress R&D > anything else.
+  function crImportance(r){
+    if(r.ownerType==="Queue") return 0;
+    if(/r&d/i.test(r.status||"")) return 1;
+    return 2;
+  }
+  const SF_PRI_SHORT={1:"L1",2:"L2",3:"L3",4:"L4"};
+  function sfStatusCell(r){
+    if(r.ownerType==="Queue") return `<td><span class="pill s-queued">Unassigned</span></td>`;
+    const s=r.status||"—", rnd=/r&d/i.test(s);
+    return `<td class="${rnd?'prio-3':'muted'}" title="${esc(s)}">${esc(s)}</td>`;
+  }
+  function sfCrRow(r, showOwner){
+    const info=`${r.name} (${r.priority||"?"}${r.atRisk?", At-Risk":""}${r.escalated?", Case Escalated":""}) — product "${r.product}", R&D queue "${r.queue}"\nStatus: ${r.status||"?"}\nSubject: "${r.subject}"\nCase ${r.case||"?"}${r.ado?`, ADO ${r.ado}`:""}\n${r.url}`;
+    const preamble=`We'll be discussing this Salesforce Collaboration Request; keep it in context for our whole conversation:\n${info}\n\n`;
+    const banner=`Salesforce ${r.name} · ${r.product} — ${r.subject}`;
+    let ctx;
+    if(r.ownerType==="Queue"){
+      // Unassigned queue CR: one-click full L4 triage via the customer-contact skill (auto-fires).
+      ctx={ banner, url:r.url, preamble,
+        kickoff:`Investigate ${r.name} using the customer-contact skill — run its L4 R&D workflow for this single CR: pull the CR + parent case + emails/attachments, analyze the logs, identify the root cause or the next diagnostic step, then draft findings for Support. Respect the skill's boundaries: R&D does not close CRs and does not contact the customer directly.` };
+    } else {
+      // Already assigned/owned: light context pin, no skill, no auto-send — you drive it (saves tokens).
+      ctx={ banner, url:r.url,
+        preamble:preamble+`Investigate this CR: read the CR + parent case + emails, then summarize the issue, what Support already tried, and the likely root cause or next diagnostic step.\n\n` };
+    }
+    const link=r.url?`<a href="${esc(r.url)}" target="_blank">${esc(r.name)}</a>`:esc(r.name);
+    const badges=(r.escalated?` <span class="esc" title="Case escalated">⏫</span>`:"")
+               +(r.atRisk?` <span class="atrisk" title="At risk">⚠</span>`:"");
+    const pri=SF_PRI_SHORT[r.prio_n]||(r.priority||"—");
+    const ado=r.ado?(String(r.ado).match(/^\d+$/)
+        ? `<a href="https://dev.azure.com/1id/_workitems/edit/${esc(r.ado)}" target="_blank">${esc(r.ado)}</a>`
+        : `<span class="muted">${esc(r.ado)}</span>`):`<span class="muted">—</span>`;
+    const col6=showOwner?`<td class="muted" title="${esc(r.owner)}">${esc(r.owner||"—")}</td>`
+                         :`<td class="muted">${esc(r.case||"—")}</td>`;
+    return `<tr>
+      <td>${link}${badges}</td>
+      <td class="prio-${r.prio_n}">${esc(pri)}</td>
+      ${sfStatusCell(r)}
+      <td class="muted">${esc(r.product)}</td>
+      <td class="title" title="${esc(r.subject)}">${esc(r.subject||"—")}</td>
+      ${col6}
+      <td>${ado}</td>${chatCell(r.name, ctx)}</tr>`;
+  }
+  function sortCrs(rows, dir){
+    return rows.slice().sort((a,b)=>{
+      let d=crRank(a)-crRank(b);           // primary: prioritisation tier
+      if(d===0) d=crImportance(a)-crImportance(b);   // secondary: unassigned/in-R&D
+      if(d===0){                            // tiebreak: oldest CR first (FIFO), not response time
+        const x=a.created||"", y=b.created||"";
+        d = x<y ? -1 : x>y ? 1 : 0;
+      }
+      return dir<0 ? -d : d;
+    });
+  }
+  function renderSf(){
+    const mk=(rows,dir,tbody,countEl,sortId,showOwner,cols)=>{
+      const sorted=sortCrs(rows,dir);
+      $(countEl).textContent=`(${sorted.length})`;
+      $(tbody).innerHTML=sorted.map(r=>sfCrRow(r,showOwner)).join("")||`<tr><td colspan="${cols}" class="muted">none</td></tr>`;
+    };
+    mk(sfData.mine,sfSort.mine,"#sf-mine tbody","#sf-mine-count","#sf-mine-sort",false,8); setArr("#sf-mine-sort",sfSort.mine);
+    mk(sfData.unassigned,sfSort.un,"#sf-un tbody","#sf-un-count","#sf-un-sort",false,8); setArr("#sf-un-sort",sfSort.un);
+    mk(sfData.all,sfSort.all,"#sf-all tbody","#sf-all-count","#sf-all-sort",true,8); setArr("#sf-all-sort",sfSort.all);
+  }
+  async function loadSf(){
+    const err=$("#sf-err"); err.innerHTML="";
+    // fetch the product catalog once (for the picker)
+    if(sfProducts===null){
+      fetch("/api/sf/products").then(r=>r.json()).then(d=>{ sfProducts=(d&&!d.error)?(d.products||[]):[]; renderProdPicker(); }).catch(()=>{ sfProducts=[]; });
+    }
+    $("#sf-updated").textContent="loading…";
+    try{
+      const q=sfSelected.length?("?products="+encodeURIComponent(sfSelected.join(","))):"";
+      const r=await fetch("/api/sf/crs"+q); const d=await r.json();
+      $("#sf-updated").textContent="updated "+new Date().toLocaleTimeString();
+      if(d.error){ err.innerHTML=`<div class="msgbox err">${esc(d.error)}</div>`; }
+      sfData.mine=Array.isArray(d.mine)?d.mine:[];
+      sfData.unassigned=Array.isArray(d.unassigned)?d.unassigned:[];
+      sfData.all=Array.isArray(d.all)?d.all:[];
+      if(d.identity_resolved===false && !d.error)
+        err.innerHTML=`<div class="msgbox">Couldn't resolve your Salesforce user — the "Assigned to me" list may be empty.</div>`;
+      renderSf();
+    }catch(e){ $("#sf-updated").textContent=""; err.innerHTML=`<div class="msgbox err">${esc(e.message)}</div>`; }
+  }
+  $("#sf-refresh").addEventListener("click",loadSf);
+  $("#sf-mine-sort").addEventListener("click",()=>{ sfSort.mine=-sfSort.mine; renderSf(); });
+  $("#sf-un-sort").addEventListener("click",()=>{ sfSort.un=-sfSort.un; renderSf(); });
+  $("#sf-all-sort").addEventListener("click",()=>{ sfSort.all=-sfSort.all; renderSf(); });
 
   /* ================= SETTINGS ================= */
   async function loadSettings(){
