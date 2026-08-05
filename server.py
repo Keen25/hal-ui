@@ -6,7 +6,8 @@ A zero-dependency web control plane for the GitHub Copilot CLI + the hive.
 Seams:
   * Chat  -> drives `copilot -p <prompt> --output-format json --allow-all-tools`
              as a subprocess, relays its JSONL stream over SSE. Multi-turn memory
-             via `-n <session>` (first turn) then `--resume=<session>`.
+             via a stable per-session `--session-id <uuid>` (idempotent create
+             on the first turn, resume thereafter).
   * Hive  -> proxies the queue_server REST API on :5001 using the control token
              read from ~/.hive/worker.token (GET /status, POST /add).
   * GitHub-> shells authenticated `gh` (keyring) for the current user's open PRs
@@ -90,8 +91,15 @@ def masked_config() -> dict:
         out[k + "_set"] = bool(cfg.get(k))
     return out
 
-_known_sessions: set[str] = set()
-_sessions_lock = threading.Lock()
+# Fixed namespace so a given browser session always maps to the same copilot
+# session UUID. Using a stable UUID (via --session-id) makes each turn an
+# idempotent create-or-resume, which survives hal-ui restarts and avoids the
+# duplicate-name ambiguity that -n/--resume-by-name produced.
+_COPILOT_SESSION_NS = uuid.UUID("5f3d9b2e-1c4a-4e77-9a10-7b6c8d2e4f01")
+
+
+def _copilot_session_id(session: str) -> str:
+    return str(uuid.uuid5(_COPILOT_SESSION_NS, session))
 
 # --- tiny TTL cache for GitHub (gh calls are ~1s each) -----------------
 _cache: dict[str, tuple[float, object]] = {}
@@ -410,12 +418,15 @@ def _mcp_server_names() -> list[str]:
 
 
 def _build_argv(prompt: str, session: str, model: str | None) -> list[str]:
-    """Legacy per-turn spawn (used when chat_fast is OFF => full MCP available)."""
-    argv = [COPILOT_BIN, "-p", prompt, "--output-format", "json", "--allow-all-tools"]
-    with _sessions_lock:
-        resume = session in _known_sessions
-        _known_sessions.add(session)
-    argv += (["--resume", session] if resume else ["-n", session])
+    """Legacy per-turn spawn (used when chat_fast is OFF => full MCP available).
+
+    Resumes by a stable per-session UUID via --session-id: copilot creates the
+    session on the first turn and resumes it thereafter. This is idempotent and
+    unambiguous, unlike resuming by name (-n/--resume=<name>), which broke when a
+    hal-ui restart re-created a session and left two copilot sessions sharing a
+    name ("Multiple sessions match the name ...")."""
+    argv = [COPILOT_BIN, "-p", prompt, "--output-format", "json",
+            "--allow-all-tools", "--session-id", _copilot_session_id(session)]
     if model:
         argv += ["--model", model]
     return argv
