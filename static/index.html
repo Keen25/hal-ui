@@ -252,7 +252,7 @@
     <div class="hint">Enter to send · Shift+Enter for newline · paste an image to attach it · messages sent while HAL is working are queued and sent in order</div>
     <form class="chat" id="f">
       <select id="model" title="Model for this session">
-        <option value="">default (opus-4.8)</option>
+        <option value="">default</option>
         <option value="claude-sonnet-4.5">sonnet-4.5</option>
         <option value="gpt-5.4">gpt-5.4</option>
       </select>
@@ -384,7 +384,7 @@
         <label class="muted">Hive token</label>
         <input id="s-hive_token" type="password" placeholder="blank = ~/.hive/worker.token (leave blank to keep)" />
         <label class="muted">Default model</label>
-        <select id="s-default_model"><option value="">default (opus-4.8)</option><option value="claude-sonnet-4.5">sonnet-4.5</option><option value="gpt-5.4">gpt-5.4</option></select>
+        <select id="s-default_model"><option value="">default</option><option value="claude-sonnet-4.5">sonnet-4.5</option><option value="gpt-5.4">gpt-5.4</option></select>
         <label class="muted">Fast chat</label>
         <label class="row2" style="gap:8px;cursor:pointer"><input id="s-chat_fast" type="checkbox" style="width:auto" /> <span class="muted">Disable MCP servers in chat for faster startup (~5-7s/msg). Turn off if you need MCP tools mid-chat.</span></label>
         <div class="row2"><span class="grow"></span><button type="submit">Save settings</button></div>
@@ -680,6 +680,29 @@
   $("#hist-q").addEventListener("input", renderHistory);
   function syncModel() { $("#model").value = cur().model || ""; }
 
+  // Populate the three model <select>s from the live catalog (/api/models),
+  // so they mirror the console's picker instead of a hard-coded list. Falls
+  // back to the markup's built-in options if the endpoint is unavailable.
+  function modelLabel(m){ return m.name + (m.usage ? ` · ${m.usage}` : ""); }
+  function fillModelSelect(sel, data, lead){
+    if(!sel) return;
+    const prev = sel.value;
+    const opts = [`<option value="">${esc(lead)}</option>`];
+    for(const m of data.models){ if(!m.id) continue;
+      opts.push(`<option value="${esc(m.id)}">${esc(modelLabel(m))}</option>`); }
+    sel.innerHTML = opts.join("");
+    if([...sel.options].some(o => o.value === prev)) sel.value = prev;
+  }
+  function fillModelSelects(data){
+    if(!data || !Array.isArray(data.models) || !data.models.length) return;
+    const def = data.models.find(m => m.id === data.default);
+    const lead = `default · ${def ? def.name : "copilot default"}`;
+    fillModelSelect($("#model"), data, lead);
+    fillModelSelect($("#s-default_model"), data, lead);
+    fillModelSelect($("#hm-model"), data, "default");
+    syncModel();
+  }
+
   function renderStrip() {
     const strip = $("#sesstrip"); strip.innerHTML = "";
     state.order.forEach(sid => {
@@ -955,6 +978,8 @@
 
   // pull default model from settings for new sessions
   fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; applyHive(c.hive_enabled!==false); }).catch(()=>{});
+  // populate model selectors from the live catalog (mirrors the console picker)
+  fetch("/api/models").then(r=>r.json()).then(d=>{ if(!d.error){ window.__models=d; fillModelSelects(d); } }).catch(()=>{});
 
   /* ================= HIVE ================= */
   const ACTIVE = new Set(["queued","pending","claimed","running","probing","reviewing","needs_attention","merging"]);

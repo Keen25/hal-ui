@@ -690,7 +690,77 @@ def _acp_close(session: str):
         p.close()
 
 
-# --- live turn buffer (survive browser close / resume on reopen) -------
+def _list_models() -> dict:
+    """Return the live model catalog copilot exposes over ACP.
+
+    We run a short one-shot `copilot --acp` handshake (initialize + session/new
+    with no MCP servers) and read models.availableModels + currentModelId — the
+    same source the interactive `/model` picker uses — so the web UI's model
+    lists never go stale. Cached by the caller. On any failure returns
+    {"error": ...} and the client keeps its built-in fallback list."""
+    try:
+        p = subprocess.Popen([COPILOT_BIN, "--acp"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, bufsize=1)
+    except Exception as exc:
+        return {"error": f"launch failed: {exc}"}
+    _id = 0
+
+    def send(method, params):
+        nonlocal _id
+        _id += 1
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": _id,
+                                  "method": method, "params": params}) + "\n")
+        p.stdin.flush()
+        return _id
+
+    def read_until(target, timeout=60):
+        end = time.time() + timeout
+        while time.time() < end:
+            line = p.stdout.readline()
+            if not line:
+                break
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("id") == target and ("result" in obj or "error" in obj):
+                return obj
+            if obj.get("method") and "id" in obj:  # unblock agent->client requests
+                p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": obj["id"],
+                                          "result": {}}) + "\n")
+                p.stdin.flush()
+        return None
+
+    try:
+        send("initialize", {"protocolVersion": 1,
+                            "clientCapabilities": {"fs": {"readTextFile": False,
+                                                          "writeTextFile": False}}})
+        read_until(_id)
+        i2 = send("session/new", {"cwd": os.path.expanduser("~"), "mcpServers": []})
+        res = (read_until(i2) or {}).get("result", {})
+        models = res.get("models", {}) or {}
+        out = []
+        for m in models.get("availableModels", []) or []:
+            meta = m.get("_meta") or {}
+            if meta.get("copilotEnablement") not in (None, "enabled"):
+                continue
+            out.append({"id": m.get("modelId", ""), "name": m.get("name", ""),
+                        "usage": meta.get("copilotUsage", ""),
+                        "price": meta.get("copilotPriceCategory", "")})
+        if not out:
+            return {"error": "no models returned"}
+        return {"models": out, "default": models.get("currentModelId", "")}
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
+
 # A turn is driven by a background worker thread that appends SSE events into a
 # per-session LiveTurn buffer instead of writing straight to one HTTP socket.
 # The HTTP request that started the turn (and any later /api/chat/resume request)
@@ -1001,6 +1071,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, cached("mywork", 30.0, _github_mywork))
         elif p.path == "/api/ado/mywork":
             self._json(200, cached("ado_mywork", 30.0, _ado_mywork))
+        elif p.path == "/api/models":
+            self._json(200, cached("models", 600.0, _list_models))
         elif p.path == "/api/settings":
             self._json(200, masked_config())
         else:
