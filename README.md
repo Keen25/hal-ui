@@ -98,6 +98,62 @@ systemctl --user restart hal-ui       # after a server.py change
 journalctl --user -u hal-ui -f        # live logs (replaces server.log)
 ```
 
+On **Windows**, HAL-UI runs the same `server.py` under a
+[WinSW](https://github.com/winsw/winsw)-registered Windows service (service id
+`hal-ui`), managed with `Restart-Service hal-ui` / `Get-Service hal-ui`.
+
+## Updating
+
+Pull the latest committed version and make it live in **one command**. The
+updater fast-forwards the checkout (`git pull --ff-only`), restarts the service
+so `server.py` changes take effect, then health-checks the running server. It
+refuses to run over uncommitted local edits (commit or stash them first), and is
+safe to re-run.
+
+**Linux / macOS** (systemd user service):
+
+```bash
+~/hal-ui/update.sh
+```
+
+**Windows** (WinSW service, PowerShell 5.1+):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\hal-ui\update.ps1"
+```
+
+Then **hard-refresh the browser tab (Ctrl+Shift+R)** to load the new client
+(static files are served off disk, so the client needs no restart — only a
+refresh; `server.py` changes need the service restart the script performs).
+
+### Manual update
+
+If you prefer to do it by hand, the script is just:
+
+```bash
+# Linux / macOS
+cd ~/hal-ui && git pull --ff-only && systemctl --user restart hal-ui
+```
+
+```powershell
+# Windows
+cd $env:USERPROFILE\hal-ui ; git pull --ff-only ; Restart-Service hal-ui
+```
+
+### Troubleshooting
+
+- **"You have uncommitted changes"** — the updater won't clobber local edits.
+  `git stash` (keep them) or `git checkout .` (discard them), then re-run.
+- **`git pull --ff-only` fails** — your local `master` has diverged from
+  `origin/master`. Inspect with `git status` / `git log --oneline origin/master..HEAD`
+  and reconcile (rebase or reset) before updating.
+- **Different service name / port** — override via env before running:
+  `HALUI_SERVICE=my-unit HALUI_HEALTH=http://127.0.0.1:9000/ ~/hal-ui/update.sh`
+  (PowerShell: `$env:HALUI_SERVICE`, `$env:HALUI_HEALTH`, or the `-Service` /
+  `-Health` parameters).
+- **Service didn't come back** — check logs: `journalctl --user -u hal-ui -n50`
+  (Linux) or the WinSW `*.out.log` / `*.err.log` next to the service exe (Windows).
+
 ### Requirements
 - Python 3.10+
 - [`copilot`](https://github.com/github/copilot-cli) CLI on `PATH`
