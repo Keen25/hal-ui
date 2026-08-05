@@ -202,6 +202,18 @@
   .modal .mbody .lbl { color:var(--muted); align-self:center; font-size:13px; }
   .modal .mrow { grid-column:1/3; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .modal .mrow .grow { flex:1; }
+  /* session history */
+  .hitem { display:flex; align-items:center; gap:12px; padding:11px 14px; margin-bottom:8px;
+    background:var(--panel); border:1px solid var(--line); border-radius:10px; cursor:pointer; }
+  .hitem:hover { border-color:var(--accent); background:var(--panel2); }
+  .hitem .hmain { flex:1; min-width:0; }
+  .hitem .hlabel { font-weight:600; color:var(--txt); }
+  .hitem .hsnip { color:var(--muted); font-size:12.5px; margin-top:3px; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .hitem .hsnip mark { background:var(--accent); color:#000; border-radius:3px; padding:0 2px; }
+  .hitem .hmeta { color:var(--muted); font-size:12px; white-space:nowrap; text-align:right; }
+  .hitem .hdel { color:var(--muted); font-weight:700; padding:2px 7px; border-radius:6px; }
+  .hitem .hdel:hover { color:#fff; background:var(--bad); }
 </style>
 </head>
 <body>
@@ -216,6 +228,7 @@
     <div class="tab" data-view="hive">Hive</div>
     <div class="tab" data-view="github">GitHub</div>
     <div class="tab" data-view="ado">ADO</div>
+    <div class="tab" data-view="history">History</div>
     <div class="tab" data-view="settings">⚙</div>
   </div>
 </header>
@@ -316,6 +329,19 @@
       <table id="adoprs"><thead><tr><th>ID</th><th>Role</th><th>Project / Repo</th><th>Title</th><th>Created</th><th></th></tr></thead><tbody></tbody></table>
       <h3>Assigned work items <span class="muted" id="wi-count"></span></h3>
       <table id="workitems"><thead><tr><th>ID</th><th>Type</th><th>State</th><th>Project</th><th>Title</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- HISTORY -->
+  <section class="view" id="view-history">
+    <div class="scroll">
+      <div class="toolbar"><strong>Session history</strong>
+        <span class="muted" id="hist-count">—</span>
+        <span class="grow"></span>
+        <input id="hist-q" placeholder="Search label or message text…" style="min-width:280px" autocomplete="off" />
+      </div>
+      <div class="muted" style="margin:2px 0 12px">Closed sessions are archived here. Click one to revive it (transcript restored; keep chatting to continue).</div>
+      <div id="hist-list"></div>
     </div>
   </section>
 
@@ -499,9 +525,9 @@
   const finishers = {}; // sid -> finish() of the in-flight turn (for Stop)
 
   function load() {
-    try { const s = JSON.parse(localStorage.getItem(LS_KEY)); if (s && s.order && s.order.length) return s; } catch (e) {}
+    try { const s = JSON.parse(localStorage.getItem(LS_KEY)); if (s && s.order && s.order.length) { if (!s.history) s.history = {}; return s; } } catch (e) {}
     const sid = newSid();
-    return { order:[sid], active:sid, sessions:{ [sid]:{ label:"Session 1", model:"", messages:[] } } };
+    return { order:[sid], active:sid, history:{}, sessions:{ [sid]:{ label:"Session 1", model:"", messages:[] } } };
   }
   function save() {
     // cap transcript size to keep localStorage sane
@@ -527,9 +553,24 @@
     renderStrip(); renderLog(); syncModel(); renderPending();
     const p = $("#prompt"); p.value = ""; p.style.height = "auto"; p.focus();
   }
+  // Archive a session into searchable history (skip empty ones), capped so
+  // localStorage stays sane. Keeps label, model, transcript + a closedAt stamp.
+  const HIST_MAX = 80;
+  function archiveSession(sid) {
+    const s = state.sessions[sid];
+    if (!s || !s.messages || !s.messages.length) return;   // nothing worth keeping
+    state.history ||= {};
+    state.history[sid] = { label: s.label, model: s.model || "",
+      messages: s.messages.slice(-120), closedAt: Date.now() };
+    // evict oldest beyond the cap
+    const ids = Object.keys(state.history).sort((a,b)=>(state.history[b].closedAt||0)-(state.history[a].closedAt||0));
+    for (const old of ids.slice(HIST_MAX)) delete state.history[old];
+  }
+
   function closeSession(sid) {
     if (es[sid]) { try { es[sid].close(); } catch(e){} delete es[sid]; }
     fetch(`/api/chat/close?session=${encodeURIComponent(sid)}`).catch(()=>{});  // free the ACP process
+    archiveSession(sid);                                   // keep it in searchable history
     delete state.sessions[sid]; delete busy[sid]; delete finishers[sid]; delete pendingAtt[sid];
     state.order = state.order.filter(x => x !== sid);
     if (!state.order.length) { const s = newSid(); state.sessions[s] = { label:"Session 1", model:"", messages:[] }; state.order=[s]; }
@@ -537,11 +578,83 @@
     delete pendingQ[sid];
     save(); renderStrip(); renderLog(); syncModel(); renderPending();
   }
+
+  // Bring an archived session back into the active strip and open it in Chat.
+  function reviveSession(sid) {
+    const h = state.history && state.history[sid]; if (!h) return;
+    const nsid = state.sessions[sid] ? newSid() : sid;    // avoid colliding with a live session id
+    state.sessions[nsid] = { label: h.label, model: h.model || "", messages: h.messages || [] };
+    state.order.push(nsid); state.active = nsid;
+    delete state.history[sid];
+    save();
+    document.querySelector('.tab[data-view="chat"]').click();
+    renderStrip(); renderLog(); syncModel(); renderPending();
+    const p = $("#prompt"); p.focus();
+  }
   function switchTo(sid) { state.active = sid; save(); renderStrip(); renderLog(); syncModel(); renderPending(); $("#prompt").focus(); }
   function renameSession(sid) {
     const name = prompt("Rename session:", state.sessions[sid].label);
     if (name && name.trim()) { state.sessions[sid].label = name.trim(); save(); renderStrip(); }
   }
+
+  /* ---- searchable session history ---- */
+  function histAgo(ts) {
+    if (!ts) return "";
+    const s = Math.floor((Date.now() - ts) / 1000);
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.floor(s/60) + "m ago";
+    if (s < 86400) return Math.floor(s/3600) + "h ago";
+    return Math.floor(s/86400) + "d ago";
+  }
+  // Build a snippet for a history entry; returns {hit, html}. With a query it
+  // matches message text first (highlighting the hit), then the label.
+  function histSnippet(h, q) {
+    if (q) {
+      const ql = q.toLowerCase();
+      for (const m of (h.messages || [])) {
+        const t = m.text || ""; const i = t.toLowerCase().indexOf(ql);
+        if (i >= 0) {
+          const start = Math.max(0, i - 40);
+          const pre = (start > 0 ? "…" : "") + t.slice(start, i);
+          const mid = t.slice(i, i + q.length);
+          const post = t.slice(i + q.length, i + q.length + 70);
+          return { hit:true, html: esc(pre) + "<mark>" + esc(mid) + "</mark>" + esc(post) };
+        }
+      }
+      if ((h.label || "").toLowerCase().includes(ql)) {
+        const first = (h.messages && h.messages[0] && h.messages[0].text) || "";
+        return { hit:true, html: esc(first.slice(0, 120)) };
+      }
+      return { hit:false };
+    }
+    const first = (h.messages && h.messages[0] && h.messages[0].text) || "";
+    return { hit:true, html: esc(first.slice(0, 120)) };
+  }
+  function renderHistory() {
+    const q = ($("#hist-q").value || "").trim();
+    const box = $("#hist-list");
+    const ids = Object.keys(state.history || {}).sort((a,b)=>(state.history[b].closedAt||0)-(state.history[a].closedAt||0));
+    const rows = []; let shown = 0;
+    for (const sid of ids) {
+      const h = state.history[sid]; const s = histSnippet(h, q);
+      if (!s.hit) continue; shown++;
+      const count = (h.messages || []).length;
+      rows.push(`<div class="hitem" data-sid="${esc(sid)}">
+        <div class="hmain"><div class="hlabel">${esc(h.label || "(untitled)")}</div>
+        <div class="hsnip">${s.html || "<span class='muted'>(empty)</span>"}</div></div>
+        <div class="hmeta">${count} msg<br>${histAgo(h.closedAt)}</div>
+        <div class="hdel" title="Delete from history" data-del="${esc(sid)}">🗑</div></div>`);
+    }
+    $("#hist-count").textContent = ids.length ? `${shown} / ${ids.length}` : "empty";
+    box.innerHTML = rows.length ? rows.join("")
+      : `<div class="muted">${ids.length ? "No sessions match your search." : "No archived sessions yet. Close a session (× on its tab) to archive it here."}</div>`;
+    box.querySelectorAll(".hdel").forEach(el => el.onclick = (e) => {
+      e.stopPropagation(); delete state.history[el.dataset.del]; save(); renderHistory();
+    });
+    box.querySelectorAll(".hitem").forEach(el => el.onclick = () => reviveSession(el.dataset.sid));
+  }
+  function loadHistory() { renderHistory(); setTimeout(() => $("#hist-q").focus(), 0); }
+  $("#hist-q").addEventListener("input", renderHistory);
   function syncModel() { $("#model").value = cur().model || ""; }
 
   function renderStrip() {
@@ -799,6 +912,7 @@
     if (t.dataset.view === "hive") loadHive();
     if (t.dataset.view === "github") loadGithub();
     if (t.dataset.view === "ado") loadAdo();
+    if (t.dataset.view === "history") loadHistory();
     if (t.dataset.view === "settings") loadSettings();
     if (t.dataset.view === "chat") $("#prompt").focus();
   });
