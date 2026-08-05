@@ -116,6 +116,7 @@
   .r-author { color:#a5d6ff; border-color:#388bfd55; }
   .r-reviewer { color:#d2a8ff; border-color:#a371f755; }
   .r-both { color:#7ee787; border-color:#2ea04355; }
+  .c-done { color:#7ee787; } .c-open { color:#e3b341; }
   .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
   .dot.on { background:var(--ok); box-shadow:0 0 6px var(--ok); }
   .dot.off { background:#555; }
@@ -343,7 +344,8 @@
         <span class="grow"></span><span class="muted mini-l">role</span>
         <select id="adopr-role" class="mini"><option value="">all</option></select></div>
       <table id="adoprs"><thead><tr><th>ID</th><th>Role</th><th>Project / Repo</th><th>Title</th>
-        <th class="sortable" id="adopr-sort">Created <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
+        <th>Comments</th>
+        <th class="sortable" id="adopr-sort">Updated <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
       <div class="lhead"><h3>Assigned work items</h3><span class="muted" id="wi-count"></span>
         <span class="grow"></span><span class="muted mini-l">type</span>
         <select id="adowi-type" class="mini"><option value="">all</option></select></div>
@@ -1096,7 +1098,7 @@
 
   /* ===== shared filter/sort helpers for the GitHub + ADO tables ===== */
   // sort dir: -1 = newest first (default), 1 = oldest first
-  function byDate(field, dir){ return (a,b)=>{ const x=Date.parse(a[field])||0, y=Date.parse(b[field])||0; return dir<0 ? (y-x) : (x-y); }; }
+  function byDate(field, dir, alt){ return (a,b)=>{ const x=Date.parse(a[field]||a[alt])||0, y=Date.parse(b[field]||b[alt])||0; return dir<0 ? (y-x) : (x-y); }; }
   function fillSelect(sel, values){ const cur=sel.value;
     sel.innerHTML='<option value="">all</option>'+values.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join("");
     if(values.includes(cur)) sel.value=cur; }
@@ -1170,12 +1172,16 @@
     const ctx={ banner:`ADO PR !${p.id} · ${p.project}/${p.repo}${asRev?' (you: reviewer)':''} — ${p.title}`, url:p.url,
       preamble:`We'll be discussing this Azure DevOps pull request${asRev?" (I'm assigned as a reviewer)":""}; keep it in context for our whole conversation:\nPR !${p.id} in ${p.project}/${p.repo}${p.author&&p.role!=='author'?` by ${p.author}`:''}\n"${p.title}"\n${p.url}\n\n` };
     const roleCls=p.role==='reviewer'?'r-reviewer':(p.role==='author+reviewer'?'r-both':'r-author');
+    const tot=p.threads_total||0, res=p.threads_resolved||0;
+    const cCls=tot===0?'muted':(res>=tot?'c-done':'c-open');
+    const comments=`<span class="${cCls}" title="${res} resolved / ${tot} comment thread${tot===1?'':'s'}">${res} / ${tot}</span>`;
     return `<tr>
       <td><a href="${esc(p.url)}" target="_blank">!${esc(p.id)}</a></td>
       <td><span class="pill ${roleCls}">${esc(p.role||'author')}</span></td>
       <td class="muted">${esc(p.project)} / ${esc(p.repo)}</td>
       <td class="title" title="${esc(p.title)}">${esc(p.title)}${p.isDraft?' <span class="muted">(draft)</span>':''}</td>
-      <td class="muted">${esc(ago(p.created))}</td>${chatCell("PR !"+p.id, ctx)}</tr>`;
+      <td>${comments}</td>
+      <td class="muted">${esc(ago(p.updated||p.created))}</td>${chatCell("PR !"+p.id, ctx)}</tr>`;
   }
   function renderAdo(){
     const typeSel=$("#adowi-type"); fillSelect(typeSel,[...new Set(adoData.workitems.map(w=>w.type).filter(Boolean))].sort());
@@ -1184,9 +1190,9 @@
     $("#workitems tbody").innerHTML=wi.map(adoWiRow).join("")||`<tr><td colspan="7" class="muted">none</td></tr>`;
     setArr("#adowi-sort",adoSort.wi);
     const roleSel=$("#adopr-role"); fillSelect(roleSel,[...new Set(adoData.prs.map(p=>p.role||'author'))].sort());
-    const pr=adoData.prs.filter(p=>!roleSel.value||(p.role||'author')===roleSel.value).slice().sort(byDate("created",adoSort.pr));
+    const pr=adoData.prs.filter(p=>!roleSel.value||(p.role||'author')===roleSel.value).slice().sort(byDate("updated",adoSort.pr,"created"));
     $("#adopr-count").textContent=`(${pr.length})`;
-    $("#adoprs tbody").innerHTML=pr.map(adoPrRow).join("")||`<tr><td colspan="6" class="muted">none</td></tr>`;
+    $("#adoprs tbody").innerHTML=pr.map(adoPrRow).join("")||`<tr><td colspan="7" class="muted">none</td></tr>`;
     setArr("#adopr-sort",adoSort.pr);
   }
   async function loadAdo(){

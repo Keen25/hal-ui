@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import json
 import os
 import queue
@@ -248,6 +249,60 @@ def _ado_identity(org: str) -> str:
     return ""
 
 
+# ADO thread statuses that count as "resolved" for the comment badge.
+_ADO_RESOLVED_STATUS = {"fixed", "wontfix", "closed", "bydesign"}
+
+
+def _pr_thread_stats(org: str, pr: dict) -> None:
+    """Fetch a PR's comment threads and annotate it in place with the last
+    activity time and resolved/total user-discussion comment counts.
+
+    The ADO PR search API returns neither a last-updated time nor comment
+    counts, so we derive both from the threads endpoint (one call per PR):
+      - updated: newest lastUpdatedDate across all non-deleted threads
+        (system threads included, since pushes/votes are activity), falling
+        back to the PR creation date.
+      - threads_total / threads_resolved: only threads containing a real user
+        comment (commentType 'text'); system-only threads are excluded, and a
+        thread counts as resolved when its status is fixed/wontFix/closed/byDesign.
+    """
+    repo_id = pr.get("repo_id")
+    if not repo_id:
+        return
+    c, d = _ado_request(
+        f"{org}/_apis/git/repositories/{urllib.parse.quote(str(repo_id))}"
+        f"/pullRequests/{pr['id']}/threads?api-version=7.0")
+    if c != 200:
+        return
+    total = resolved = 0
+    latest = ""
+    for th in d.get("value") or []:
+        if th.get("isDeleted"):
+            continue
+        upd = th.get("lastUpdatedDate") or th.get("publishedDate") or ""
+        if upd > latest:
+            latest = upd
+        comments = th.get("comments") or []
+        is_user = any((c or {}).get("commentType", "text") != "system"
+                      and not (c or {}).get("isDeleted") for c in comments)
+        if not is_user:
+            continue
+        total += 1
+        if (th.get("status") or "").lower() in _ADO_RESOLVED_STATUS:
+            resolved += 1
+    pr["updated"] = latest or pr.get("created", "")
+    pr["threads_total"] = total
+    pr["threads_resolved"] = resolved
+
+
+def _enrich_pr_threads(org: str, prs: list) -> None:
+    """Populate updated time + comment counts for every PR concurrently."""
+    if not prs:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda p: _pr_thread_stats(org, p), prs))
+
+
 def _ado_mywork():
     cfg = load_config()
     org = (cfg.get("ado_org") or "").rstrip("/")
@@ -310,6 +365,7 @@ def _ado_mywork():
                     out.append({
                         "id": prid, "title": p.get("title", ""),
                         "repo": repo.get("name", ""), "project": prj,
+                        "repo_id": repo.get("id", ""),
                         "created": p.get("creationDate", ""),
                         "isDraft": p.get("isDraft", False),
                         "author": (p.get("createdBy") or {}).get("displayName", ""),
@@ -330,6 +386,7 @@ def _ado_mywork():
             else:
                 by_id[p["id"]] = p
         prs = sorted(by_id.values(), key=lambda x: x.get("created", ""), reverse=True)
+        _enrich_pr_threads(org, prs)
     return {"workitems": workitems, "prs": prs,
             "identity_resolved": bool(ident)}
 
