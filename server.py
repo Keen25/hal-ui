@@ -266,7 +266,7 @@ def _ado_mywork():
         ids = [w["id"] for w in (data.get("workItems") or [])][:50]
         if ids:
             fields = ["System.Id", "System.Title", "System.WorkItemType",
-                      "System.State", "System.TeamProject"]
+                      "System.State", "System.TeamProject", "System.ChangedDate"]
             c2, d2 = _ado_request(f"{org}/_apis/wit/workitemsbatch?api-version=7.0",
                                   method="POST", body={"ids": ids, "fields": fields})
             if c2 == 200:
@@ -279,6 +279,7 @@ def _ado_mywork():
                         "type": f.get("System.WorkItemType", ""),
                         "state": f.get("System.State", ""),
                         "project": proj,
+                        "changed": f.get("System.ChangedDate", ""),
                         "url": f"{org}/{urllib.parse.quote(proj)}/_workitems/edit/{w.get('id')}",
                     })
             else:

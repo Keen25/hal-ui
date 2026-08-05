@@ -214,6 +214,14 @@
   .hitem .hmeta { color:var(--muted); font-size:12px; white-space:nowrap; text-align:right; }
   .hitem .hdel { color:var(--muted); font-weight:700; padding:2px 7px; border-radius:6px; }
   .hitem .hdel:hover { color:#fff; background:var(--bad); }
+  /* list-section header + table filter/sort controls (GitHub/ADO) */
+  .lhead { display:flex; align-items:center; gap:10px; margin:16px 0 6px; }
+  .lhead h3 { margin:0; }
+  .lhead .mini-l { font-size:12px; }
+  select.mini { padding:4px 8px; font-size:12px; border-radius:8px; min-width:120px; }
+  th.sortable { cursor:pointer; user-select:none; white-space:nowrap; }
+  th.sortable:hover { color:var(--txt); }
+  th.sortable .arr { color:var(--accent); font-size:10px; margin-left:2px; }
 </style>
 </head>
 <body>
@@ -312,10 +320,16 @@
     <div class="scroll">
       <div class="toolbar"><strong>My Work</strong><span class="muted" id="gh-updated">—</span>
         <span class="grow"></span><button class="ghost" id="gh-refresh" type="button">Refresh</button></div>
-      <h3>Open pull requests</h3>
-      <table id="prs"><thead><tr><th>Repo</th><th>#</th><th>Title</th><th>Updated</th><th></th></tr></thead><tbody></tbody></table>
-      <h3>Assigned issues</h3>
-      <table id="issues"><thead><tr><th>Repo</th><th>#</th><th>Title</th><th>Updated</th><th></th></tr></thead><tbody></tbody></table>
+      <div class="lhead"><h3>Open pull requests</h3><span class="muted" id="ghpr-count"></span>
+        <span class="grow"></span><span class="muted mini-l">repo</span>
+        <select id="ghpr-repo" class="mini"><option value="">all</option></select></div>
+      <table id="prs"><thead><tr><th>Repo</th><th>#</th><th>Title</th>
+        <th class="sortable" id="ghpr-sort">Updated <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
+      <div class="lhead"><h3>Assigned issues</h3><span class="muted" id="ghiss-count"></span>
+        <span class="grow"></span><span class="muted mini-l">repo</span>
+        <select id="ghiss-repo" class="mini"><option value="">all</option></select></div>
+      <table id="issues"><thead><tr><th>Repo</th><th>#</th><th>Title</th>
+        <th class="sortable" id="ghiss-sort">Updated <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
     </div>
   </section>
 
@@ -325,10 +339,16 @@
       <div class="toolbar"><strong>Azure DevOps</strong><span class="muted" id="ado-updated">—</span>
         <span class="grow"></span><button class="ghost" id="ado-refresh" type="button">Refresh</button></div>
       <div id="ado-err"></div>
-      <h3>My active pull requests <span class="muted" id="adopr-count"></span></h3>
-      <table id="adoprs"><thead><tr><th>ID</th><th>Role</th><th>Project / Repo</th><th>Title</th><th>Created</th><th></th></tr></thead><tbody></tbody></table>
-      <h3>Assigned work items <span class="muted" id="wi-count"></span></h3>
-      <table id="workitems"><thead><tr><th>ID</th><th>Type</th><th>State</th><th>Project</th><th>Title</th><th></th></tr></thead><tbody></tbody></table>
+      <div class="lhead"><h3>My active pull requests</h3><span class="muted" id="adopr-count"></span>
+        <span class="grow"></span><span class="muted mini-l">role</span>
+        <select id="adopr-role" class="mini"><option value="">all</option></select></div>
+      <table id="adoprs"><thead><tr><th>ID</th><th>Role</th><th>Project / Repo</th><th>Title</th>
+        <th class="sortable" id="adopr-sort">Created <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
+      <div class="lhead"><h3>Assigned work items</h3><span class="muted" id="wi-count"></span>
+        <span class="grow"></span><span class="muted mini-l">type</span>
+        <select id="adowi-type" class="mini"><option value="">all</option></select></div>
+      <table id="workitems"><thead><tr><th>ID</th><th>Type</th><th>State</th><th>Project</th><th>Title</th>
+        <th class="sortable" id="adowi-sort">Changed <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
     </div>
   </section>
 
@@ -1074,73 +1094,117 @@
     }catch(err){ m.className="msgbox err"; m.textContent=err.message; }
   });
 
+  /* ===== shared filter/sort helpers for the GitHub + ADO tables ===== */
+  // sort dir: -1 = newest first (default), 1 = oldest first
+  function byDate(field, dir){ return (a,b)=>{ const x=Date.parse(a[field])||0, y=Date.parse(b[field])||0; return dir<0 ? (y-x) : (x-y); }; }
+  function fillSelect(sel, values){ const cur=sel.value;
+    sel.innerHTML='<option value="">all</option>'+values.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join("");
+    if(values.includes(cur)) sel.value=cur; }
+  function setArr(id, dir){ const el=document.querySelector(id+" .arr"); if(el) el.textContent = dir<0 ? "▼" : "▲"; }
+  const ghRepoOf = x => (x.repository&&x.repository.nameWithOwner)||"";
+
   /* ================= GITHUB ================= */
+  const ghData={prs:[],issues:[],prsErr:"",issErr:""};
+  const ghSort={pr:-1,iss:-1};
+  function ghPrRow(p){
+    const repo=ghRepoOf(p); const short=`${repo.split("/").pop()}#${p.number}`;
+    const ctx={ banner:`GitHub PR ${repo}#${p.number} — ${p.title}`, url:p.url,
+      preamble:`We'll be discussing this GitHub pull request; keep it in context for our whole conversation:\n${repo}#${p.number} — "${p.title}"\n${p.url}\n\n` };
+    return `<tr>
+      <td class="muted">${esc(repo)}</td><td>#${esc(p.number)}</td>
+      <td><a href="${esc(p.url)}" target="_blank">${esc(p.title)}${p.isDraft?' <span class="muted">(draft)</span>':''}</a></td>
+      <td class="muted">${esc(ago(p.updatedAt))}</td>${chatCell(short, ctx)}</tr>`;
+  }
+  function ghIssRow(i){
+    const repo=ghRepoOf(i); const short=`${repo.split("/").pop()}#${i.number}`;
+    const ctx={ banner:`GitHub issue ${repo}#${i.number} — ${i.title}`, url:i.url,
+      preamble:`We'll be discussing this GitHub issue; keep it in context for our whole conversation:\n${repo}#${i.number} — "${i.title}"\n${i.url}\n\n` };
+    return `<tr>
+      <td class="muted">${esc(repo)}</td><td>#${esc(i.number)}</td>
+      <td><a href="${esc(i.url)}" target="_blank">${esc(i.title)}</a></td>
+      <td class="muted">${esc(ago(i.updatedAt))}</td>${chatCell(short, ctx)}</tr>`;
+  }
+  function renderGithub(){
+    const prRepo=$("#ghpr-repo"); fillSelect(prRepo,[...new Set(ghData.prs.map(ghRepoOf))].sort());
+    const prs=ghData.prs.filter(p=>!prRepo.value||ghRepoOf(p)===prRepo.value).slice().sort(byDate("updatedAt",ghSort.pr));
+    $("#ghpr-count").textContent=`(${prs.length})`;
+    $("#prs tbody").innerHTML=prs.map(ghPrRow).join("")||`<tr><td colspan="5" class="muted">${ghData.prsErr?esc(ghData.prsErr):'none'}</td></tr>`;
+    setArr("#ghpr-sort",ghSort.pr);
+    const issRepo=$("#ghiss-repo"); fillSelect(issRepo,[...new Set(ghData.issues.map(ghRepoOf))].sort());
+    const iss=ghData.issues.filter(i=>!issRepo.value||ghRepoOf(i)===issRepo.value).slice().sort(byDate("updatedAt",ghSort.iss));
+    $("#ghiss-count").textContent=`(${iss.length})`;
+    $("#issues tbody").innerHTML=iss.map(ghIssRow).join("")||`<tr><td colspan="5" class="muted">${ghData.issErr?esc(ghData.issErr):'none'}</td></tr>`;
+    setArr("#ghiss-sort",ghSort.iss);
+  }
   async function loadGithub(){
     try{
       const r=await fetch("/api/github/mywork"); const d=await r.json();
       $("#gh-updated").textContent="updated "+new Date().toLocaleTimeString();
-      const rowsPR=(Array.isArray(d.prs)?d.prs:[]).map(p=>{
-        const repo=p.repository&&p.repository.nameWithOwner||"";
-        const short=`${repo.split("/").pop()}#${p.number}`;
-        const ctx={ banner:`GitHub PR ${repo}#${p.number} — ${p.title}`, url:p.url,
-          preamble:`We'll be discussing this GitHub pull request; keep it in context for our whole conversation:\n${repo}#${p.number} — "${p.title}"\n${p.url}\n\n` };
-        return `<tr>
-        <td class="muted">${esc(repo)}</td><td>#${esc(p.number)}</td>
-        <td><a href="${esc(p.url)}" target="_blank">${esc(p.title)}${p.isDraft?' <span class="muted">(draft)</span>':''}</a></td>
-        <td class="muted">${esc(ago(p.updatedAt))}</td>${chatCell(short, ctx)}</tr>`;}).join("");
-      $("#prs tbody").innerHTML=rowsPR||`<tr><td colspan="5" class="muted">${d.prs&&d.prs.error?esc(d.prs.error):'none'}</td></tr>`;
-      const rowsIss=(Array.isArray(d.issues)?d.issues:[]).map(i=>{
-        const repo=i.repository&&i.repository.nameWithOwner||"";
-        const short=`${repo.split("/").pop()}#${i.number}`;
-        const ctx={ banner:`GitHub issue ${repo}#${i.number} — ${i.title}`, url:i.url,
-          preamble:`We'll be discussing this GitHub issue; keep it in context for our whole conversation:\n${repo}#${i.number} — "${i.title}"\n${i.url}\n\n` };
-        return `<tr>
-        <td class="muted">${esc(repo)}</td><td>#${esc(i.number)}</td>
-        <td><a href="${esc(i.url)}" target="_blank">${esc(i.title)}</a></td>
-        <td class="muted">${esc(ago(i.updatedAt))}</td>${chatCell(short, ctx)}</tr>`;}).join("");
-      $("#issues tbody").innerHTML=rowsIss||`<tr><td colspan="5" class="muted">${d.issues&&d.issues.error?esc(d.issues.error):'none'}</td></tr>`;
+      ghData.prs=Array.isArray(d.prs)?d.prs:[]; ghData.prsErr=(d.prs&&d.prs.error)||"";
+      ghData.issues=Array.isArray(d.issues)?d.issues:[]; ghData.issErr=(d.issues&&d.issues.error)||"";
+      renderGithub();
     }catch(e){ $("#prs tbody").innerHTML=`<tr><td colspan="5" class="msgbox err">${esc(e.message)}</td></tr>`; }
   }
   $("#gh-refresh").addEventListener("click",loadGithub);
+  $("#ghpr-repo").addEventListener("change",renderGithub);
+  $("#ghiss-repo").addEventListener("change",renderGithub);
+  $("#ghpr-sort").addEventListener("click",()=>{ ghSort.pr=-ghSort.pr; renderGithub(); });
+  $("#ghiss-sort").addEventListener("click",()=>{ ghSort.iss=-ghSort.iss; renderGithub(); });
 
   /* ================= ADO ================= */
+  const adoData={prs:[],workitems:[]};
+  const adoSort={pr:-1,wi:-1};
+  function adoWiRow(w){
+    const ctx={ banner:`ADO ${w.type} ${w.id} · ${w.project} — ${w.title}`, url:w.url,
+      preamble:`We'll be discussing this Azure DevOps work item; keep it in context for our whole conversation:\nWork item ${w.id} — ${w.type}, state "${w.state}", project "${w.project}"\n"${w.title}"\n${w.url}\n\n` };
+    return `<tr>
+      <td><a href="${esc(w.url)}" target="_blank">${esc(w.id)}</a></td>
+      <td class="muted">${esc(w.type)}</td>
+      <td><span class="pill s-${esc((w.state||'').toLowerCase().replace(/ /g,'_'))}">${esc(w.state)}</span></td>
+      <td class="muted">${esc(w.project)}</td>
+      <td class="title" title="${esc(w.title)}">${esc(w.title)}</td>
+      <td class="muted">${esc(ago(w.changed))}</td>${chatCell("WI "+w.id, ctx)}</tr>`;
+  }
+  function adoPrRow(p){
+    const asRev=p.role==='reviewer';
+    const ctx={ banner:`ADO PR !${p.id} · ${p.project}/${p.repo}${asRev?' (you: reviewer)':''} — ${p.title}`, url:p.url,
+      preamble:`We'll be discussing this Azure DevOps pull request${asRev?" (I'm assigned as a reviewer)":""}; keep it in context for our whole conversation:\nPR !${p.id} in ${p.project}/${p.repo}${p.author&&p.role!=='author'?` by ${p.author}`:''}\n"${p.title}"\n${p.url}\n\n` };
+    const roleCls=p.role==='reviewer'?'r-reviewer':(p.role==='author+reviewer'?'r-both':'r-author');
+    return `<tr>
+      <td><a href="${esc(p.url)}" target="_blank">!${esc(p.id)}</a></td>
+      <td><span class="pill ${roleCls}">${esc(p.role||'author')}</span></td>
+      <td class="muted">${esc(p.project)} / ${esc(p.repo)}</td>
+      <td class="title" title="${esc(p.title)}">${esc(p.title)}${p.isDraft?' <span class="muted">(draft)</span>':''}</td>
+      <td class="muted">${esc(ago(p.created))}</td>${chatCell("PR !"+p.id, ctx)}</tr>`;
+  }
+  function renderAdo(){
+    const typeSel=$("#adowi-type"); fillSelect(typeSel,[...new Set(adoData.workitems.map(w=>w.type).filter(Boolean))].sort());
+    const wi=adoData.workitems.filter(w=>!typeSel.value||w.type===typeSel.value).slice().sort(byDate("changed",adoSort.wi));
+    $("#wi-count").textContent=`(${wi.length})`;
+    $("#workitems tbody").innerHTML=wi.map(adoWiRow).join("")||`<tr><td colspan="7" class="muted">none</td></tr>`;
+    setArr("#adowi-sort",adoSort.wi);
+    const roleSel=$("#adopr-role"); fillSelect(roleSel,[...new Set(adoData.prs.map(p=>p.role||'author'))].sort());
+    const pr=adoData.prs.filter(p=>!roleSel.value||(p.role||'author')===roleSel.value).slice().sort(byDate("created",adoSort.pr));
+    $("#adopr-count").textContent=`(${pr.length})`;
+    $("#adoprs tbody").innerHTML=pr.map(adoPrRow).join("")||`<tr><td colspan="6" class="muted">none</td></tr>`;
+    setArr("#adopr-sort",adoSort.pr);
+  }
   async function loadAdo(){
     const err=$("#ado-err"); err.innerHTML="";
     try{
       const r=await fetch("/api/ado/mywork"); const d=await r.json();
       $("#ado-updated").textContent="updated "+new Date().toLocaleTimeString();
       if(d.error){ err.innerHTML=`<div class="msgbox err">${esc(d.error)}</div>`; }
-      const wi=Array.isArray(d.workitems)?d.workitems:[];
-      $("#wi-count").textContent=`(${wi.length})`;
-      $("#workitems tbody").innerHTML=wi.map(w=>{
-        const ctx={ banner:`ADO ${w.type} ${w.id} · ${w.project} — ${w.title}`,
-          url:w.url,
-          preamble:`We'll be discussing this Azure DevOps work item; keep it in context for our whole conversation:\nWork item ${w.id} — ${w.type}, state "${w.state}", project "${w.project}"\n"${w.title}"\n${w.url}\n\n` };
-        return `<tr>
-        <td><a href="${esc(w.url)}" target="_blank">${esc(w.id)}</a></td>
-        <td class="muted">${esc(w.type)}</td>
-        <td><span class="pill s-${esc((w.state||'').toLowerCase().replace(/ /g,'_'))}">${esc(w.state)}</span></td>
-        <td class="muted">${esc(w.project)}</td>
-        <td class="title" title="${esc(w.title)}">${esc(w.title)}</td>${chatCell("WI "+w.id, ctx)}</tr>`;}).join("")
-        ||`<tr><td colspan="6" class="muted">none</td></tr>`;
-      const pr=Array.isArray(d.prs)?d.prs:[];
-      $("#adopr-count").textContent=`(${pr.length})`;
-      $("#adoprs tbody").innerHTML=pr.map(p=>{
-        const asRev=p.role==='reviewer';
-        const ctx={ banner:`ADO PR !${p.id} · ${p.project}/${p.repo}${asRev?' (you: reviewer)':''} — ${p.title}`,
-          url:p.url,
-          preamble:`We'll be discussing this Azure DevOps pull request${asRev?" (I'm assigned as a reviewer)":""}; keep it in context for our whole conversation:\nPR !${p.id} in ${p.project}/${p.repo}${p.author&&p.role!=='author'?` by ${p.author}`:''}\n"${p.title}"\n${p.url}\n\n` };
-        const roleCls=p.role==='reviewer'?'r-reviewer':(p.role==='author+reviewer'?'r-both':'r-author');
-        return `<tr>
-        <td><a href="${esc(p.url)}" target="_blank">!${esc(p.id)}</a></td>
-        <td><span class="pill ${roleCls}">${esc(p.role||'author')}</span></td>
-        <td class="muted">${esc(p.project)} / ${esc(p.repo)}</td>
-        <td class="title" title="${esc(p.title)}">${esc(p.title)}${p.isDraft?' <span class="muted">(draft)</span>':''}</td>
-        <td class="muted">${esc(ago(p.created))}</td>${chatCell("PR !"+p.id, ctx)}</tr>`;}).join("")
-        ||`<tr><td colspan="6" class="muted">none</td></tr>`;
+      adoData.workitems=Array.isArray(d.workitems)?d.workitems:[];
+      adoData.prs=Array.isArray(d.prs)?d.prs:[];
+      renderAdo();
     }catch(e){ err.innerHTML=`<div class="msgbox err">${esc(e.message)}</div>`; }
   }
   $("#ado-refresh").addEventListener("click",loadAdo);
+  $("#adowi-type").addEventListener("change",renderAdo);
+  $("#adopr-role").addEventListener("change",renderAdo);
+  $("#adowi-sort").addEventListener("click",()=>{ adoSort.wi=-adoSort.wi; renderAdo(); });
+  $("#adopr-sort").addEventListener("click",()=>{ adoSort.pr=-adoSort.pr; renderAdo(); });
 
   /* ================= SETTINGS ================= */
   async function loadSettings(){
