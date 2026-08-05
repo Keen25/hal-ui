@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -606,8 +607,164 @@ def _acp_stop(session: str):
 def _acp_close(session: str):
     with _acp_lock:
         p = _acp_procs.pop(session, None)
+    with _live_lock:
+        _live_turns.pop(session, None)
     if p is not None:
         p.close()
+
+
+# --- live turn buffer (survive browser close / resume on reopen) -------
+# A turn is driven by a background worker thread that appends SSE events into a
+# per-session LiveTurn buffer instead of writing straight to one HTTP socket.
+# The HTTP request that started the turn (and any later /api/chat/resume request)
+# just relays from the buffer. A browser closing therefore detaches the viewer
+# WITHOUT cancelling the turn; the worker keeps running and buffering, and a
+# reopened tab replays the buffer from index 0 and continues live until done.
+# The finished buffer is retained until the next turn replaces it, so a tab that
+# reopens AFTER completion still gets the full transcript + terminal events.
+class LiveTurn:
+    def __init__(self, turn_id: str):
+        self.turn_id = turn_id
+        self.events: list[tuple[str, dict]] = []
+        self.done = False
+        self.canceller = None   # set by the runner: stops the turn (Stop button)
+        self.cond = threading.Condition()
+
+    def append(self, event: str, data: dict):
+        with self.cond:
+            self.events.append((event, data))
+            self.cond.notify_all()
+
+    def finish(self):
+        with self.cond:
+            self.done = True
+            self.cond.notify_all()
+
+    def read_from(self, idx: int):
+        """Generator: yield buffered events from idx, blocking for new ones
+        until the turn is done. Never holds the lock while yielding."""
+        while True:
+            with self.cond:
+                while idx >= len(self.events) and not self.done:
+                    self.cond.wait(timeout=0.5)
+                batch = self.events[idx:]
+                idx = len(self.events)
+                done = self.done
+            for ev in batch:
+                yield ev
+            if done and not batch:
+                return
+
+
+_live_turns: dict[str, LiveTurn] = {}
+_live_lock = threading.Lock()
+
+
+def _run_acp_turn(session, model, prompt, images, lt: LiveTurn):
+    """Fast lane: run one turn on the persistent ACP process, buffering events."""
+    try:
+        acp = _acp_get(session, model)
+    except Exception as exc:
+        lt.append("error", {"message": f"acp launch failed: {exc}"})
+        lt.append("done", {"code": 1})
+        return
+    lt.canceller = acp.cancel
+    try:
+        acp.prompt(prompt, lt.append, images=images)
+    except Exception as exc:
+        lt.append("error", {"message": str(exc)})
+        lt.append("done", {"code": 1})
+
+
+def _run_subprocess_turn(session, model, prompt, lt: LiveTurn):
+    """Legacy lane (chat_fast OFF => full MCP): spawn `copilot -p ...` per turn,
+    parse its JSONL, buffer events. Survives browser close because it runs in the
+    turn worker thread, not the HTTP request."""
+    emit = lt.append
+    argv = _build_argv(prompt, session, model)
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                cwd=os.path.expanduser("~"), text=True, bufsize=1)
+    except Exception as exc:
+        emit("error", {"message": f"launch failed: {exc}"})
+        emit("done", {})
+        return
+    lt.canceller = proc.kill
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = obj.get("type", "")
+            data = obj.get("data", {})
+            if etype == "assistant.message_delta":
+                emit("delta", {"text": data.get("deltaContent", "")})
+            elif etype == "assistant.message":
+                tr = data.get("toolRequests") or []
+                emit("message", {"text": data.get("content", ""),
+                                 "model": data.get("model"),
+                                 "tools": [t.get("name") for t in tr]})
+            elif etype == "assistant.turn_start":
+                emit("turn_start", {})
+            elif etype == "assistant.idle":
+                emit("idle", {})
+            elif etype == "model.call_start":
+                emit("thinking", {})
+            elif etype.startswith("mcp.") or "tool" in etype:
+                emit("tool", {"type": etype})
+        proc.wait(timeout=5)
+    except Exception as exc:
+        emit("error", {"message": str(exc)})
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        err = proc.stderr.read()[-400:] if proc.stderr else ""
+        emit("done", {"code": proc.returncode, "stderr": err.strip()})
+
+
+def _start_turn(session: str, model: str | None, prompt: str, images: list) -> LiveTurn:
+    """Begin a turn in a background worker thread that buffers its SSE events into
+    a LiveTurn. Returns the buffer immediately so the HTTP request can relay it.
+    Because the turn runs off-thread, a browser close does not end it — a reopened
+    tab reattaches via /api/chat/resume. Replaces any prior buffer for the session.
+    Lane choice mirrors _sse_chat: ACP fast lane, or legacy subprocess when
+    chat_fast is off (images always force the ACP lane)."""
+    turn_id = uuid.uuid4().hex
+    lt = LiveTurn(turn_id)
+    with _live_lock:
+        _live_turns[session] = lt
+    fast = bool(load_config().get("chat_fast", True)) or bool(images)
+    lt.append("start", {"session": session, "acp": fast, "turn": turn_id})
+
+    def worker():
+        try:
+            if fast:
+                _run_acp_turn(session, model, prompt, images, lt)
+            else:
+                _run_subprocess_turn(session, model, prompt, lt)
+        finally:
+            lt.finish()
+
+    threading.Thread(target=worker, name=f"turn-{session}", daemon=True).start()
+    return lt
+
+
+def _turn_stop(session: str):
+    """Stop the in-flight turn for a session (Stop button): cancel the ACP prompt
+    or kill the subprocess, and also cancel the persistent ACP session."""
+    with _live_lock:
+        lt = _live_turns.get(session)
+    if lt is not None and lt.canceller is not None:
+        try:
+            lt.canceller()
+        except Exception:
+            pass
+    _acp_stop(session)
 
 
 # --- image attachment store (paste-to-chat) ---------------------------
@@ -672,6 +829,45 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     # --- SSE chat ------------------------------------------------------
+    def _relay_live(self, lt: "LiveTurn", from_idx: int):
+        """Stream a LiveTurn buffer to this client from from_idx, blocking for
+        new events until the turn completes. A write failure means the viewer
+        detached (tab closed) — we return quietly; the turn keeps running."""
+        try:
+            for event, data in lt.read_from(from_idx):
+                self.wfile.write(
+                    f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _sse_resume(self, qs: dict):
+        """Reattach a reopened tab to an in-flight (or just-finished) turn and
+        replay its buffered events, then continue live until done."""
+        session = (qs.get("session", ["default"])[0]).strip() or "default"
+        turn = (qs.get("turn", [""])[0]).strip()
+        try:
+            from_idx = int(qs.get("from", ["0"])[0])
+        except ValueError:
+            from_idx = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        with _live_lock:
+            lt = _live_turns.get(session)
+        if lt is None or (turn and lt.turn_id != turn):
+            # nothing to resume: server restarted, or a newer/different turn.
+            try:
+                self.wfile.write(
+                    b'event: done\ndata: {"code": 0, "stale": true}\n\n')
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        self._relay_live(lt, from_idx)
+
     def _sse_chat(self, qs: dict):
         prompt = (qs.get("prompt", [""])[0]).strip()
         session = (qs.get("session", ["default"])[0]).strip() or "default"
@@ -686,92 +882,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
-
-        def emit(event: str, data: dict):
-            self.wfile.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
-            self.wfile.flush()
-
-        # Fast lane: persistent ACP process per session (warm, later turns skip boot).
-        # Images are only supported over ACP, so force this lane when any are attached.
-        if load_config().get("chat_fast", True) or images:
-            emit("start", {"session": session, "acp": True})
-            try:
-                acp = _acp_get(session, model)
-            except Exception as exc:
-                emit("error", {"message": f"acp launch failed: {exc}"})
-                emit("done", {"code": 1})
-                return
-            try:
-                acp.prompt(prompt, emit, images=images)
-            except (BrokenPipeError, ConnectionResetError):
-                acp.cancel()  # browser hung up mid-turn -> stop the agent
-            except Exception as exc:
-                try:
-                    emit("error", {"message": str(exc)})
-                    emit("done", {"code": 1})
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-            return
-
-        argv = _build_argv(prompt, session, model)
-        emit("start", {"session": session, "resumed": "--resume" in argv})
-        try:
-            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    cwd=os.path.expanduser("~"), text=True, bufsize=1)
-        except Exception as exc:
-            emit("error", {"message": f"launch failed: {exc}"})
-            emit("done", {})
-            return
-        try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                etype = obj.get("type", "")
-                data = obj.get("data", {})
-                if etype == "assistant.message_delta":
-                    emit("delta", {"text": data.get("deltaContent", "")})
-                elif etype == "assistant.message":
-                    tr = data.get("toolRequests") or []
-                    emit("message", {"text": data.get("content", ""),
-                                     "model": data.get("model"),
-                                     "tools": [t.get("name") for t in tr]})
-                elif etype == "assistant.turn_start":
-                    emit("turn_start", {})
-                elif etype == "assistant.idle":
-                    emit("idle", {})
-                elif etype == "model.call_start":
-                    emit("thinking", {})
-                elif etype.startswith("mcp.") or "tool" in etype:
-                    emit("tool", {"type": etype})
-            proc.wait(timeout=5)
-        except (BrokenPipeError, ConnectionResetError):
-            proc.kill()
-            return
-        except Exception as exc:
-            emit("error", {"message": str(exc)})
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-            err = proc.stderr.read()[-400:] if proc.stderr else ""
-            try:
-                emit("done", {"code": proc.returncode, "stderr": err.strip()})
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+        # The turn runs in a background worker that buffers its events (LiveTurn);
+        # this request just relays them. If the browser closes we stop relaying but
+        # DO NOT cancel — the worker keeps running and a reopened tab reattaches via
+        # /api/chat/resume. Lane (ACP vs subprocess) is chosen inside _start_turn.
+        lt = _start_turn(session, model, prompt, images)
+        self._relay_live(lt, 0)
 
     # --- routing -------------------------------------------------------
     def do_GET(self):
         p = urlparse(self.path)
         if p.path == "/api/chat":
             self._sse_chat(parse_qs(p.query))
+        elif p.path == "/api/chat/resume":
+            self._sse_resume(parse_qs(p.query))
         elif p.path == "/api/chat/stop":
             session = (parse_qs(p.query).get("session", [""])[0] or "").strip()
-            _acp_stop(session)
+            _turn_stop(session)
             self._json(200, {"stopped": bool(session)})
         elif p.path == "/api/chat/close":
             session = (parse_qs(p.query).get("session", [""])[0] or "").strip()

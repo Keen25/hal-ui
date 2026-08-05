@@ -604,13 +604,32 @@
     });
     log.scrollTop = log.scrollHeight;
   }
-  // Update only the streaming bubble of the active session (cheap live update)
+  // Update only the streaming bubble of the active session (cheap live update).
+  // SSE deltas can arrive faster than the browser paints; writing the DOM +
+  // forcing a reflow (scrollTop) on every token makes streaming feel choppy and
+  // costs O(n²) as the response grows. Coalesce into one DOM write per frame,
+  // cache the target element, and only auto-scroll when already at the bottom.
+  const _rafPending = {};   // sid -> true when a frame is already scheduled
+  const _streamEl = {};     // sid -> cached streaming .body element
   function liveUpdate(sid) {
     if (sid !== state.active) return;
-    const s = cur(); const last = s.messages[s.messages.length-1];
-    if (!last || last.role !== "bot") return;
-    const bodies = log.querySelectorAll(".msg.bot .body");
-    const el = bodies[bodies.length-1]; if (el) { el.textContent = last.text; log.scrollTop = log.scrollHeight; }
+    if (_rafPending[sid]) return;         // one flush per frame, coalesce the rest
+    _rafPending[sid] = true;
+    requestAnimationFrame(() => {
+      _rafPending[sid] = false;
+      if (sid !== state.active) return;
+      const s = cur(); const last = s.messages[s.messages.length-1];
+      if (!last || last.role !== "bot") return;
+      let el = _streamEl[sid];
+      if (!el || !el.isConnected) {        // requery only if the cache went stale
+        const bodies = log.querySelectorAll(".msg.bot .body");
+        el = bodies[bodies.length-1]; _streamEl[sid] = el;
+      }
+      if (!el) return;
+      const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+      el.textContent = last.text;
+      if (atBottom) log.scrollTop = log.scrollHeight;   // stick-to-bottom, don't yank
+    });
   }
 
   /* ================= CHAT SEND ================= */
@@ -698,20 +717,53 @@
     const ids = await uploadAtts(atts);  // stage images server-side, reference by id
     let url = `/api/chat?session=${encodeURIComponent(sid)}&model=${encodeURIComponent(s.model||"")}&prompt=${encodeURIComponent(sendText)}`;
     if (ids.length) url += `&attach=${encodeURIComponent(ids.join(","))}`;
-    const source = new EventSource(url); es[sid] = source;
+    const source = new EventSource(url);
+    wireStream(sid, source, bot);
+  }
+
+  // Wire an SSE stream (fresh turn or a resumed one) to a bot message + session.
+  // Shared by startTurn and resumeTurn so both behave identically.
+  function wireStream(sid, source, bot, resumed) {
+    es[sid] = source;
+    const s = state.sessions[sid];
     const finish = () => {
       bot.streaming = false; busy[sid] = false; delete finishers[sid];
       try { source.close(); } catch(e){} delete es[sid];
+      delete _streamEl[sid]; delete _rafPending[sid];   // drop streaming-bubble cache
+      delete s.pendingTurn;                              // turn is over: nothing to resume
       save(); renderStrip();
       const q = pendingQ[sid];
       if (q && q.length) { const next = q.shift(); startTurn(sid, next.text, next.atts); }  // drain next queued message
       else if (sid===state.active) { renderLog(); renderPending(); }
     };
     finishers[sid] = finish;
+    // Remember which server-side turn this is so a reopened tab can resume it.
+    // On a resume, the buffer replays `start` first — that's our cue to clear the
+    // old partial text before deltas rebuild it. (A stale resume sends no `start`,
+    // so the previously-shown text is preserved.)
+    source.addEventListener("start",(ev)=>{
+      try{ const d=JSON.parse(ev.data); if(d.turn){ s.pendingTurn = d.turn; save(); } }catch(e){}
+      if (resumed && !bot._reset){ bot._reset = true; bot.text = ""; liveUpdate(sid); }
+    });
     source.addEventListener("delta",(ev)=>{ bot.text += JSON.parse(ev.data).text; liveUpdate(sid); });
     source.addEventListener("message",(ev)=>{ const d=JSON.parse(ev.data); if(d.text) bot.text=d.text; if(d.tools&&d.tools.length) bot.tools=d.tools; liveUpdate(sid); });
     source.addEventListener("done",(ev)=>{ const d=JSON.parse(ev.data||"{}"); if(d.code&&d.code!==0&&d.stderr&&!bot.text) bot.text="[exit "+d.code+": "+d.stderr+"]"; finish(); });
     source.addEventListener("error",()=>{ if(!bot.text) bot.text="[stream error — is server.py running?]"; finish(); });
+  }
+
+  // Reattach to a turn that was still running server-side when the tab closed.
+  // Replays the buffered events from the start (rebuilding the bubble) and then
+  // continues live until the turn completes.
+  function resumeTurn(sid) {
+    const s = state.sessions[sid]; if (!s || !s.pendingTurn) return;
+    const last = s.messages[s.messages.length-1];
+    if (!last || last.role !== "bot") { delete s.pendingTurn; save(); return; }
+    last.streaming = true; busy[sid] = true;   // buffer replay from idx 0 rebuilds the text
+    const url = `/api/chat/resume?session=${encodeURIComponent(sid)}&turn=${encodeURIComponent(s.pendingTurn)}&from=0`;
+    const source = new EventSource(url);
+    wireStream(sid, source, last, true);
+    renderStrip();
+    if (sid===state.active) { renderLog(); renderPending(); }
   }
 
   // Stop the in-flight turn for the active session (ACP session/cancel + free the UI).
@@ -753,6 +805,8 @@
 
   // boot chat
   renderStrip(); renderLog(); syncModel(); renderPending();
+  // reattach to any turns that were still running server-side when we last closed
+  for (const sid of state.order) { if (state.sessions[sid] && state.sessions[sid].pendingTurn) resumeTurn(sid); }
   // pull default model from settings for new sessions
   fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; }).catch(()=>{});
 
