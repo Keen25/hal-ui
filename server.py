@@ -41,7 +41,29 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 COPILOT_BIN = shutil.which("copilot") or os.path.expanduser("~/.local/bin/copilot")
 GH_BIN = shutil.which("gh") or "/usr/bin/gh"
 AZ_BIN = shutil.which("az") or "/usr/bin/az"
-SF_BIN = shutil.which("sf") or "sf"
+def _resolve_sf() -> tuple[str, str]:
+    """Locate the `sf` CLI and the bin dir that must be on PATH to run it.
+
+    Under systemd the service PATH is only /usr/local/bin:/usr/bin, which
+    contains neither the nvm-installed `sf` nor the `node` its shebang
+    (`#!/usr/bin/env -S node`) needs. shutil.which("sf") therefore fails and the
+    CR tab silently disappears even though the sf auth token is valid on disk.
+    Fall back to the nvm node bin dirs so the integration works regardless of
+    the inherited PATH. Returns (sf_path, bin_dir); bin_dir is "" when unknown."""
+    found = shutil.which("sf")
+    if found:
+        return found, os.path.dirname(found)
+    import glob as _glob
+    # Prefer the highest node version that ships an sf binary.
+    cands = sorted(_glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin/sf")),
+                   reverse=True)
+    for c in cands:
+        if os.path.exists(c):
+            return c, os.path.dirname(c)
+    return "sf", ""
+
+
+SF_BIN, SF_BIN_DIR = _resolve_sf()
 SF_EXPECTED_ORG_ID = "00D30000000n44BEAQ"   # Quest/One Identity Salesforce org
 HIVE_URL_DEFAULT = os.environ.get("HIVE_URL", "http://127.0.0.1:5001")
 HIVE_TOKEN_FILE = os.path.expanduser("~/.hive/worker.token")
@@ -446,8 +468,14 @@ def _sf_run(args: list, timeout: float = 60) -> dict:
     """Run an `sf` subcommand with --json and return the parsed object, or
     {'error': ...} on any failure."""
     try:
+        env = os.environ.copy()
+        if SF_BIN_DIR:
+            # Ensure both `sf` and the `node` its shebang invokes are resolvable
+            # even when the inherited PATH (e.g. systemd) lacks the nvm bin dir.
+            env["PATH"] = SF_BIN_DIR + os.pathsep + env.get("PATH", "")
         out = subprocess.run([SF_BIN, *args, "--json"],
-                             capture_output=True, text=True, timeout=timeout)
+                             capture_output=True, text=True, timeout=timeout,
+                             env=env)
     except FileNotFoundError:
         return {"error": "sf CLI not found"}
     except subprocess.TimeoutExpired:
