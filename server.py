@@ -520,6 +520,147 @@ def _sf_enabled() -> bool:
     return bool(_sf_org())
 
 
+def _sf_cache_clear() -> None:
+    """Drop every cached Salesforce-derived value so status/enabled/products
+    re-evaluate after a (re)authentication."""
+    with _cache_lock:
+        for k in [k for k in _cache if k.startswith("sf_")]:
+            _cache.pop(k, None)
+
+
+def _desktop_env() -> dict:
+    """Best-effort DISPLAY/XAUTHORITY for the logged-in HAL desktop so a
+    subprocess (the sf web-login browser) can open a window. The systemd user
+    service inherits no DISPLAY, so we lift it from a live desktop process (same
+    uid => readable), falling back to :0 + the newest /run/user xauth cookie."""
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                raw = Path(f"/proc/{pid}/environ").read_bytes()
+            except OSError:
+                continue
+            e = dict(kv.split("=", 1) for kv in
+                     raw.decode("utf-8", "ignore").split("\0") if "=" in kv)
+            if e.get("DISPLAY"):
+                out = {"DISPLAY": e["DISPLAY"]}
+                if e.get("XAUTHORITY"):
+                    out["XAUTHORITY"] = e["XAUTHORITY"]
+                return out
+    except OSError:
+        pass
+    out = {"DISPLAY": ":0"}
+    import glob as _glob
+    xs = sorted(_glob.glob(f"/run/user/{os.getuid()}/xauth_*"))
+    if xs:
+        out["XAUTHORITY"] = xs[-1]
+    return out
+
+
+def _sf_status() -> dict:
+    """Salesforce connection status for the Settings panel. Reports the org
+    matching the expected Quest orgId (or any authorized org), including broken
+    states like AuthDecryptError so the UI can prompt a reconnect."""
+    present = bool(shutil.which("sf") or
+                   (SF_BIN and os.path.sep in SF_BIN and os.path.exists(SF_BIN)))
+    if not present:
+        return {"cli": False, "connected": False, "status": "sf CLI not found",
+                "org": "", "orgId": "", "instanceUrl": ""}
+    d = _sf_run(["org", "list"])
+    if "result" not in d:
+        return {"cli": True, "connected": False,
+                "status": d.get("error") or "org list failed",
+                "org": "", "orgId": "", "instanceUrl": ""}
+    res = d["result"] or {}
+    chosen = anyorg = None
+    for grp in ("nonScratchOrgs", "sandboxes", "scratchOrgs", "other"):
+        for o in res.get(grp) or []:
+            anyorg = anyorg or o
+            if o.get("orgId") == SF_EXPECTED_ORG_ID:
+                chosen = o
+                break
+        if chosen:
+            break
+    o = chosen or anyorg or {}
+    st = o.get("connectedStatus") or ("unknown" if o else "no authorized orgs")
+    return {"cli": True, "connected": st == "Connected", "status": st,
+            "org": o.get("username") or o.get("alias") or "",
+            "orgId": o.get("orgId") or "", "instanceUrl": o.get("instanceUrl") or ""}
+
+
+_sf_login_lock = threading.Lock()
+_sf_login_state = {"running": False, "url": "", "done": False,
+                   "ok": False, "msg": ""}
+
+
+def _sf_reconnect_start() -> dict:
+    """Kick off `sf org login web` for the Quest org in the background. Opens a
+    browser on the HAL desktop (DISPLAY lifted from the live session) and also
+    returns the login URL so it can be completed manually. Returns as soon as
+    the URL is known (or ~8s), leaving the flow running; SF caches are cleared
+    when it finishes so the CR tab reappears without a restart."""
+    with _sf_login_lock:
+        if _sf_login_state["running"]:
+            return {"started": True, "already": True, "url": _sf_login_state["url"]}
+        _sf_login_state.update(running=True, url="", done=False, ok=False, msg="")
+    url_evt = threading.Event()
+
+    def worker():
+        env = os.environ.copy()
+        if SF_BIN_DIR:
+            env["PATH"] = SF_BIN_DIR + os.pathsep + env.get("PATH", "")
+        env.update(_desktop_env())
+        cmd = [SF_BIN, "org", "login", "web",
+               "--instance-url", "https://login.salesforce.com", "--alias", "90729"]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, env=env)
+        except Exception as exc:
+            with _sf_login_lock:
+                _sf_login_state.update(running=False, done=True, ok=False,
+                                       msg=str(exc)[:200])
+            url_evt.set()
+            return
+        for line in proc.stdout or []:
+            m = re.search(r"https?://\S+", line)
+            if m:
+                with _sf_login_lock:
+                    if not _sf_login_state["url"]:
+                        _sf_login_state["url"] = m.group(0)
+                url_evt.set()
+        try:
+            rc = proc.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = -1
+        _sf_cache_clear()
+        with _sf_login_lock:
+            _sf_login_state.update(running=False, done=True, ok=(rc == 0),
+                                   msg="authorized" if rc == 0 else
+                                       ("timed out" if rc == -1 else f"exit {rc}"))
+        url_evt.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    url_evt.wait(timeout=8)
+    with _sf_login_lock:
+        return {"started": True, "url": _sf_login_state["url"],
+                "done": _sf_login_state["done"], "ok": _sf_login_state["ok"],
+                "msg": _sf_login_state["msg"]}
+
+
+def _sf_status_payload() -> dict:
+    """Connection status plus any in-flight login progress (single poll source
+    for the Settings panel)."""
+    s = dict(cached("sf_status", 8.0, _sf_status))
+    with _sf_login_lock:
+        s["login"] = {"running": _sf_login_state["running"],
+                      "url": _sf_login_state["url"],
+                      "done": _sf_login_state["done"],
+                      "ok": _sf_login_state["ok"], "msg": _sf_login_state["msg"]}
+    return s
+
+
 def _sf_query(soql: str, timeout: float = 60):
     """Run a SOQL query via the sf CLI. Returns (records, error_or_None)."""
     org = _sf_org()
@@ -1580,6 +1721,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(404, {"error": "salesforce disabled"})
             else:
                 self._json(200, cached("sf_products", 300.0, _sf_products))
+        elif p.path == "/api/sf/status":
+            self._json(200, _sf_status_payload())
         elif p.path == "/api/sf/crs":
             if not _sf_enabled():
                 self._json(404, {"error": "salesforce disabled"})
@@ -1644,6 +1787,8 @@ class Handler(BaseHTTPRequestHandler):
                     payload[k] = body[k]
             code, data = _hive_request("/add", method="POST", body=payload)
             self._json(code, data)
+        elif p.path == "/api/sf/reconnect":
+            self._json(200, _sf_reconnect_start())
         elif p.path == "/api/settings":
             save_config(body if isinstance(body, dict) else {})
             # settings that affect ADO identity/token invalidate caches
