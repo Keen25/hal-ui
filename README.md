@@ -160,6 +160,16 @@ cd $env:USERPROFILE\hal-ui ; git pull --ff-only ; Restart-Service hal-ui
   `-Health` parameters).
 - **Service didn't come back** — check logs: `journalctl --user -u hal-ui -n50`
   (Linux) or the WinSW `*.out.log` / `*.err.log` next to the service exe (Windows).
+- **Salesforce shows `AuthDecryptError`** — `sf` stores its token-encryption key
+  in the OS keyring (`secret-tool`), which a headless/systemd service can't reach
+  (`Cannot autolaunch D-Bus without X11 $DISPLAY`). HAL-UI forces `sf`'s file
+  keychain via `SF_USE_GENERIC_UNIX_KEYCHAIN=true` (set in `hal-ui.service` and
+  injected into every `sf` call). The on-disk token must be re-encrypted with the
+  file key **once** after adopting this: restart the service, then click
+  **Reconnect** in Settings (or run `SF_USE_GENERIC_UNIX_KEYCHAIN=true sf org
+  login web --alias 90729`). Thereafter the CR tab survives restarts and locked
+  keyrings. Note: a token authorized *under the flag* can't be read *without* it
+  (and vice-versa) — keep the flag set everywhere `sf` is invoked.
 
 ### Requirements
 - Python 3.10+

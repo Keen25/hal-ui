@@ -447,6 +447,13 @@
         <div class="row2"><span class="grow"></span><button type="submit">Save settings</button></div>
         <div id="set-msg"></div>
       </form>
+
+      <form class="addform" id="sf-panel" style="max-width:640px;margin-top:18px" onsubmit="return false">
+        <div class="toolbar" style="padding-left:0"><strong>Salesforce</strong><span class="muted">CR triage org connection</span></div>
+        <div id="sf-status-line" class="msgbox">checking…</div>
+        <div class="row2" style="margin-top:8px"><span class="grow muted">Re-auth opens a browser on the HAL desktop. If it doesn't, use the link shown below.</span><button id="sf-reconnect-btn" type="button">Reconnect</button></div>
+        <div id="sf-reconnect-msg"></div>
+      </form>
     </div>
   </section>
 </main>
@@ -1677,8 +1684,47 @@
       $("#s-chat_fast").checked=c.chat_fast!==false;
       $("#s-ado_pat").placeholder=c.ado_pat_set?"•••• set (leave blank to keep)":"blank = use az login";
       $("#s-hive_token").placeholder=c.hive_token_set?"•••• set (leave blank to keep)":"blank = ~/.hive/worker.token";
+      loadSfStatus();
     }catch(e){}
   }
+  function renderSfStatus(s){
+    const line=$("#sf-status-line");
+    if(!s||s.error){ line.className="msgbox err"; line.textContent="status unavailable"; return; }
+    if(!s.cli){ line.className="msgbox err"; line.textContent="sf CLI not found"; return; }
+    const org=s.org?` — ${s.org}`:"";
+    if(s.connected){ line.className="msgbox ok"; line.textContent=`Connected${org}`; }
+    else { line.className="msgbox err"; line.textContent=`Not connected: ${s.status||"unknown"}${org}`; }
+  }
+  async function loadSfStatus(){
+    try{ renderSfStatus(await (await fetch("/api/sf/status")).json()); }
+    catch(e){ $("#sf-status-line").className="msgbox err"; $("#sf-status-line").textContent="status fetch failed"; }
+  }
+  let __sfPoll=null;
+  function pollSfLogin(){
+    if(__sfPoll) clearInterval(__sfPoll);
+    __sfPoll=setInterval(async()=>{
+      let s; try{ s=await (await fetch("/api/sf/status")).json(); }catch(e){ return; }
+      renderSfStatus(s);
+      const lg=s.login||{};
+      if(lg.done||!lg.running){
+        clearInterval(__sfPoll); __sfPoll=null;
+        const m=$("#sf-reconnect-msg"); $("#sf-reconnect-btn").disabled=false;
+        if(s.connected||lg.ok){ m.className="msgbox ok"; m.textContent="authorized — CR tab enabled"; applySf(true); }
+        else if(lg.done){ m.className="msgbox err"; m.textContent="login ended: "+(lg.msg||"not connected"); }
+      }
+    },3000);
+  }
+  $("#sf-reconnect-btn").addEventListener("click",async()=>{
+    const btn=$("#sf-reconnect-btn"), m=$("#sf-reconnect-msg");
+    btn.disabled=true; m.className="msgbox"; m.textContent="starting web login…";
+    try{
+      const d=await (await fetch("/api/sf/reconnect",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})).json();
+      if(d.url){ m.className="msgbox"; m.innerHTML=`Complete login in the HAL desktop browser, or open: <a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.url)}</a>`; }
+      else if(d.ok||d.done){ m.className="msgbox ok"; m.textContent="authorized"; }
+      else { m.className="msgbox"; m.textContent="browser opened on HAL desktop — complete login there"; }
+      pollSfLogin();
+    }catch(err){ btn.disabled=false; m.className="msgbox err"; m.textContent=err.message; }
+  });
   $("#setf").addEventListener("submit",async(e)=>{
     e.preventDefault(); const m=$("#set-msg"); m.className=""; m.textContent="";
     const payload={ ado_org:$("#s-ado_org").value.trim(), ado_upn:$("#s-ado_upn").value.trim(),
