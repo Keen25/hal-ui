@@ -65,6 +65,30 @@ def _resolve_sf() -> tuple[str, str]:
 
 SF_BIN, SF_BIN_DIR = _resolve_sf()
 SF_EXPECTED_ORG_ID = "00D30000000n44BEAQ"   # Quest/One Identity Salesforce org
+
+
+def _sf_env(base: dict | None = None) -> dict:
+    """Environment for every `sf` invocation.
+
+    Two things a background/systemd service needs that the ambient env lacks:
+      1. PATH must include the nvm bin dir so `sf` and the `node` its shebang
+         invokes are resolvable (systemd PATH is only /usr/local/bin:/usr/bin).
+      2. The generic file keychain must be forced. By default `sf` stores its
+         AES key in the OS keyring via `secret-tool`, which needs a live DBus
+         session + unlocked wallet. Without them the token can't be decrypted
+         and `sf` reports AuthDecryptError ("secret-tool: Cannot autolaunch
+         D-Bus without X11 $DISPLAY"). SF_USE_GENERIC_UNIX_KEYCHAIN moves the
+         key to ~/.sfdx/key.json so reads work headlessly regardless of the
+         keyring/DBus state. (Both the sf and legacy sfdx var names are set.)
+
+    The token must be (re)authorized once after this flag is in effect so it
+    gets encrypted with the file key rather than the keyring key."""
+    env = (base if base is not None else os.environ).copy()
+    if SF_BIN_DIR:
+        env["PATH"] = SF_BIN_DIR + os.pathsep + env.get("PATH", "")
+    env.setdefault("SF_USE_GENERIC_UNIX_KEYCHAIN", "true")
+    env.setdefault("SFDX_USE_GENERIC_UNIX_KEYCHAIN", "true")
+    return env
 HIVE_URL_DEFAULT = os.environ.get("HIVE_URL", "http://127.0.0.1:5001")
 HIVE_TOKEN_FILE = os.path.expanduser("~/.hive/worker.token")
 ADO_RESOURCE = "499b84ac-1321-427f-aa17-267ca6975798"  # Azure DevOps AAD app id
@@ -468,14 +492,9 @@ def _sf_run(args: list, timeout: float = 60) -> dict:
     """Run an `sf` subcommand with --json and return the parsed object, or
     {'error': ...} on any failure."""
     try:
-        env = os.environ.copy()
-        if SF_BIN_DIR:
-            # Ensure both `sf` and the `node` its shebang invokes are resolvable
-            # even when the inherited PATH (e.g. systemd) lacks the nvm bin dir.
-            env["PATH"] = SF_BIN_DIR + os.pathsep + env.get("PATH", "")
         out = subprocess.run([SF_BIN, *args, "--json"],
                              capture_output=True, text=True, timeout=timeout,
-                             env=env)
+                             env=_sf_env())
     except FileNotFoundError:
         return {"error": "sf CLI not found"}
     except subprocess.TimeoutExpired:
@@ -607,9 +626,7 @@ def _sf_reconnect_start() -> dict:
     url_evt = threading.Event()
 
     def worker():
-        env = os.environ.copy()
-        if SF_BIN_DIR:
-            env["PATH"] = SF_BIN_DIR + os.pathsep + env.get("PATH", "")
+        env = _sf_env()
         env.update(_desktop_env())
         cmd = [SF_BIN, "org", "login", "web",
                "--instance-url", "https://login.salesforce.com", "--alias", "90729"]

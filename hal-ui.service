@@ -7,6 +7,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/hal-ui
+# Force sf's file-based keychain so Salesforce auth decrypts without a live
+# DBus/keyring session (otherwise: AuthDecryptError on headless restarts).
+Environment=SF_USE_GENERIC_UNIX_KEYCHAIN=true
+Environment=SFDX_USE_GENERIC_UNIX_KEYCHAIN=true
 ExecStart=/usr/bin/python3 %h/hal-ui/server.py --port 8900 --host 127.0.0.1
 Restart=on-failure
 RestartSec=3
