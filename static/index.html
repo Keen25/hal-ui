@@ -27,6 +27,13 @@
   .tab.active { color:var(--txt); background:var(--panel2); border-color:var(--line); }
   .hive-off .tab[data-view="hive"], .hive-off #tohive { display:none !important; }
   .sf-off .tab[data-view="sf"] { display:none !important; }
+  /* unread notifications: per-tab count badge + per-row "updated" dot */
+  .tab .nbadge { display:none; margin-left:6px; min-width:16px; height:16px; padding:0 4px;
+    border-radius:8px; background:var(--bad); color:#fff; font-size:11px; line-height:16px;
+    font-weight:700; text-align:center; vertical-align:middle; box-shadow:0 0 6px var(--bad); }
+  .tab .nbadge.on { display:inline-block; }
+  .ndot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--bad);
+    box-shadow:0 0 5px var(--bad); margin-right:6px; vertical-align:middle; }
   main { flex:1; min-height:0; display:flex; }
   .view { flex:1; min-height:0; display:none; flex-direction:column; }
   .view.active { display:flex; }
@@ -255,10 +262,10 @@
   </div>
   <div class="tabs">
     <div class="tab active" data-view="chat">Chat</div>
-    <div class="tab" data-view="hive">Hive</div>
-    <div class="tab" data-view="github">GitHub</div>
-    <div class="tab" data-view="ado">ADO</div>
-    <div class="tab" data-view="sf">CRs</div>
+    <div class="tab" data-view="hive">Hive<span class="nbadge"></span></div>
+    <div class="tab" data-view="github">GitHub<span class="nbadge"></span></div>
+    <div class="tab" data-view="ado">ADO<span class="nbadge"></span></div>
+    <div class="tab" data-view="sf">CRs<span class="nbadge"></span></div>
     <div class="tab" data-view="history">History</div>
     <div class="tab" data-view="settings">⚙</div>
   </div>
@@ -1108,6 +1115,8 @@
 
   // top-level view tabs
   document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+    const prev=(document.querySelector(".tab.active")||{}).dataset;
+    const prevView=prev&&prev.view;
     document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
     document.querySelectorAll(".view").forEach(x => x.classList.remove("active"));
     t.classList.add("active"); $("#view-" + t.dataset.view).classList.add("active");
@@ -1118,6 +1127,8 @@
     if (t.dataset.view === "history") loadHistory();
     if (t.dataset.view === "settings") loadSettings();
     if (t.dataset.view === "chat") $("#prompt").focus();
+    // leaving a data view marks everything currently in it as seen
+    if (prevView && prevView !== t.dataset.view) nAckView(prevView);
   });
 
   // boot chat
@@ -1169,7 +1180,7 @@
     }catch(e){ $("#hive-cards").innerHTML=`<div class="msgbox err">fetch failed: ${esc(e.message)}</div>`; }
   }
   function renderTasks(){
-    if(!hiveData) return; const f=($("#q-filter").value||"").toLowerCase(); const sf=$("#q-status").value;
+    if(!hiveData) return; nComputeUnread("hive"); const f=($("#q-filter").value||"").toLowerCase(); const sf=$("#q-status").value;
     let tasks=(hiveData.tasks||[]).slice();
     tasks.sort((a,b)=>(b.created_at||"").localeCompare(a.created_at||""));
     tasks=tasks.filter(t=>{
@@ -1179,12 +1190,13 @@
       return true;
     });
     $("#q-count").textContent=`(${tasks.length})`;
-    $("#tasks tbody").innerHTML=tasks.slice(0,200).map(t=>`<tr class="click" data-id="${esc(t.id)}">
-      <td>${esc(t.id)}</td><td class="title" title="${esc(t.title)}">${esc(t.title||"")}</td>
+    $("#tasks tbody").innerHTML=tasks.slice(0,200).map(t=>{ const nk="hive:"+t.id; return `<tr class="click" data-id="${esc(t.id)}" data-nk="${esc(nk)}" data-nv="${esc(nVer(t.status))}">
+      <td>${nDot("hive",nk)}${esc(t.id)}</td><td class="title" title="${esc(t.title)}">${esc(t.title||"")}</td>
       <td><span class="pill s-${esc(t.status)}">${esc(t.status)}</span></td>
       <td>${esc(t.kind||"")}</td><td>${esc(t.priority)}</td><td>${esc(t.worker_id||t.worker||"—")}</td>
       <td class="muted">${esc(t.model||"")}</td><td class="muted">${esc(t.created_at||"")}</td>
-    </tr>`).join("")||`<tr><td colspan="8" class="muted">no matching tasks</td></tr>`;
+    </tr>`; }).join("")||`<tr><td colspan="8" class="muted">no matching tasks</td></tr>`;
+    nSetBadge("hive",nUnread.hive.size);
   }
   $("#tasks").addEventListener("click",(e)=>{ const tr=e.target.closest("tr.click"); if(tr&&tr.dataset.id) openTaskDrawer(tr.dataset.id); });
   $("#q-filter").addEventListener("input",renderTasks);
@@ -1303,28 +1315,128 @@
   function setArr(id, dir){ const el=document.querySelector(id+" .arr"); if(el) el.textContent = dir<0 ? "▼" : "▲"; }
   const ghRepoOf = x => (x.repository&&x.repository.nameWithOwner)||"";
 
+  /* ================= UNREAD NOTIFICATIONS =================
+     Per-item "changed since you last looked" tracking across the GitHub, ADO,
+     CRs and Hive views. Each item has a stable key + a "version" (a timestamp,
+     or Hive task status) already fetched by the views. We remember the version
+     last acknowledged (localStorage); an item is unread when its current
+     version differs. Unread items get a red row dot; each view's tab shows a
+     red count badge; the browser tab title shows the grand total. A background
+     poller refreshes all views on an interval so badges light up without you
+     opening the tab.
+
+     Acknowledging (clears the mark):
+       - leaving a view marks everything currently in it as seen;
+       - clicking a row acknowledges just that item.
+
+     First run per view is a silent baseline (mark all seen, no flood). */
+  const NOTIF_SEEN_KEY="hal-ui-seen-v1";     // { itemKey: version }
+  const NOTIF_INIT_KEY="hal-ui-seen-init-v1"; // { view: true } once baselined
+  const NOTIF_POLL_MS=90000;
+  let notifSeen=(()=>{ try{ return JSON.parse(localStorage.getItem(NOTIF_SEEN_KEY))||{}; }catch(e){ return {}; } })();
+  let notifInit=(()=>{ try{ return JSON.parse(localStorage.getItem(NOTIF_INIT_KEY))||{}; }catch(e){ return {}; } })();
+  const nUnread={github:new Set(),ado:new Set(),sf:new Set(),hive:new Set()};
+  const NOTIF_VIEWS=["github","ado","sf","hive"];
+  function nVer(v){ return String(v==null?"":v); }
+  function notifSave(){ try{ localStorage.setItem(NOTIF_SEEN_KEY,JSON.stringify(notifSeen)); localStorage.setItem(NOTIF_INIT_KEY,JSON.stringify(notifInit)); }catch(e){} }
+  // {key,ver} list for a view, built from the data the view already fetched.
+  function nItemsFor(view){
+    if(view==="github") return [
+      ...ghData.prs.map(p=>({key:"gh:pr:"+ghRepoOf(p)+"#"+p.number, ver:p.updatedAt})),
+      ...ghData.issues.map(i=>({key:"gh:iss:"+ghRepoOf(i)+"#"+i.number, ver:i.updatedAt}))];
+    if(view==="ado") return [
+      ...adoData.prs.map(p=>({key:"ado:pr:"+p.id, ver:p.updated||p.created})),
+      ...adoData.workitems.map(w=>({key:"ado:wi:"+w.id, ver:w.changed}))];
+    if(view==="sf") return [...sfData.mine,...sfData.unassigned,...sfData.all]
+      .map(r=>({key:"sf:"+(r.id||r.name), ver:r.modified||r.created}));
+    if(view==="hive") return (((typeof hiveData!=="undefined"&&hiveData&&hiveData.tasks)||[]))
+      .map(t=>({key:"hive:"+t.id, ver:t.status}));
+    return [];
+  }
+  // Recompute the unread set for a view (baselines silently on first run).
+  function nComputeUnread(view){
+    const items=nItemsFor(view); const set=new Set();
+    if(!notifInit[view]){
+      for(const it of items) if(it.key) notifSeen[it.key]=nVer(it.ver);
+      notifInit[view]=true; notifSave();
+    } else {
+      for(const it of items) if(it.key && notifSeen[it.key]!==nVer(it.ver)) set.add(it.key);
+    }
+    nUnread[view]=set; return set;
+  }
+  function nDot(view,key){ return (nUnread[view]&&nUnread[view].has(key))?'<span class="ndot" title="updated since you last looked"></span>':""; }
+  function nSetBadge(view,n){
+    const el=document.querySelector('.tab[data-view="'+view+'"] .nbadge'); if(el){
+      if(n>0){ el.textContent=n>99?"99+":n; el.classList.add("on"); } else { el.textContent=""; el.classList.remove("on"); }
+    }
+    nRefreshTitle();
+  }
+  function nRefreshTitle(){
+    let t=0; for(const v of NOTIF_VIEWS) t+=nUnread[v]?nUnread[v].size:0;
+    document.title=(t>0?"("+t+") ":"")+"HAL-UI";
+  }
+  // Mark every item currently in a view as seen (called when you leave the view).
+  function nAckView(view){
+    if(NOTIF_VIEWS.indexOf(view)<0) return;
+    let ch=false;
+    for(const it of nItemsFor(view)){ if(it.key){ const v=nVer(it.ver); if(notifSeen[it.key]!==v){ notifSeen[it.key]=v; ch=true; } } }
+    notifInit[view]=true; if(ch) notifSave();
+    nUnread[view]=new Set(); nSetBadge(view,0);
+  }
+  function nViewOfKey(k){ return k.indexOf("gh:")===0?"github":k.indexOf("ado:")===0?"ado":k.indexOf("sf:")===0?"sf":k.indexOf("hive:")===0?"hive":null; }
+  // Acknowledge a single item (called when you click its row).
+  function nAckOne(key,ver){
+    if(!key) return; const v=nVer(ver); if(notifSeen[key]===v) return;
+    notifSeen[key]=v; notifSave();
+    const view=nViewOfKey(key); if(!view) return;
+    if(nUnread[view]) nUnread[view].delete(key);
+    nSetBadge(view, nUnread[view]?nUnread[view].size:0);
+    document.querySelectorAll('tr[data-nk]').forEach(tr=>{ if(tr.getAttribute("data-nk")===key){ const d=tr.querySelector(".ndot"); if(d) d.remove(); } });
+  }
+  // Clicking any tracked row acknowledges that item.
+  document.addEventListener("click",(e)=>{
+    const tr=e.target.closest("tr[data-nk]"); if(!tr) return;
+    nAckOne(tr.getAttribute("data-nk"), tr.getAttribute("data-nv"));
+  });
+  // Background refresh so badges appear without opening each tab. Reuses the
+  // view loaders (server-side responses are TTL-cached); each renders into its
+  // own (possibly hidden) view and recomputes its badge.
+  async function nPoll(){
+    const jobs=[];
+    if(typeof loadGithub==="function") jobs.push(loadGithub());
+    if(typeof loadAdo==="function") jobs.push(loadAdo());
+    if(!document.body.classList.contains("sf-off") && typeof loadSf==="function") jobs.push(loadSf());
+    if(!document.body.classList.contains("hive-off") && typeof loadHive==="function") jobs.push(loadHive());
+    try{ await Promise.allSettled(jobs); }catch(e){}
+  }
+  setTimeout(nPoll,2500);
+  setInterval(nPoll,NOTIF_POLL_MS);
+
   /* ================= GITHUB ================= */
   const ghData={prs:[],issues:[],prsErr:"",issErr:""};
   const ghSort={pr:-1,iss:-1};
   function ghPrRow(p){
     const repo=ghRepoOf(p); const short=`${repo.split("/").pop()}#${p.number}`;
+    const nk="gh:pr:"+repo+"#"+p.number;
     const ctx={ banner:`GitHub PR ${repo}#${p.number} — ${p.title}`, url:p.url,
       preamble:`We'll be discussing this GitHub pull request; keep it in context for our whole conversation:\n${repo}#${p.number} — "${p.title}"\n${p.url}\n\n` };
-    return `<tr>
-      <td class="muted">${esc(repo)}</td><td>#${esc(p.number)}</td>
+    return `<tr data-nk="${esc(nk)}" data-nv="${esc(nVer(p.updatedAt))}">
+      <td class="muted">${nDot("github",nk)}${esc(repo)}</td><td>#${esc(p.number)}</td>
       <td><a href="${esc(p.url)}" target="_blank">${esc(p.title)}${p.isDraft?' <span class="muted">(draft)</span>':''}</a></td>
       <td class="muted">${esc(ago(p.updatedAt))}</td>${chatCell(short, ctx)}</tr>`;
   }
   function ghIssRow(i){
     const repo=ghRepoOf(i); const short=`${repo.split("/").pop()}#${i.number}`;
+    const nk="gh:iss:"+repo+"#"+i.number;
     const ctx={ banner:`GitHub issue ${repo}#${i.number} — ${i.title}`, url:i.url,
       preamble:`We'll be discussing this GitHub issue; keep it in context for our whole conversation:\n${repo}#${i.number} — "${i.title}"\n${i.url}\n\n` };
-    return `<tr>
-      <td class="muted">${esc(repo)}</td><td>#${esc(i.number)}</td>
+    return `<tr data-nk="${esc(nk)}" data-nv="${esc(nVer(i.updatedAt))}">
+      <td class="muted">${nDot("github",nk)}${esc(repo)}</td><td>#${esc(i.number)}</td>
       <td><a href="${esc(i.url)}" target="_blank">${esc(i.title)}</a></td>
       <td class="muted">${esc(ago(i.updatedAt))}</td>${chatCell(short, ctx)}</tr>`;
   }
   function renderGithub(){
+    nComputeUnread("github");
     const prRepo=$("#ghpr-repo"); fillSelect(prRepo,[...new Set(ghData.prs.map(ghRepoOf))].sort());
     const prs=ghData.prs.filter(p=>!prRepo.value||ghRepoOf(p)===prRepo.value).slice().sort(byDate("updatedAt",ghSort.pr));
     $("#ghpr-count").textContent=`(${prs.length})`;
@@ -1335,6 +1447,7 @@
     $("#ghiss-count").textContent=`(${iss.length})`;
     $("#issues tbody").innerHTML=iss.map(ghIssRow).join("")||`<tr><td colspan="5" class="muted">${ghData.issErr?esc(ghData.issErr):'none'}</td></tr>`;
     setArr("#ghiss-sort",ghSort.iss);
+    nSetBadge("github",nUnread.github.size);
   }
   async function loadGithub(){
     try{
@@ -1355,10 +1468,11 @@
   const adoData={prs:[],workitems:[]};
   const adoSort={pr:-1,wi:-1};
   function adoWiRow(w){
+    const nk="ado:wi:"+w.id;
     const ctx={ banner:`ADO ${w.type} ${w.id} · ${w.project} — ${w.title}`, url:w.url,
       preamble:`We'll be discussing this Azure DevOps work item; keep it in context for our whole conversation:\nWork item ${w.id} — ${w.type}, state "${w.state}", project "${w.project}"\n"${w.title}"\n${w.url}\n\n` };
-    return `<tr>
-      <td><a href="${esc(w.url)}" target="_blank">${esc(w.id)}</a></td>
+    return `<tr data-nk="${esc(nk)}" data-nv="${esc(nVer(w.changed))}">
+      <td>${nDot("ado",nk)}<a href="${esc(w.url)}" target="_blank">${esc(w.id)}</a></td>
       <td class="muted">${esc(w.type)}</td>
       <td><span class="pill s-${esc((w.state||'').toLowerCase().replace(/ /g,'_'))}">${esc(w.state)}</span></td>
       <td class="muted">${esc(w.project)}</td>
@@ -1367,14 +1481,15 @@
   }
   function adoPrRow(p){
     const asRev=p.role==='reviewer';
+    const nk="ado:pr:"+p.id;
     const ctx={ banner:`ADO PR !${p.id} · ${p.project}/${p.repo}${asRev?' (you: reviewer)':''} — ${p.title}`, url:p.url,
       preamble:`We'll be discussing this Azure DevOps pull request${asRev?" (I'm assigned as a reviewer)":""}; keep it in context for our whole conversation:\nPR !${p.id} in ${p.project}/${p.repo}${p.author&&p.role!=='author'?` by ${p.author}`:''}\n"${p.title}"\n${p.url}\n\n` };
     const roleCls=p.role==='reviewer'?'r-reviewer':(p.role==='author+reviewer'?'r-both':'r-author');
     const tot=p.threads_total||0, res=p.threads_resolved||0;
     const cCls=tot===0?'muted':(res>=tot?'c-done':'c-open');
     const comments=`<span class="${cCls}" title="${res} resolved / ${tot} comment thread${tot===1?'':'s'}">${res} / ${tot}</span>`;
-    return `<tr>
-      <td><a href="${esc(p.url)}" target="_blank">!${esc(p.id)}</a></td>
+    return `<tr data-nk="${esc(nk)}" data-nv="${esc(nVer(p.updated||p.created))}">
+      <td>${nDot("ado",nk)}<a href="${esc(p.url)}" target="_blank">!${esc(p.id)}</a></td>
       <td><span class="pill ${roleCls}">${esc(p.role||'author')}</span></td>
       <td class="muted">${esc(p.project)} / ${esc(p.repo)}</td>
       <td class="title" title="${esc(p.title)}">${esc(p.title)}${p.isDraft?' <span class="muted">(draft)</span>':''}</td>
@@ -1382,6 +1497,7 @@
       <td class="muted">${esc(ago(p.updated||p.created))}</td>${chatCell("PR !"+p.id, ctx)}</tr>`;
   }
   function renderAdo(){
+    nComputeUnread("ado");
     const typeSel=$("#adowi-type"); fillSelect(typeSel,[...new Set(adoData.workitems.map(w=>w.type).filter(Boolean))].sort());
     const wi=adoData.workitems.filter(w=>!typeSel.value||w.type===typeSel.value).slice().sort(byDate("changed",adoSort.wi));
     $("#wi-count").textContent=`(${wi.length})`;
@@ -1392,6 +1508,7 @@
     $("#adopr-count").textContent=`(${pr.length})`;
     $("#adoprs tbody").innerHTML=pr.map(adoPrRow).join("")||`<tr><td colspan="7" class="muted">none</td></tr>`;
     setArr("#adopr-sort",adoSort.pr);
+    nSetBadge("ado",nUnread.ado.size);
   }
   async function loadAdo(){
     const err=$("#ado-err"); err.innerHTML="";
@@ -1483,6 +1600,7 @@
         preamble:preamble+`Investigate this CR: read the CR + parent case + emails, then summarize the issue, what Support already tried, and the likely root cause or next diagnostic step.\n\n` };
     }
     const link=r.url?`<a href="${esc(r.url)}" target="_blank">${esc(r.name)}</a>`:esc(r.name);
+    const nk="sf:"+(r.id||r.name);
     const badges=(r.escalated?` <span class="esc" title="Case escalated">⏫</span>`:"")
                +(r.atRisk?` <span class="atrisk" title="At risk">⚠</span>`:"");
     const pri=SF_PRI_SHORT[r.prio_n]||(r.priority||"—");
@@ -1491,8 +1609,8 @@
         : `<span class="muted">${esc(r.ado)}</span>`):`<span class="muted">—</span>`;
     const col6=showOwner?`<td class="muted" title="${esc(r.owner)}">${esc(r.owner||"—")}</td>`
                          :`<td class="muted">${esc(r.case||"—")}</td>`;
-    return `<tr>
-      <td>${link}${badges}</td>
+    return `<tr data-nk="${esc(nk)}" data-nv="${esc(nVer(r.modified||r.created))}">
+      <td>${nDot("sf",nk)}${link}${badges}</td>
       <td class="prio-${r.prio_n}">${esc(pri)}</td>
       ${sfStatusCell(r)}
       <td class="muted">${esc(r.product)}</td>
@@ -1512,6 +1630,7 @@
     });
   }
   function renderSf(){
+    nComputeUnread("sf");
     const mk=(rows,dir,tbody,countEl,sortId,showOwner,cols)=>{
       const sorted=sortCrs(rows,dir);
       $(countEl).textContent=`(${sorted.length})`;
@@ -1520,6 +1639,7 @@
     mk(sfData.mine,sfSort.mine,"#sf-mine tbody","#sf-mine-count","#sf-mine-sort",false,8); setArr("#sf-mine-sort",sfSort.mine);
     mk(sfData.unassigned,sfSort.un,"#sf-un tbody","#sf-un-count","#sf-un-sort",false,8); setArr("#sf-un-sort",sfSort.un);
     mk(sfData.all,sfSort.all,"#sf-all tbody","#sf-all-count","#sf-all-sort",true,8); setArr("#sf-all-sort",sfSort.all);
+    nSetBadge("sf",nUnread.sf.size);
   }
   async function loadSf(){
     const err=$("#sf-err"); err.innerHTML="";
