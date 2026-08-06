@@ -9,6 +9,13 @@ Two files. No build step. No `pip install`, no `npm install`. Just
 
 ## Features
 
+- **Unread notifications** — a background poller (~90s) watches GitHub, ADO,
+  CRs and Hive; when an item changes since you last looked, its row gets a red
+  dot, its tab shows a red count badge, and the browser tab title shows the
+  grand total (`(3) HAL-UI`). Change detection is per-item: PR/issue/CR/work-item
+  `updatedAt`/`changed`/`modified` timestamps, or Hive task status. Leaving a
+  view (or clicking a row) marks its items seen; first run per view is a silent
+  baseline (no flood). Seen-state persists in `localStorage`.
 - **Streaming multi-session chat** — konsole-style tabs, each a live Copilot CLI
   session. Token-by-token streaming over SSE, per-session message queue (sends
   while busy are queued, not dropped), copy-to-clipboard on replies.
