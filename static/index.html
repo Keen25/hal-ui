@@ -144,6 +144,7 @@
   .r-author { color:#a5d6ff; border-color:#388bfd55; }
   .r-reviewer { color:#d2a8ff; border-color:#a371f755; }
   .r-both { color:#7ee787; border-color:#2ea04355; }
+  .r-assignee { color:#ffa657; border-color:#f0883e55; }
   .c-done { color:#7ee787; } .c-open { color:#e3b341; }
   .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
   .dot.on { background:var(--ok); box-shadow:0 0 6px var(--ok); }
@@ -353,7 +354,7 @@
       <div class="lhead"><h3>Open pull requests</h3><span class="muted" id="ghpr-count"></span>
         <span class="grow"></span><span class="muted mini-l">repo</span>
         <select id="ghpr-repo" class="mini"><option value="">all</option></select></div>
-      <table id="prs"><thead><tr><th>Repo</th><th>#</th><th>Title</th>
+      <table id="prs"><thead><tr><th>Repo</th><th>#</th><th>Role</th><th>Title</th>
         <th class="sortable" id="ghpr-sort">Updated <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
       <div class="lhead"><h3>Assigned issues</h3><span class="muted" id="ghiss-count"></span>
         <span class="grow"></span><span class="muted mini-l">repo</span>
@@ -1422,13 +1423,22 @@
   /* ================= GITHUB ================= */
   const ghData={prs:[],issues:[],prsErr:"",issErr:""};
   const ghSort={pr:-1,iss:-1};
+  function ghRoleCls(role){
+    if(role==='author') return 'r-author';
+    if(role==='reviewer') return 'r-reviewer';
+    if(role==='assignee') return 'r-assignee';
+    if(role==='author+reviewer') return 'r-both';
+    return 'r-reviewer';
+  }
   function ghPrRow(p){
     const repo=ghRepoOf(p); const short=`${repo.split("/").pop()}#${p.number}`;
     const nk="gh:pr:"+repo+"#"+p.number;
+    const role=p.role||'author'; const asAuthor=role.split('+').includes('author');
     const ctx={ banner:`GitHub PR ${repo}#${p.number} — ${p.title}`, url:p.url,
-      preamble:`We'll be discussing this GitHub pull request; keep it in context for our whole conversation:\n${repo}#${p.number} — "${p.title}"\n${p.url}\n\n` };
+      preamble:`We'll be discussing this GitHub pull request${asAuthor?"":" (you: "+role+")"}; keep it in context for our whole conversation:\n${repo}#${p.number} — "${p.title}"\n${p.url}\n\n` };
     return `<tr data-nk="${esc(nk)}" data-nv="${esc(nVer(p.updatedAt))}">
       <td class="muted">${nDot("github",nk)}${esc(repo)}</td><td>#${esc(p.number)}</td>
+      <td><span class="pill ${ghRoleCls(role)}">${esc(role)}</span></td>
       <td><a href="${esc(p.url)}" target="_blank">${esc(p.title)}${p.isDraft?' <span class="muted">(draft)</span>':''}</a></td>
       <td class="muted">${esc(ago(p.updatedAt))}</td>${chatCell(short, ctx)}</tr>`;
   }
@@ -1447,7 +1457,7 @@
     const prRepo=$("#ghpr-repo"); fillSelect(prRepo,[...new Set(ghData.prs.map(ghRepoOf))].sort());
     const prs=ghData.prs.filter(p=>!prRepo.value||ghRepoOf(p)===prRepo.value).slice().sort(byDate("updatedAt",ghSort.pr));
     $("#ghpr-count").textContent=`(${prs.length})`;
-    $("#prs tbody").innerHTML=prs.map(ghPrRow).join("")||`<tr><td colspan="5" class="muted">${ghData.prsErr?esc(ghData.prsErr):'none'}</td></tr>`;
+    $("#prs tbody").innerHTML=prs.map(ghPrRow).join("")||`<tr><td colspan="6" class="muted">${ghData.prsErr?esc(ghData.prsErr):'none'}</td></tr>`;
     setArr("#ghpr-sort",ghSort.pr);
     const issRepo=$("#ghiss-repo"); fillSelect(issRepo,[...new Set(ghData.issues.map(ghRepoOf))].sort());
     const iss=ghData.issues.filter(i=>!issRepo.value||ghRepoOf(i)===issRepo.value).slice().sort(byDate("updatedAt",ghSort.iss));
@@ -1463,7 +1473,7 @@
       ghData.prs=Array.isArray(d.prs)?d.prs:[]; ghData.prsErr=(d.prs&&d.prs.error)||"";
       ghData.issues=Array.isArray(d.issues)?d.issues:[]; ghData.issErr=(d.issues&&d.issues.error)||"";
       renderGithub();
-    }catch(e){ $("#prs tbody").innerHTML=`<tr><td colspan="5" class="msgbox err">${esc(e.message)}</td></tr>`; }
+    }catch(e){ $("#prs tbody").innerHTML=`<tr><td colspan="6" class="msgbox err">${esc(e.message)}</td></tr>`; }
   }
   $("#gh-refresh").addEventListener("click",loadGithub);
   $("#ghpr-repo").addEventListener("change",renderGithub);
