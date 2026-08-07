@@ -228,11 +228,48 @@ def _gh_json(args: list[str]):
         return {"error": str(exc)}
 
 
+_GH_PR_FIELDS = "number,title,repository,url,updatedAt,isDraft"
+# role precedence: authored PRs win, then review-requested, then assignee.
+_GH_PR_ROLES = [
+    ("--author=@me", "author"),
+    ("--review-requested=@me", "reviewer"),
+    ("--assignee=@me", "assignee"),
+]
+
+
 def _github_mywork():
-    prs = _gh_json([
-        "search", "prs", "--author=@me", "--state=open", "--limit", "20",
-        "--json", "number,title,repository,url,updatedAt,isDraft",
-    ])
+    # Merge PRs across every relationship (author / reviewer / assignee) so
+    # review-requested and assigned PRs surface, not just the ones we authored.
+    by_key: dict = {}
+    order: list = []
+    prs_err = ""
+    for flag, role in _GH_PR_ROLES:
+        rows = _gh_json([
+            "search", "prs", flag, "--state=open", "--limit", "20",
+            "--json", _GH_PR_FIELDS,
+        ])
+        if isinstance(rows, dict) and rows.get("error"):
+            prs_err = prs_err or rows["error"]
+            continue
+        for p in rows or []:
+            repo = (p.get("repository") or {}).get("nameWithOwner", "")
+            key = f"{repo}#{p.get('number')}"
+            if key in by_key:
+                existing = by_key[key]
+                if role not in existing["_roles"]:
+                    existing["_roles"].append(role)
+            else:
+                p["_roles"] = [role]
+                by_key[key] = p
+                order.append(key)
+    prs = []
+    for key in order:
+        p = by_key[key]
+        roles = p.pop("_roles", [])
+        p["role"] = "+".join(roles)
+        prs.append(p)
+    if not prs and prs_err:
+        prs = {"error": prs_err}
     issues = _gh_json([
         "search", "issues", "--assignee=@me", "--state=open",
         "--limit", "20", "--json", "number,title,repository,url,updatedAt",
