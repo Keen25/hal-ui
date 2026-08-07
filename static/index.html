@@ -620,7 +620,21 @@
   function save() {
     // cap transcript size to keep localStorage sane
     for (const sid of state.order) { const m = state.sessions[sid].messages; if (m.length > 200) state.sessions[sid].messages = m.slice(-200); }
-    localStorage.setItem(LS_KEY, JSON.stringify(state));
+    // Persist defensively: a quota error (e.g. from oversized attachments) must
+    // never throw on the critical path (startTurn calls save() before opening the
+    // SSE stream — an uncaught throw here would kill the turn). On overflow, evict
+    // the oldest archived history and retry once, then give up silently.
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(state));
+    } catch (e) {
+      try {
+        if (state.history) {
+          const ids = Object.keys(state.history).sort((a,b)=>(state.history[a].closedAt||0)-(state.history[b].closedAt||0));
+          for (const old of ids.slice(0, Math.ceil(ids.length/2))) delete state.history[old];
+        }
+        localStorage.setItem(LS_KEY, JSON.stringify(state));
+      } catch (e2) { /* storage full — keep running from in-memory state */ }
+    }
   }
   function cur() { return state.sessions[state.active]; }
 
@@ -967,6 +981,30 @@
   const pendingQ = {};  // sid -> [{text, atts},...] messages waiting for the current turn to finish
   const pendingAtt = {}; // sid -> [{mime, data, dataUrl},...] images pasted into the composer
 
+  // Downscale an image dataURL to a small thumbnail (bounded longest edge, JPEG).
+  // Used so the *persisted* transcript never carries multi-MB base64 blobs — those
+  // blow the ~5MB localStorage quota and freeze/wedge the UI. The full-resolution
+  // data is kept in-memory (pendingAtt) for the actual upload to the server.
+  function downscaleImage(dataUrl, maxEdge = 512, quality = 0.7) {
+    return new Promise((resolve) => {
+      try {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
+            const w = Math.max(1, Math.round(img.width * scale));
+            const h = Math.max(1, Math.round(img.height * scale));
+            const c = document.createElement("canvas"); c.width = w; c.height = h;
+            c.getContext("2d").drawImage(img, 0, 0, w, h);
+            resolve(c.toDataURL("image/jpeg", quality));
+          } catch (e) { resolve(dataUrl); }
+        };
+        img.onerror = () => resolve(dataUrl);
+        img.src = dataUrl;
+      } catch (e) { resolve(dataUrl); }
+    });
+  }
+
   // paste an image into the composer -> stage it as an attachment thumbnail
   promptEl.addEventListener("paste", (e) => {
     const items = (e.clipboardData && e.clipboardData.items) || [];
@@ -976,9 +1014,14 @@
         const f = it.getAsFile(); if (!f) continue;
         grabbed = true;
         const rd = new FileReader();
-        rd.onload = () => {
+        rd.onload = async () => {
           const durl = String(rd.result); const b64 = durl.split(",")[1] || "";
-          (pendingAtt[state.active] ||= []).push({ mime: f.type, data: b64, dataUrl: durl });
+          // full-res `data`/`dataUrl` stays in-memory for upload; `thumb` (small)
+          // is what ever gets persisted into the transcript.
+          const att = { mime: f.type, data: b64, dataUrl: durl, thumb: durl };
+          (pendingAtt[state.active] ||= []).push(att);
+          renderAtt();
+          att.thumb = await downscaleImage(durl);
           renderAtt();
         };
         rd.readAsDataURL(f);
@@ -992,7 +1035,7 @@
     const a = pendingAtt[state.active] || [];
     a.forEach((att, i) => {
       const d = document.createElement("div"); d.className = "att";
-      d.innerHTML = `<img src="${att.dataUrl}" alt="attachment"/><span class="x" title="Remove">×</span>`;
+      d.innerHTML = `<img src="${att.thumb || att.dataUrl}" alt="attachment"/><span class="x" title="Remove">×</span>`;
       d.querySelector(".x").onclick = () => { (pendingAtt[state.active]||[]).splice(i,1); renderAtt(); };
       box.appendChild(d);
     });
@@ -1031,7 +1074,12 @@
   async function startTurn(sid, text, atts) {
     const s = state.sessions[sid];
     const userMsg = { role:"user", text };
-    if (atts && atts.length) userMsg.atts = atts.map(a => a.dataUrl);  // thumbnails in transcript
+    if (atts && atts.length) {
+      // Ensure only downscaled thumbnails reach the persisted transcript, even if
+      // the turn is fired before the paste-time downscale finished.
+      userMsg.atts = await Promise.all(atts.map(a =>
+        (a.thumb && a.thumb !== a.dataUrl) ? a.thumb : downscaleImage(a.dataUrl)));
+    }
     s.messages.push(userMsg);
     const bot = { role:"bot", text:"", tools:[], streaming:true };
     s.messages.push(bot);
