@@ -104,6 +104,8 @@ DEFAULT_CONFIG = {
     "hive_token": "",       # optional override; blank => ~/.hive/worker.token
     "default_model": "",
     "chat_fast": True,      # disable MCP servers in the chat lane for faster startup
+    "chat_idle_timeout": 900,  # legacy lane: reap a copilot -p turn after this many
+                               # seconds with zero output (wedged subprocess). 0 = off.
     "sf_org": "",           # Salesforce target org username/alias; blank => auto-resolve
     "sf_products": "ActiveRolesServer,PasswordManager",  # default R&D queues for the CR tab
 }
@@ -1475,18 +1477,31 @@ class LiveTurn:
             self.done = True
             self.cond.notify_all()
 
-    def read_from(self, idx: int):
+    def read_from(self, idx: int, idle_ping: float = 15.0):
         """Generator: yield buffered events from idx, blocking for new ones
-        until the turn is done. Never holds the lock while yielding."""
+        until the turn is done. Never holds the lock while yielding. When no
+        new event arrives within idle_ping seconds (and the turn isn't done),
+        yields a ("__ping__", None) sentinel so the relay can emit an SSE
+        keepalive — this surfaces a half-open connection to the browser as an
+        error instead of a silently-stuck stream."""
+        last = time.monotonic()
         while True:
             with self.cond:
                 while idx >= len(self.events) and not self.done:
                     self.cond.wait(timeout=0.5)
+                    if (time.monotonic() - last >= idle_ping
+                            and idx >= len(self.events) and not self.done):
+                        break
                 batch = self.events[idx:]
                 idx = len(self.events)
                 done = self.done
-            for ev in batch:
-                yield ev
+            if batch:
+                last = time.monotonic()
+                for ev in batch:
+                    yield ev
+            elif not done:
+                last = time.monotonic()
+                yield ("__ping__", None)
             if done and not batch:
                 return
 
@@ -1517,7 +1532,16 @@ def _run_acp_turn(session, model, prompt, images, lt: LiveTurn,
 def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
     """Legacy lane (chat_fast OFF => full MCP): spawn `copilot -p ...` per turn,
     parse its JSONL, buffer events. Survives browser close because it runs in the
-    turn worker thread, not the HTTP request."""
+    turn worker thread, not the HTTP request.
+
+    Two robustness guards keep a turn from wedging the whole session forever:
+      * a concurrent stderr drainer — a chatty copilot (MCP logs/warnings) can
+        otherwise fill the 64 KB stderr pipe, block the child on write(), and
+        stall stdout indefinitely (the process sits in Sl and the UI shows
+        "working" with nothing ever completing);
+      * an idle-timeout reaper — if no stdout arrives for chat_idle_timeout
+        seconds the subprocess is killed and the turn is closed, so the browser
+        stops waiting and queued messages can drain."""
     emit = lt.append
     argv = _build_argv(prompt, session, model, copilot_id=copilot_id)
     try:
@@ -1529,8 +1553,47 @@ def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
         return
     lt.canceller = proc.kill
     try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
+        idle_timeout = float(load_config().get("chat_idle_timeout", 900) or 0)
+    except (TypeError, ValueError):
+        idle_timeout = 900.0
+
+    # Drain stderr concurrently so a full pipe can never deadlock the child.
+    err_tail: list[str] = []
+    def _drain_err():
+        try:
+            assert proc.stderr is not None
+            for chunk in iter(lambda: proc.stderr.read(4096), ""):
+                err_tail.append(chunk)
+                if len(err_tail) > 8:
+                    del err_tail[0]
+        except Exception:
+            pass
+    threading.Thread(target=_drain_err, name=f"cerr-{session}", daemon=True).start()
+
+    # Pump stdout lines into a queue so the consumer can apply an idle timeout
+    # (a blocking `for line in proc.stdout` gives us no way to notice a wedge).
+    lines: queue.Queue = queue.Queue()
+    def _pump():
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                lines.put(line)
+        except Exception:
+            pass
+        finally:
+            lines.put(None)  # EOF sentinel
+    threading.Thread(target=_pump, name=f"cout-{session}", daemon=True).start()
+
+    timed_out = False
+    try:
+        while True:
+            try:
+                line = lines.get(timeout=idle_timeout if idle_timeout > 0 else None)
+            except queue.Empty:
+                timed_out = True
+                break
+            if line is None:
+                break  # EOF: process finished
             line = line.strip()
             if not line:
                 continue
@@ -1555,14 +1618,26 @@ def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
                 emit("thinking", {})
             elif etype.startswith("mcp.") or "tool" in etype:
                 emit("tool", {"type": etype})
-        proc.wait(timeout=5)
     except Exception as exc:
         emit("error", {"message": str(exc)})
     finally:
-        if proc.poll() is None:
-            proc.kill()
-        err = proc.stderr.read()[-400:] if proc.stderr else ""
-        emit("done", {"code": proc.returncode, "stderr": err.strip()})
+        if timed_out:
+            # Append a note without wiping any partial streamed text.
+            emit("delta", {"text": f"\n\n⚠️ _Turn reaped: no output for "
+                                   f"{int(idle_timeout)}s; the copilot subprocess "
+                                   f"was wedged and has been killed. Please retry._"})
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        err = ("".join(err_tail))[-400:].strip()
+        code = proc.returncode if proc.returncode is not None else -1
+        emit("done", {"code": code, "stderr": err, "reaped": timed_out})
 
 
 def _start_turn(session: str, model: str | None, prompt: str, images: list,
@@ -1575,10 +1650,19 @@ def _start_turn(session: str, model: str | None, prompt: str, images: list,
     chat_fast is off (images always force the ACP lane).
 
     copilot_id (optional) pins this session to a real on-disk copilot session id
-    revived from the History tab so the turn resumes that conversation."""
+    revived from the History tab so the turn resumes that conversation.
+
+    Concurrency guard: if a turn for this session is still running, we do NOT
+    spawn a second one — a duplicate `copilot -p` on the same --session-id can
+    deadlock or corrupt that session. We return the in-flight buffer so the new
+    request just relays it (the frontend already serialises via its busy flag;
+    this closes a race from a reload/resume edge case)."""
     turn_id = uuid.uuid4().hex
     lt = LiveTurn(turn_id)
     with _live_lock:
+        prev = _live_turns.get(session)
+        if prev is not None and not prev.done:
+            return prev
         _live_turns[session] = lt
     fast = bool(load_config().get("chat_fast", True)) or bool(images)
     lt.append("start", {"session": session, "acp": fast, "turn": turn_id})
@@ -1678,8 +1762,11 @@ class Handler(BaseHTTPRequestHandler):
         detached (tab closed) — we return quietly; the turn keeps running."""
         try:
             for event, data in lt.read_from(from_idx):
-                self.wfile.write(
-                    f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+                if event == "__ping__":
+                    self.wfile.write(b": ping\n\n")   # SSE comment: keepalive only
+                else:
+                    self.wfile.write(
+                        f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             return
