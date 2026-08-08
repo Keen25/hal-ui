@@ -83,6 +83,11 @@
   .body.md table.md thead th { background:var(--panel2); font-weight:700; }
   .body.md table.md tbody tr:nth-child(even) { background:rgba(255,255,255,.02); }
   .tools { font-size:12px; color:var(--tool); margin-top:6px; }
+  .tprog { font-size:11px; color:var(--tool); margin-top:3px; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; max-width:340px; }
+  .tprog .dim { color:var(--muted); }
+  .terr { font-size:11px; color:var(--bad); margin-top:3px; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; max-width:340px; }
   .status { align-self:center; color:var(--muted); font-size:12px; font-style:italic; }
   .copybtn { position:absolute; top:8px; right:8px; padding:2px 8px; font-size:11px; font-weight:600;
     background:var(--panel2); color:var(--muted); border:1px solid var(--line); border-radius:7px; cursor:pointer;
@@ -1235,6 +1240,33 @@
       renderTasks();
     }catch(e){ $("#hive-cards").innerHTML=`<div class="msgbox err">fetch failed: ${esc(e.message)}</div>`; }
   }
+  function fmtElapsed(s){ if(s==null) return ""; s=+s; if(isNaN(s)) return "";
+    if(s<60) return s+"s"; const m=Math.floor(s/60), r=s%60; return m+"m"+(r?(" "+r+"s"):""); }
+  // Live in-flight progress line for a claimed/running task, built from the worker
+  // heartbeat snapshot (last tool call, turn depth, elapsed) — mirrors the hive
+  // dashboard so a busy worker's row isn't a blank box until the task completes.
+  function hiveProgressHTML(t){
+    const p=t.progress; if(!p||!ACTIVE.has(t.status)) return "";
+    let head;
+    if(p.last_tool){ const tl=p.last_tool;
+      const det=(tl.detail||"").replace(/\s+/g," ").trim().slice(0,200);
+      head="🔧 "+esc(tl.tool||"?")+(det?": "+esc(det):""); }
+    else if(p.last_msg){ head="💬 "+esc(String(p.last_msg).replace(/\s+/g," ").trim().slice(0,200)); }
+    else { head=(p.phase==="finishing"?"finishing…":"working…"); }
+    const bits=[]; if(p.turn!=null && +p.turn>0) bits.push("turn "+esc(p.turn));
+    const dur=fmtElapsed(p.elapsed_s); if(dur) bits.push(dur);
+    if(p.phase==="finishing") bits.push("finishing");
+    const tail=bits.length?` <span class="dim">(${esc(bits.join(" · "))})</span>`:"";
+    const tip=String((p.last_tool&&(p.last_tool.detail||p.last_tool.tool))||p.last_msg||"").slice(0,400);
+    return `<div class="tprog" title="${esc(tip)}">${head}${tail}</div>`;
+  }
+  // Terminal/diagnostic note (also used by the hive for non-error notes like
+  // "no changes produced" or "PROMOTED to ADO PR #…") — shown in red to match.
+  function hiveErrHTML(t){
+    if(!t.error) return "";
+    const s=String(t.error).replace(/\s+/g," ").trim();
+    return `<div class="terr" title="${esc(String(t.error).slice(0,400))}">${esc(s.slice(0,200))}</div>`;
+  }
   function renderTasks(){
     if(!hiveData) return; nComputeUnread("hive"); const f=($("#q-filter").value||"").toLowerCase(); const sf=$("#q-status").value;
     let tasks=(hiveData.tasks||[]).slice();
@@ -1248,7 +1280,7 @@
     $("#q-count").textContent=`(${tasks.length})`;
     $("#tasks tbody").innerHTML=tasks.slice(0,200).map(t=>{ const nk="hive:"+t.id; return `<tr class="click" data-id="${esc(t.id)}" data-nk="${esc(nk)}" data-nv="${esc(nVer(t.status))}">
       <td>${nDot("hive",nk)}${esc(t.id)}</td><td class="title" title="${esc(t.title)}">${esc(t.title||"")}</td>
-      <td><span class="pill s-${esc(t.status)}">${esc(t.status)}</span></td>
+      <td><span class="pill s-${esc(t.status)}">${esc(t.status)}</span>${hiveProgressHTML(t)}${hiveErrHTML(t)}</td>
       <td>${esc(t.kind||"")}</td><td>${esc(t.priority)}</td><td>${esc(t.worker_id||t.worker||"—")}</td>
       <td class="muted">${esc(t.model||"")}</td><td class="muted">${esc(t.created_at||"")}</td>
     </tr>`; }).join("")||`<tr><td colspan="8" class="muted">no matching tasks</td></tr>`;
