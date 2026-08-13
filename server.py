@@ -1748,10 +1748,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = target.read_bytes()
         ctype = {".html": "text/html; charset=utf-8", ".js": "text/javascript",
-                 ".css": "text/css"}.get(target.suffix, "application/octet-stream")
+                 ".css": "text/css", ".json": "application/json",
+                 ".webmanifest": "application/manifest+json",
+                 ".png": "image/png", ".svg": "image/svg+xml",
+                 ".ico": "image/x-icon", ".map": "application/json",
+                 ".woff2": "font/woff2"}.get(target.suffix, "application/octet-stream")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # The service worker must control the root scope; let it be served from /.
+        if target.name == "sw.js":
+            self.send_header("Service-Worker-Allowed", "/")
+            self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
