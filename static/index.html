@@ -266,6 +266,22 @@
   th.sortable { cursor:pointer; user-select:none; white-space:nowrap; }
   th.sortable:hover { color:var(--txt); }
   th.sortable .arr { color:var(--accent); font-size:10px; margin-left:2px; }
+  /* gist inline preview */
+  #gists tr.grow-row { cursor:pointer; }
+  #gists tr.grow-row:hover td { background:rgba(255,255,255,.03); }
+  #gists td.caret { width:18px; color:var(--muted); user-select:none; text-align:center; }
+  #gists tr.grow-row.open td.caret { color:var(--accent); }
+  tr.gist-detail > td { background:var(--panel2); padding:0; }
+  .gist-files { padding:6px 10px 10px 28px; }
+  .gist-file { margin-top:8px; }
+  .gist-file .fh { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted);
+    padding:4px 0; border-bottom:1px solid var(--line); }
+  .gist-file .fh b { color:var(--txt); font-weight:600; }
+  .gist-file pre { margin:6px 0 0; max-height:340px; overflow:auto; background:var(--bg);
+    border:1px solid var(--line); border-radius:8px; padding:10px;
+    font:12px/1.5 ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace; white-space:pre;
+    color:var(--txt); }
+  .gist-file .hit { background:rgba(255,106,69,.25); border-radius:2px; }
 </style>
 </head>
 <body>
@@ -384,12 +400,13 @@
     <div class="scroll">
       <div class="toolbar"><strong>My Gists</strong><span class="muted" id="gist-updated">—</span>
         <span class="grow"></span>
+        <input id="gist-q" class="mini" placeholder="Search description / filename…" autocomplete="off" style="min-width:220px" />
         <span class="muted mini-l">visibility</span>
         <select id="gist-vis" class="mini"><option value="">all</option>
           <option value="secret">secret</option><option value="public">public</option></select>
         <button class="ghost" id="gist-refresh" type="button">Refresh</button></div>
       <div id="gist-err"></div>
-      <table id="gists"><thead><tr><th>Vis</th><th>Description</th><th>Files</th>
+      <table id="gists"><thead><tr><th></th><th>Vis</th><th>Description</th><th>Files</th>
         <th class="sortable" id="gist-sort">Updated <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
     </div>
   </section>
@@ -1591,7 +1608,19 @@
 
   /* ================= GISTS ================= */
   const gistData={gists:[],err:""};
-  let gistSort=-1;
+  let gistSort=-1, gistQuery="";
+  const gistDetails={};       // id -> {files:[...]} once fetched
+  const gistOpen=new Set();   // ids currently expanded
+  function gistMatch(g,q){
+    if(!q) return true;
+    const hay=((g.description||"")+" "+(g.files||[]).join(" ")).toLowerCase();
+    if(hay.indexOf(q)>=0) return true;
+    // if we've already fetched this gist's contents, search inside them too
+    const d=gistDetails[g.id];
+    if(d&&!d.error&&Array.isArray(d.files))
+      return d.files.some(f=>(f.content||"").toLowerCase().indexOf(q)>=0);
+    return false;
+  }
   function gistRow(g){
     const nk="gist:"+g.id;
     const vis=g.public?"public":"secret";
@@ -1599,22 +1628,59 @@
     const label=g.description||first;
     const nfiles=(g.files||[]).length;
     const filesTxt=nfiles<=1?esc(first):`${esc(first)} <span class="muted">+${nfiles-1}</span>`;
+    const open=gistOpen.has(g.id);
     const ctx={ banner:`GitHub gist ${g.id} — ${label}`, url:g.url,
       preamble:`We'll be discussing this GitHub gist; keep it in context for our whole conversation:\n${vis} gist "${label}"\nFiles: ${(g.files||[]).join(", ")}\n${g.url}\n\n` };
-    return `<tr data-nk="${esc(nk)}" data-nv="${esc(nVer(g.updatedAt))}">
-      <td>${nDot("gists",nk)}<span class="pill ${g.public?'r-author':'r-reviewer'}">${vis}</span></td>
-      <td class="title" title="${esc(g.description||'')}"><a href="${esc(g.url)}" target="_blank">${esc(label)}</a></td>
+    let html=`<tr class="grow-row${open?' open':''}" data-gid="${esc(g.id)}" data-nk="${esc(nk)}" data-nv="${esc(nVer(g.updatedAt))}">
+      <td class="caret">${open?'▾':'▸'}</td>
+      <td><span class="pill ${g.public?'r-author':'r-reviewer'}">${vis}</span>${nDot("gists",nk)}</td>
+      <td class="title" title="${esc(g.description||'')}"><a href="${esc(g.url)}" target="_blank" onclick="event.stopPropagation()">${esc(label)}</a></td>
       <td class="muted" title="${esc((g.files||[]).join(', '))}">${filesTxt}</td>
       <td class="muted">${esc(ago(g.updatedAt))}</td>${chatCell(first, ctx)}</tr>`;
+    if(open) html+=`<tr class="gist-detail" data-detail="${esc(g.id)}"><td colspan="6">${gistDetailHtml(g.id)}</td></tr>`;
+    return html;
+  }
+  function gistDetailHtml(id){
+    const d=gistDetails[id];
+    if(!d) return `<div class="gist-files muted">loading…</div>`;
+    if(d.error) return `<div class="gist-files msgbox err">${esc(d.error)}</div>`;
+    const q=gistQuery;
+    const files=(d.files||[]).map(f=>{
+      const meta=[f.language,(f.size||0)+" B"].filter(Boolean).join(" · ");
+      return `<div class="gist-file"><div class="fh"><b>${esc(f.name)}</b><span>${esc(meta)}</span></div>
+        <pre>${hi(f.content||"",q)}</pre></div>`;
+    }).join("");
+    return `<div class="gist-files">${files||'<span class="muted">no files</span>'}</div>`;
+  }
+  // escape + highlight case-insensitive matches of q
+  function hi(text,q){
+    const e=esc(text);
+    if(!q) return e;
+    try{
+      const rx=new RegExp("("+q.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+")","ig");
+      return e.replace(rx,'<span class="hit">$1</span>');
+    }catch(_){ return e; }
+  }
+  async function gistToggle(id){
+    if(gistOpen.has(id)){ gistOpen.delete(id); renderGists(); return; }
+    gistOpen.add(id); renderGists();
+    if(!gistDetails[id]){
+      try{
+        const r=await fetch("/api/github/gist?id="+encodeURIComponent(id));
+        gistDetails[id]=await r.json();
+      }catch(e){ gistDetails[id]={error:e.message}; }
+      if(gistOpen.has(id)) renderGists();
+    }
   }
   function renderGists(){
     nComputeUnread("gists");
     const vis=$("#gist-vis").value;
     const rows=gistData.gists
       .filter(g=>!vis||(vis==="public"?g.public:!g.public))
+      .filter(g=>gistMatch(g,gistQuery))
       .slice().sort(byDate("updatedAt",gistSort,"createdAt"));
     $("#gists tbody").innerHTML=rows.map(gistRow).join("")
-      ||`<tr><td colspan="5" class="muted">${gistData.err?esc(gistData.err):'none'}</td></tr>`;
+      ||`<tr><td colspan="6" class="muted">${gistData.err?esc(gistData.err):(gistQuery?'no matches':'none')}</td></tr>`;
     setArr("#gist-sort",gistSort);
     nSetBadge("gists",nUnread.gists.size);
   }
@@ -1626,11 +1692,18 @@
       if(d.gists&&d.gists.error){ gistData.gists=[]; gistData.err=d.gists.error; }
       else { gistData.gists=Array.isArray(d.gists)?d.gists:[]; gistData.err=""; }
       renderGists();
-    }catch(e){ $("#gists tbody").innerHTML=`<tr><td colspan="5" class="msgbox err">${esc(e.message)}</td></tr>`; }
+    }catch(e){ $("#gists tbody").innerHTML=`<tr><td colspan="6" class="msgbox err">${esc(e.message)}</td></tr>`; }
   }
   $("#gist-refresh").addEventListener("click",loadGists);
   $("#gist-vis").addEventListener("change",renderGists);
   $("#gist-sort").addEventListener("click",()=>{ gistSort=-gistSort; renderGists(); });
+  $("#gist-q").addEventListener("input",()=>{ gistQuery=$("#gist-q").value.trim().toLowerCase(); renderGists(); });
+  // expand/collapse a gist row (ignore clicks on links or the chat cell)
+  $("#gists").addEventListener("click",(e)=>{
+    if(e.target.closest("a,.tochat")) return;
+    const tr=e.target.closest("tr.grow-row"); if(!tr) return;
+    gistToggle(tr.dataset.gid);
+  });
 
   /* ================= ADO ================= */
   const adoData={prs:[],workitems:[]};

@@ -308,6 +308,52 @@ def _github_gists():
     return {"gists": gists}
 
 
+def _github_gist_detail(gid: str):
+    """Return one gist's files with contents for inline preview.
+
+    `gh api /gists/<id>` embeds file `content` inline (GitHub truncates very
+    large files and instead exposes a `raw_url`; we fetch that so preview is
+    complete). Errors surface as {"error": ...}.
+    """
+    if not gid or not re.fullmatch(r"[0-9a-zA-Z]+", gid):
+        return {"error": "bad gist id"}
+    raw = _gh_json(["api", f"/gists/{gid}"])
+    if isinstance(raw, dict) and raw.get("error"):
+        return raw
+    files = []
+    for name, f in (raw.get("files") or {}).items():
+        content = f.get("content") or ""
+        if f.get("truncated") and f.get("raw_url"):
+            fetched = _gh_json(["api", f.get("raw_url")])
+            # raw_url returns text, not JSON; _gh_json yields {"error":...} on
+            # a decode failure but the stdout is the file — grab it directly.
+            content = _gh_raw(f.get("raw_url")) if isinstance(fetched, dict) and fetched.get("error") else content
+        files.append({
+            "name": name,
+            "language": f.get("language") or "",
+            "size": f.get("size") or 0,
+            "type": f.get("type") or "",
+            "content": content,
+        })
+    return {
+        "id": raw.get("id"),
+        "description": (raw.get("description") or "").strip(),
+        "public": bool(raw.get("public")),
+        "url": raw.get("html_url"),
+        "files": files,
+    }
+
+
+def _gh_raw(path: str) -> str:
+    """Fetch a gh api path expecting a raw (non-JSON) text body."""
+    try:
+        out = subprocess.run([GH_BIN, "api", path], capture_output=True,
+                             text=True, timeout=25)
+        return out.stdout if out.returncode == 0 else ""
+    except Exception:  # pragma: no cover
+        return ""
+
+
 # ---------------- Azure DevOps -----------------------------------------
 _az_token: dict = {"tok": "", "exp": 0.0}
 _az_lock = threading.Lock()
@@ -1933,6 +1979,14 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/api/github/gists":
             self._json(200, cached("gists", 30.0, _github_gists,
                                    keep=lambda v: not (isinstance(v.get("gists"), dict))))
+        elif p.path == "/api/github/gist":
+            gid = (parse_qs(p.query).get("id", [""])[0] or "").strip()
+            if not gid:
+                self._json(400, {"error": "id is required"})
+            else:
+                self._json(200, cached("gist:" + gid, 60.0,
+                                       lambda: _github_gist_detail(gid),
+                                       keep=lambda v: "error" not in v))
         elif p.path == "/api/ado/mywork":
             self._json(200, cached("ado_mywork", 30.0, _ado_mywork,
                                    keep=lambda v: "error" not in v))
