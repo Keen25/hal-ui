@@ -287,6 +287,27 @@ def _github_mywork():
     return {"prs": prs, "issues": issues}
 
 
+def _github_gists():
+    # `gh api` paginates newest-first; 50 is plenty for a control-plane list.
+    raw = _gh_json(["api", "/gists?per_page=50"])
+    if isinstance(raw, dict) and raw.get("error"):
+        return {"gists": raw}
+    gists = []
+    for g in raw or []:
+        files = list((g.get("files") or {}).keys())
+        gists.append({
+            "id": g.get("id"),
+            "description": (g.get("description") or "").strip(),
+            "public": bool(g.get("public")),
+            "url": g.get("html_url"),
+            "files": files,
+            "comments": g.get("comments") or 0,
+            "createdAt": g.get("created_at"),
+            "updatedAt": g.get("updated_at"),
+        })
+    return {"gists": gists}
+
+
 # ---------------- Azure DevOps -----------------------------------------
 _az_token: dict = {"tok": "", "exp": 0.0}
 _az_lock = threading.Lock()
@@ -1909,6 +1930,9 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/api/github/mywork":
             self._json(200, cached("mywork", 30.0, _github_mywork,
                                    keep=lambda v: "error" not in v))
+        elif p.path == "/api/github/gists":
+            self._json(200, cached("gists", 30.0, _github_gists,
+                                   keep=lambda v: not (isinstance(v.get("gists"), dict))))
         elif p.path == "/api/ado/mywork":
             self._json(200, cached("ado_mywork", 30.0, _ado_mywork,
                                    keep=lambda v: "error" not in v))

@@ -279,6 +279,7 @@
     <div class="tab active" data-view="chat">Chat</div>
     <div class="tab" data-view="hive">Hive<span class="nbadge"></span></div>
     <div class="tab" data-view="github">GitHub<span class="nbadge"></span></div>
+    <div class="tab" data-view="gists">Gists<span class="nbadge"></span></div>
     <div class="tab" data-view="ado">ADO<span class="nbadge"></span></div>
     <div class="tab" data-view="sf">CRs<span class="nbadge"></span></div>
     <div class="tab" data-view="history">History</div>
@@ -375,6 +376,21 @@
         <select id="ghiss-repo" class="mini"><option value="">all</option></select></div>
       <table id="issues"><thead><tr><th>Repo</th><th>#</th><th>Title</th>
         <th class="sortable" id="ghiss-sort">Updated <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- GISTS -->
+  <section class="view" id="view-gists">
+    <div class="scroll">
+      <div class="toolbar"><strong>My Gists</strong><span class="muted" id="gist-updated">—</span>
+        <span class="grow"></span>
+        <span class="muted mini-l">visibility</span>
+        <select id="gist-vis" class="mini"><option value="">all</option>
+          <option value="secret">secret</option><option value="public">public</option></select>
+        <button class="ghost" id="gist-refresh" type="button">Refresh</button></div>
+      <div id="gist-err"></div>
+      <table id="gists"><thead><tr><th>Vis</th><th>Description</th><th>Files</th>
+        <th class="sortable" id="gist-sort">Updated <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
     </div>
   </section>
 
@@ -1192,6 +1208,7 @@
     t.classList.add("active"); $("#view-" + t.dataset.view).classList.add("active");
     if (t.dataset.view === "hive") loadHive();
     if (t.dataset.view === "github") loadGithub();
+    if (t.dataset.view === "gists") loadGists();
     if (t.dataset.view === "ado") loadAdo();
     if (t.dataset.view === "sf") loadSf();
     if (t.dataset.view === "history") loadHistory();
@@ -1433,7 +1450,7 @@
   let notifSeen=(()=>{ try{ return JSON.parse(localStorage.getItem(NOTIF_SEEN_KEY))||{}; }catch(e){ return {}; } })();
   let notifInit=(()=>{ try{ return JSON.parse(localStorage.getItem(NOTIF_INIT_KEY))||{}; }catch(e){ return {}; } })();
   const nUnread={github:new Set(),ado:new Set(),sf:new Set(),hive:new Set()};
-  const NOTIF_VIEWS=["github","ado","sf","hive"];
+  const NOTIF_VIEWS=["github","gists","ado","sf","hive"];
   function nVer(v){ return String(v==null?"":v); }
   function notifSave(){ try{ localStorage.setItem(NOTIF_SEEN_KEY,JSON.stringify(notifSeen)); localStorage.setItem(NOTIF_INIT_KEY,JSON.stringify(notifInit)); }catch(e){} }
   // {key,ver} list for a view, built from the data the view already fetched.
@@ -1441,6 +1458,7 @@
     if(view==="github") return [
       ...ghData.prs.map(p=>({key:"gh:pr:"+ghRepoOf(p)+"#"+p.number, ver:p.updatedAt})),
       ...ghData.issues.map(i=>({key:"gh:iss:"+ghRepoOf(i)+"#"+i.number, ver:i.updatedAt}))];
+    if(view==="gists") return gistData.gists.map(g=>({key:"gist:"+g.id, ver:g.updatedAt}));
     if(view==="ado") return [
       ...adoData.prs.map(p=>({key:"ado:pr:"+p.id, ver:p.updated||p.created})),
       ...adoData.workitems.map(w=>({key:"ado:wi:"+w.id, ver:w.changed}))];
@@ -1480,7 +1498,7 @@
     notifInit[view]=true; if(ch) notifSave();
     nUnread[view]=new Set(); nSetBadge(view,0);
   }
-  function nViewOfKey(k){ return k.indexOf("gh:")===0?"github":k.indexOf("ado:")===0?"ado":k.indexOf("sf:")===0?"sf":k.indexOf("hive:")===0?"hive":null; }
+  function nViewOfKey(k){ return k.indexOf("gist:")===0?"gists":k.indexOf("gh:")===0?"github":k.indexOf("ado:")===0?"ado":k.indexOf("sf:")===0?"sf":k.indexOf("hive:")===0?"hive":null; }
   // Acknowledge a single item (called when you click its row).
   function nAckOne(key,ver){
     if(!key) return; const v=nVer(ver); if(notifSeen[key]===v) return;
@@ -1501,6 +1519,7 @@
   async function nPoll(){
     const jobs=[];
     if(typeof loadGithub==="function") jobs.push(loadGithub());
+    if(typeof loadGists==="function") jobs.push(loadGists());
     if(typeof loadAdo==="function") jobs.push(loadAdo());
     if(!document.body.classList.contains("sf-off") && typeof loadSf==="function") jobs.push(loadSf());
     if(!document.body.classList.contains("hive-off") && typeof loadHive==="function") jobs.push(loadHive());
@@ -1569,6 +1588,49 @@
   $("#ghiss-repo").addEventListener("change",renderGithub);
   $("#ghpr-sort").addEventListener("click",()=>{ ghSort.pr=-ghSort.pr; renderGithub(); });
   $("#ghiss-sort").addEventListener("click",()=>{ ghSort.iss=-ghSort.iss; renderGithub(); });
+
+  /* ================= GISTS ================= */
+  const gistData={gists:[],err:""};
+  let gistSort=-1;
+  function gistRow(g){
+    const nk="gist:"+g.id;
+    const vis=g.public?"public":"secret";
+    const first=(g.files&&g.files[0])||"(no files)";
+    const label=g.description||first;
+    const nfiles=(g.files||[]).length;
+    const filesTxt=nfiles<=1?esc(first):`${esc(first)} <span class="muted">+${nfiles-1}</span>`;
+    const ctx={ banner:`GitHub gist ${g.id} — ${label}`, url:g.url,
+      preamble:`We'll be discussing this GitHub gist; keep it in context for our whole conversation:\n${vis} gist "${label}"\nFiles: ${(g.files||[]).join(", ")}\n${g.url}\n\n` };
+    return `<tr data-nk="${esc(nk)}" data-nv="${esc(nVer(g.updatedAt))}">
+      <td>${nDot("gists",nk)}<span class="pill ${g.public?'r-author':'r-reviewer'}">${vis}</span></td>
+      <td class="title" title="${esc(g.description||'')}"><a href="${esc(g.url)}" target="_blank">${esc(label)}</a></td>
+      <td class="muted" title="${esc((g.files||[]).join(', '))}">${filesTxt}</td>
+      <td class="muted">${esc(ago(g.updatedAt))}</td>${chatCell(first, ctx)}</tr>`;
+  }
+  function renderGists(){
+    nComputeUnread("gists");
+    const vis=$("#gist-vis").value;
+    const rows=gistData.gists
+      .filter(g=>!vis||(vis==="public"?g.public:!g.public))
+      .slice().sort(byDate("updatedAt",gistSort,"createdAt"));
+    $("#gists tbody").innerHTML=rows.map(gistRow).join("")
+      ||`<tr><td colspan="5" class="muted">${gistData.err?esc(gistData.err):'none'}</td></tr>`;
+    setArr("#gist-sort",gistSort);
+    nSetBadge("gists",nUnread.gists.size);
+  }
+  async function loadGists(){
+    const err=$("#gist-err"); err.innerHTML="";
+    try{
+      const r=await fetch("/api/github/gists"); const d=await r.json();
+      $("#gist-updated").textContent="updated "+new Date().toLocaleTimeString();
+      if(d.gists&&d.gists.error){ gistData.gists=[]; gistData.err=d.gists.error; }
+      else { gistData.gists=Array.isArray(d.gists)?d.gists:[]; gistData.err=""; }
+      renderGists();
+    }catch(e){ $("#gists tbody").innerHTML=`<tr><td colspan="5" class="msgbox err">${esc(e.message)}</td></tr>`; }
+  }
+  $("#gist-refresh").addEventListener("click",loadGists);
+  $("#gist-vis").addEventListener("change",renderGists);
+  $("#gist-sort").addEventListener("click",()=>{ gistSort=-gistSort; renderGists(); });
 
   /* ================= ADO ================= */
   const adoData={prs:[],workitems:[]};
