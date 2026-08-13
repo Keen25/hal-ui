@@ -38,9 +38,75 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse, quote
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-COPILOT_BIN = shutil.which("copilot") or os.path.expanduser("~/.local/bin/copilot")
 GH_BIN = shutil.which("gh") or "/usr/bin/gh"
 AZ_BIN = shutil.which("az") or "/usr/bin/az"
+
+
+# --- Engine abstraction: which coding-agent CLI drives the chat lanes --------
+# hal-ui was born Copilot-only. Both Copilot and opencode expose the SAME ACP
+# (Zed Agent Client Protocol) over stdio, so the persistent chat lane (chat_fast
+# ON, the default) is engine-agnostic — only the launch argv differs
+# (`copilot --acp` vs `opencode acp`) and the JSON-RPC method vocabulary is
+# shared. The legacy per-turn lane (chat_fast OFF) parses Copilot's proprietary
+# `--output-format json` stream, so it stays Copilot-only; engines that don't set
+# ``legacy_lane`` are forced onto the ACP lane. Likewise session history
+# (ACP session/list + the on-disk ~/.copilot/session-state transcripts) is a
+# Copilot-only surface, gated by ``session_history``.
+def _resolve_bin(names: list[str], fallbacks: list[str]) -> str:
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    for f in fallbacks:
+        fp = os.path.expanduser(f)
+        if os.path.exists(fp):
+            return fp
+    return os.path.expanduser(fallbacks[0]) if fallbacks else names[0]
+
+
+ENGINES: dict[str, dict] = {
+    "copilot": {
+        "label": "GitHub Copilot CLI",
+        "bin": _resolve_bin(["copilot"], ["~/.local/bin/copilot"]),
+        "acp_argv": lambda b: [b, "--acp"],
+        # Legacy per-turn spawn (chat_fast OFF); parsed by _run_subprocess_turn.
+        "oneshot_argv": lambda b, prompt, sid, model: (
+            [b, "-p", prompt, "--output-format", "json", "--allow-all-tools",
+             "--session-id", sid] + (["--model", model] if model else [])),
+        "legacy_lane": True,       # supports the chat_fast-OFF subprocess lane
+        "session_history": True,   # supports ACP session/list + session-state
+    },
+    "opencode": {
+        "label": "opencode",
+        "bin": _resolve_bin(["opencode"],
+                            ["~/.opencode/bin/opencode", "~/.local/bin/opencode"]),
+        "acp_argv": lambda b: [b, "acp"],
+        # opencode's `run --format json` stream schema differs from Copilot's, so
+        # the legacy lane is disabled below and this argv is never taken today;
+        # kept for a future per-engine stream adapter.
+        "oneshot_argv": lambda b, prompt, sid, model: (
+            [b, "run", "--format", "json"]
+            + (["--model", model] if model else []) + [prompt]),
+        "legacy_lane": False,      # run-stream JSON schema differs -> ACP lane only
+        "session_history": False,  # no ACP session/list + no ~/.copilot state
+    },
+}
+
+
+def _engine() -> dict:
+    """The active engine descriptor (from config ``engine``; default copilot)."""
+    name = (load_config().get("engine") or "copilot").lower()
+    return ENGINES.get(name, ENGINES["copilot"])
+
+
+def _engine_bin() -> str:
+    return _engine()["bin"]
+
+
+def _acp_launch_argv() -> list[str]:
+    """argv that starts the active engine as an ACP agent over stdio."""
+    e = _engine()
+    return e["acp_argv"](e["bin"])
 def _resolve_sf() -> tuple[str, str]:
     """Locate the `sf` CLI and the bin dir that must be on PATH to run it.
 
@@ -103,6 +169,7 @@ DEFAULT_CONFIG = {
     "hive_url": HIVE_URL_DEFAULT,
     "hive_token": "",       # optional override; blank => ~/.hive/worker.token
     "default_model": "",
+    "engine": "copilot",    # coding-agent CLI backing the chat lanes: copilot | opencode
     "chat_fast": True,      # disable MCP servers in the chat lane for faster startup
     "chat_idle_timeout": 900,  # legacy lane: reap a copilot -p turn after this many
                                # seconds with zero output (wedged subprocess). 0 = off.
@@ -869,11 +936,8 @@ def _build_argv(prompt: str, session: str, model: str | None,
     resume THAT real copilot session id directly so the conversation continues
     with its full server-side context, instead of our uuid5-derived id."""
     sid = copilot_id or _copilot_session_id(session)
-    argv = [COPILOT_BIN, "-p", prompt, "--output-format", "json",
-            "--allow-all-tools", "--session-id", sid]
-    if model:
-        argv += ["--model", model]
-    return argv
+    e = _engine()
+    return e["oneshot_argv"](e["bin"], prompt, sid, model)
 
 
 # ======================================================================
@@ -903,7 +967,7 @@ class AcpProc:
         self._event_q: queue.Queue | None = None  # active turn's notification sink
         self._event_lock = threading.Lock()
         self.proc = subprocess.Popen(
-            [COPILOT_BIN, "--acp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            _acp_launch_argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1, cwd=os.path.expanduser("~"))
         threading.Thread(target=self._reader, daemon=True).start()
         self._boot(model, load_id, cwd)
@@ -1150,7 +1214,7 @@ def _list_models() -> dict:
     lists never go stale. Cached by the caller. On any failure returns
     {"error": ...} and the client keeps its built-in fallback list."""
     try:
-        p = subprocess.Popen([COPILOT_BIN, "--acp"], stdin=subprocess.PIPE,
+        p = subprocess.Popen(_acp_launch_argv(), stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              text=True, bufsize=1)
     except Exception as exc:
@@ -1199,9 +1263,23 @@ def _list_models() -> dict:
             out.append({"id": m.get("modelId", ""), "name": m.get("name", ""),
                         "usage": meta.get("copilotUsage", ""),
                         "price": meta.get("copilotPriceCategory", "")})
+        default = models.get("currentModelId", "")
+        if not out:
+            # opencode (and other ACP agents) advertise the model catalog via the
+            # session/new `configOptions` list — a select with id "model" — rather
+            # than Copilot's `models.availableModels`. Parse that shape as a
+            # fallback so the picker is populated for every engine.
+            for opt in res.get("configOptions", []) or []:
+                if opt.get("id") != "model" and opt.get("category") != "model":
+                    continue
+                default = opt.get("currentValue", "") or default
+                for o in opt.get("options", []) or []:
+                    out.append({"id": o.get("value", ""), "name": o.get("name", ""),
+                                "usage": "", "price": ""})
+                break
         if not out:
             return {"error": "no models returned"}
-        return {"models": out, "default": models.get("currentModelId", "")}
+        return {"models": out, "default": default}
     except Exception as exc:
         return {"error": str(exc)}
     finally:
@@ -1218,7 +1296,7 @@ def _acp_oneshot():
     until the response to request id `target` arrives, auto-answering any
     agent->client requests, and returns (result_obj, notifications) where
     notifications is the list of session/update payloads seen meanwhile."""
-    p = subprocess.Popen([COPILOT_BIN, "--acp"], stdin=subprocess.PIPE,
+    p = subprocess.Popen(_acp_launch_argv(), stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          text=True, bufsize=1)
     state = {"id": 0}
@@ -1264,6 +1342,8 @@ def _list_sessions(cap: int = 200) -> dict:
     Returns every session copilot knows about — console, other tools, and ones
     hal-ui created — newest first, so the History tab can surface them. Cached by
     the caller. On failure returns {"error": ...}."""
+    if not _engine().get("session_history", False):
+        return {"sessions": []}   # engine has no ACP session/list surface
     try:
         p, send, pump = _acp_oneshot()
     except Exception as exc:
@@ -1664,7 +1744,11 @@ def _start_turn(session: str, model: str | None, prompt: str, images: list,
         if prev is not None and not prev.done:
             return prev
         _live_turns[session] = lt
-    fast = bool(load_config().get("chat_fast", True)) or bool(images)
+    # Engines without a legacy per-turn parser (e.g. opencode) always take the
+    # ACP lane — their `run` stream schema isn't the Copilot JSONL that
+    # _run_subprocess_turn expects.
+    fast = (bool(load_config().get("chat_fast", True)) or bool(images)
+            or not _engine().get("legacy_lane", True))
     lt.append("start", {"session": session, "acp": fast, "turn": turn_id})
 
     def worker():
@@ -1947,12 +2031,13 @@ def main():
     ap.add_argument("--port", type=int, default=8900)
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
-    if not Path(COPILOT_BIN).exists():
-        raise SystemExit(f"copilot binary not found at {COPILOT_BIN}")
+    eng = _engine()
+    if not Path(eng["bin"]).exists():
+        raise SystemExit(f"{eng['label']} binary not found at {eng['bin']}")
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     tok = "ok" if _hive_token() else "MISSING"
     print(f"HAL-UI Phase 2 on http://{args.host}:{args.port}/  "
-          f"(copilot={COPILOT_BIN}, hive={_hive_url()} token={tok})")
+          f"(engine={eng['label']} bin={eng['bin']}, hive={_hive_url()} token={tok})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

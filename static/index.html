@@ -448,6 +448,9 @@
         <input id="s-hive_token" type="password" placeholder="blank = ~/.hive/worker.token (leave blank to keep)" />
         <label class="muted">Default model</label>
         <select id="s-default_model"><option value="">default</option><option value="claude-sonnet-4.5">sonnet-4.5</option><option value="gpt-5.4">gpt-5.4</option></select>
+        <label class="muted">Engine</label>
+        <select id="s-engine"><option value="copilot">GitHub Copilot CLI</option><option value="opencode">opencode</option></select>
+        <span class="muted" style="font-size:11px">Coding-agent CLI backing chat. opencode uses the shared ACP lane (fast chat only); Copilot supports both lanes and session history.</span>
         <label class="muted">Fast chat</label>
         <label class="row2" style="gap:8px;cursor:pointer"><input id="s-chat_fast" type="checkbox" style="width:auto" /> <span class="muted">Disable MCP servers in chat for faster startup (~5-7s/msg). Turn off if you need MCP tools mid-chat.</span></label>
         <div class="row2"><span class="grow"></span><button type="submit">Save settings</button></div>
@@ -1771,6 +1774,7 @@
       $("#s-ado_upn").value=c.ado_upn||"";
       $("#s-hive_url").value=c.hive_url||"";
       $("#s-default_model").value=c.default_model||"";
+      $("#s-engine").value=c.engine||"copilot";
       $("#s-chat_fast").checked=c.chat_fast!==false;
       $("#s-ado_pat").placeholder=c.ado_pat_set?"•••• set (leave blank to keep)":"blank = use az login";
       $("#s-hive_token").placeholder=c.hive_token_set?"•••• set (leave blank to keep)":"blank = ~/.hive/worker.token";
@@ -1819,6 +1823,7 @@
     e.preventDefault(); const m=$("#set-msg"); m.className=""; m.textContent="";
     const payload={ ado_org:$("#s-ado_org").value.trim(), ado_upn:$("#s-ado_upn").value.trim(),
       hive_url:$("#s-hive_url").value.trim(), default_model:$("#s-default_model").value,
+      engine:$("#s-engine").value,
       chat_fast:$("#s-chat_fast").checked,
       ado_pat:$("#s-ado_pat").value, hive_token:$("#s-hive_token").value };
     try{

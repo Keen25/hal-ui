@@ -44,6 +44,12 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   in-flight turn instantly; queued messages are cleared.
 - **Fast chat toggle** — `chat_fast` ON = ACP persistent lane (fast, no MCP);
   OFF = legacy per-turn spawn with full MCP servers available mid-chat.
+- **Pluggable engine** — the `engine` setting picks which coding-agent CLI backs
+  chat: `copilot` (default) or `opencode`. Both speak the **same ACP** (Zed Agent
+  Client Protocol) over stdio, so the fast lane is engine-agnostic — only the
+  launch argv differs (`copilot --acp` vs `opencode acp`). The legacy per-turn
+  lane and session-history tab parse Copilot's proprietary JSON, so they stay
+  Copilot-only; selecting opencode transparently forces the ACP fast lane.
 - **Hive drawer auto-poll** — an open task drawer refreshes progress + log tail
   every 4s while the task is non-terminal, then stops.
 
@@ -62,12 +68,16 @@ server.py (Python stdlib http.server, threaded)
 
 ### Backend — `server.py`
 - Python 3 **stdlib only**: `http.server.ThreadingHTTPServer`, thread-per-request.
-- Chat, fast lane (`chat_fast` on): persistent `copilot --acp` process per session
-  (JSON-RPC over stdio — `initialize` → `session/new` → `session/prompt`, streamed
-  `session/update` → SSE). `session/cancel` powers Stop; permission requests
-  auto-answered `allow_once`.
-- Chat, legacy lane (`chat_fast` off): per-turn `copilot -p … --output-format json`
-  spawn with full MCP servers.
+- **Engine abstraction** (`ENGINES` registry): each entry maps a CLI to its ACP
+  launch argv, legacy oneshot argv, and capability flags (`legacy_lane`,
+  `session_history`). Copilot and opencode are the built-ins; adding another ACP
+  agent is one registry entry.
+- Chat, fast lane (`chat_fast` on): persistent ACP process per session
+  (`<engine> acp` — JSON-RPC over stdio: `initialize` → `session/new` →
+  `session/prompt`, streamed `session/update` → SSE). `session/cancel` powers
+  Stop; permission requests auto-answered `allow_once`.
+- Chat, legacy lane (`chat_fast` off, Copilot only): per-turn
+  `copilot -p … --output-format json` spawn with full MCP servers.
 - Data: `gh` CLI (TTL-cached), `az account get-access-token` → ADO REST, Hive REST.
 - Config: `~/.config/hal-ui/config.json` (0600); secrets masked on read, preserved
   if POSTed blank.
