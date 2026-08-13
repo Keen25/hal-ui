@@ -52,16 +52,32 @@ AZ_BIN = shutil.which("az") or "/usr/bin/az"
 # ``legacy_lane`` are forced onto the ACP lane. Likewise session history
 # (ACP session/list + the on-disk ~/.copilot/session-state transcripts) is a
 # Copilot-only surface, gated by ``session_history``.
-def _resolve_bin(names: list[str], fallbacks: list[str]) -> str:
+def _resolve_bin(names: list[str], fallbacks: list[str]) -> str | None:
+    """Resolve a runnable binary from PATH names then explicit fallbacks.
+
+    Returns the resolved path, or None if nothing runnable was found — callers
+    that need a definite string for display fall back themselves. Resolution is
+    intentionally re-runnable (not cached) so a binary installed *after* the
+    server started is picked up on the next call instead of staying rejected
+    until a restart."""
     for n in names:
         p = shutil.which(n)
         if p:
             return p
     for f in fallbacks:
         fp = os.path.expanduser(f)
-        if os.path.exists(fp):
+        if os.path.isfile(fp) and os.access(fp, os.X_OK):
             return fp
-    return os.path.expanduser(fallbacks[0]) if fallbacks else names[0]
+    return None
+
+
+def _engine_bin(name: str) -> str:
+    """Live-resolved path to an engine's binary (re-runs _resolve_bin every
+    call so a freshly installed CLI is found without a restart). Falls back to
+    the first configured name if nothing is runnable yet, so argv construction
+    still yields a string (the launch then fails cleanly with a clear error)."""
+    e = ENGINES[name]
+    return _resolve_bin(e["bin_names"], e["bin_fallbacks"]) or e["bin_names"][0]
 
 
 def _parse_models_copilot(res: dict) -> dict:
@@ -103,7 +119,10 @@ ENGINES: dict[str, dict] = {
     "copilot": {
         "name": "copilot",
         "label": "GitHub Copilot CLI",
-        "bin": _resolve_bin(["copilot"], ["~/.local/bin/copilot"]),
+        # Command names (PATH) + explicit fallbacks, resolved live via
+        # _engine_bin so a post-startup install is picked up without a restart.
+        "bin_names": ["copilot"],
+        "bin_fallbacks": ["~/.local/bin/copilot"],
         "acp_argv": lambda b: [b, "--acp"],
         # Legacy per-turn spawn (chat_fast OFF); parsed by _run_subprocess_turn.
         "oneshot_argv": lambda b, prompt, sid, model: (
@@ -114,12 +133,15 @@ ENGINES: dict[str, dict] = {
         "session_history": True,   # supports ACP session/list + session-state
         # On-disk transcript store scanned by the History full-text search.
         "session_state_dir": "~/.copilot/session-state",
+        # Copilot's permission option vocabulary is known, so when no exact
+        # allow_once is offered we may fall back to any allow* / first option.
+        "permissive_fallback": True,
     },
     "opencode": {
         "name": "opencode",
         "label": "opencode",
-        "bin": _resolve_bin(["opencode"],
-                            ["~/.opencode/bin/opencode", "~/.local/bin/opencode"]),
+        "bin_names": ["opencode"],
+        "bin_fallbacks": ["~/.opencode/bin/opencode", "~/.local/bin/opencode"],
         "acp_argv": lambda b: [b, "acp"],
         # opencode's `run --format json` stream schema differs from Copilot's, so
         # the legacy lane is disabled below and this argv is never taken today;
@@ -135,6 +157,8 @@ ENGINES: dict[str, dict] = {
         # exists.
         "session_history": False,
         "session_state_dir": None,
+        # Unverified option vocabulary: never auto-pick a broad/persistent grant.
+        "permissive_fallback": False,
     },
 }
 
@@ -156,7 +180,7 @@ def _engine(cfg: dict | None = None) -> dict:
 def _acp_launch_argv() -> list[str]:
     """argv that starts the active engine as an ACP agent over stdio."""
     e = _engine()
-    return e["acp_argv"](e["bin"])
+    return e["acp_argv"](_engine_bin(e["name"]))
 def _resolve_sf() -> tuple[str, str]:
     """Locate the `sf` CLI and the bin dir that must be on PATH to run it.
 
@@ -228,18 +252,36 @@ DEFAULT_CONFIG = {
 }
 _SECRET_KEYS = {"ado_pat", "hive_token"}
 _config_lock = threading.Lock()
+_cfg_cache: dict | None = None       # last parsed config
+_cfg_cache_mtime: float = -1.0       # mtime it was parsed at (-1 = none/no file)
 
 
 def load_config() -> dict:
+    """Load config as a fresh dict (DEFAULT_CONFIG merged with the on-disk file).
+
+    Backed by an mtime-keyed in-memory cache so the hot paths that resolve the
+    active engine per request (review finding N8) don't re-read + re-parse the
+    file every call; an external edit still takes effect because a changed mtime
+    invalidates the cache. Returns a copy so callers can't mutate the cache."""
+    global _cfg_cache, _cfg_cache_mtime
+    try:
+        mtime = os.path.getmtime(CONFIG_FILE)
+    except OSError:
+        mtime = -1.0
+    cached_cfg = _cfg_cache
+    if cached_cfg is not None and mtime == _cfg_cache_mtime:
+        return dict(cached_cfg)
     cfg = dict(DEFAULT_CONFIG)
     try:
         cfg.update(json.loads(Path(CONFIG_FILE).read_text()))
     except (OSError, json.JSONDecodeError):
         pass
+    _cfg_cache, _cfg_cache_mtime = dict(cfg), mtime
     return cfg
 
 
 def save_config(patch: dict) -> dict:
+    global _cfg_cache, _cfg_cache_mtime
     with _config_lock:
         cfg = load_config()
         for k, v in patch.items():
@@ -251,6 +293,12 @@ def save_config(patch: dict) -> dict:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         Path(CONFIG_FILE).write_text(json.dumps(cfg, indent=2))
         os.chmod(CONFIG_FILE, 0o600)
+        # Refresh the cache under the write's new mtime so the very next
+        # load_config() returns this value without a re-read.
+        try:
+            _cfg_cache, _cfg_cache_mtime = dict(cfg), os.path.getmtime(CONFIG_FILE)
+        except OSError:
+            _cfg_cache = None
     return cfg
 
 
@@ -267,6 +315,12 @@ def masked_config() -> dict:
     out["engine"] = _engine_name(cfg)
     out["engines"] = [{"id": e["name"], "label": e["label"]}
                       for e in ENGINES.values()]
+    # Capability flags for the active engine so the frontend can adapt (e.g.
+    # explain an empty History tab, or disable the fast-lane toggle when the
+    # legacy lane is unavailable) instead of hardcoding engine-specific UI.
+    _e = _engine(cfg)
+    out["session_history"] = bool(_e.get("session_history"))
+    out["legacy_lane"] = bool(_e.get("legacy_lane"))
     return out
 
 # Fixed namespace so a given browser session always maps to the same copilot
@@ -993,7 +1047,7 @@ def _build_argv(prompt: str, session: str, model: str | None,
     with its full server-side context, instead of our uuid5-derived id."""
     sid = copilot_id or _copilot_session_id(session)
     e = _engine()
-    return e["oneshot_argv"](e["bin"], prompt, sid, model)
+    return e["oneshot_argv"](_engine_bin(e["name"]), prompt, sid, model)
 
 
 # ======================================================================
@@ -1041,6 +1095,11 @@ class AcpProc:
                         self.proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         self.proc.kill()
+                        # Reap after SIGKILL so no zombie lingers until GC.
+                        try:
+                            self.proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            pass
             except Exception:
                 pass
             raise
@@ -1116,9 +1175,9 @@ class AcpProc:
                     pick = o
                     break
             if pick is None:
-                if self.engine == "copilot":
-                    # Preserve Copilot's original fallback chain (known option
-                    # vocabulary): any "allow"* option, then the first option.
+                if ENGINES.get(self.engine, {}).get("permissive_fallback"):
+                    # Engine with a known option vocabulary (e.g. Copilot):
+                    # fall back to any "allow"* option, then the first option.
                     for o in opts:
                         if ("allow" in (o.get("optionId") or "").lower()
                                 or "allow" in (o.get("kind") or "").lower()):
@@ -1126,9 +1185,9 @@ class AcpProc:
                             break
                     if pick is None and opts:
                         pick = opts[0]
-                # For any other engine the option vocabulary is unverified: never
-                # auto-pick a broad/persistent (allow_always) or unknown-first
-                # option — cancel instead of guessing (fail-safe).
+                # Otherwise the option vocabulary is unverified: never auto-pick a
+                # broad/persistent (allow_always) or unknown-first option — cancel
+                # instead of guessing (fail-safe).
             result = ({"outcome": {"outcome": "selected", "optionId": pick["optionId"]}}
                       if pick else {"outcome": {"outcome": "cancelled"}})
             self._write({"jsonrpc": "2.0", "id": rid, "result": result})
@@ -1296,22 +1355,29 @@ def _acp_close(session: str):
         p.close()
 
 
-def _acp_close_all() -> int:
-    """Tear down every cached ACP process. Called on an engine change so no
-    session keeps a proc bound to the previous engine's CLI. Returns the count
-    closed."""
+def _acp_close_stale(keep_engine: str) -> int:
+    """Tear down only cached ACP processes NOT bound to ``keep_engine``. Called
+    on an engine change so sessions stop talking to the previous engine's CLI,
+    while any process already on the new engine (and other engines' in-flight
+    turns are unavoidable collateral only if they differ) survives. Selecting
+    and detaching under _acp_lock makes this atomic against a concurrent
+    _acp_get that may have just created a new-engine process.
+
+    Returns the count closed."""
     with _acp_lock:
-        procs = list(_acp_procs.items())
-        _acp_procs.clear()
+        stale = [(s, p) for s, p in _acp_procs.items()
+                 if getattr(p, "engine", keep_engine) != keep_engine]
+        for s, _ in stale:
+            _acp_procs.pop(s, None)
     with _live_lock:
-        for sess, _ in procs:
+        for sess, _ in stale:
             _live_turns.pop(sess, None)
-    for _, p in procs:
+    for _, p in stale:
         try:
             p.close()
         except Exception:
             pass
-    return len(procs)
+    return len(stale)
 
 
 def _list_models() -> dict:
@@ -1322,8 +1388,10 @@ def _list_models() -> dict:
     same source the interactive `/model` picker uses — so the web UI's model
     lists never go stale. Cached by the caller. On any failure returns
     {"error": ...} and the client keeps its built-in fallback list."""
+    eng = _engine()   # snapshot once: launch and parse must use the same engine
     try:
-        p = subprocess.Popen(_acp_launch_argv(), stdin=subprocess.PIPE,
+        p = subprocess.Popen(eng["acp_argv"](_engine_bin(eng["name"])),
+                             stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              text=True, bufsize=1)
     except Exception as exc:
@@ -1365,7 +1433,7 @@ def _list_models() -> dict:
         res = (read_until(i2) or {}).get("result", {})
         # Model-catalog shape is engine-specific (Copilot's models.availableModels
         # vs opencode's configOptions), so parsing lives in the engine descriptor.
-        return _engine()["parse_models"](res)
+        return eng["parse_models"](res)
     except Exception as exc:
         return {"error": str(exc)}
     finally:
@@ -1523,7 +1591,7 @@ def _search_sessions(query: str, cap: int = 100) -> dict:
     if not q:
         return {"sessions": []}
     ql = q.lower()
-    meta = cached("sessions", 20.0, _list_sessions)
+    meta = cached("sessions:" + _engine_name(), 20.0, _list_sessions)
     if isinstance(meta, dict) and meta.get("error"):
         return {"error": meta["error"]}
     out = []
@@ -2053,9 +2121,12 @@ class Handler(BaseHTTPRequestHandler):
                 key = "sf_crs:" + ",".join(sorted(products))
                 self._json(200, cached(key, 30.0, lambda: _sf_crs(products)))
         elif p.path == "/api/models":
-            self._json(200, cached("models", 600.0, _list_models))
+            # Engine-qualified key so a switch reads a fresh catalog instead of a
+            # stale-engine value, and an in-flight old-engine producer can't
+            # repopulate the new engine's key (see review finding N4).
+            self._json(200, cached("models:" + _engine_name(), 600.0, _list_models))
         elif p.path == "/api/sessions":
-            self._json(200, cached("sessions", 20.0, _list_sessions))
+            self._json(200, cached("sessions:" + _engine_name(), 20.0, _list_sessions))
         elif p.path == "/api/sessions/search":
             if not _engine().get("session_history", False):
                 self._json(200, {"sessions": []})
@@ -2118,33 +2189,37 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, _sf_reconnect_start())
         elif p.path == "/api/settings":
             patch = body if isinstance(body, dict) else {}
-            # Reject an unknown/absent engine before persisting so the config can
-            # never be left naming a CLI that can't be launched. main() validates
-            # the startup engine; this is the runtime-change equivalent.
+            prev_engine = _engine_name()
+            # Validate only a genuine engine CHANGE. The frontend sends `engine`
+            # on every save, so gating on presence alone would reject unrelated
+            # setting changes whenever the active engine's binary is missing
+            # (review finding N1). An unchanged engine needs no re-check.
             if "engine" in patch:
                 name = patch["engine"]
-                if not isinstance(name, str) or name.lower() not in ENGINES:
-                    self._json(400, {"error": f"unknown engine: {name!r}"})
-                    return
-                bin_path = ENGINES[name.lower()]["bin"]
-                if not Path(bin_path).exists():
-                    self._json(400, {"error": f"{name} binary not found at {bin_path}"})
-                    return
-            prev_engine = _engine_name()
+                changing = not isinstance(name, str) or name.lower() != prev_engine
+                if changing:
+                    if not isinstance(name, str) or name.lower() not in ENGINES:
+                        self._json(400, {"error": f"unknown engine: {name!r}"})
+                        return
+                    # Live-resolve so an engine installed AFTER startup is
+                    # accepted without a restart (review finding N2).
+                    if not _resolve_bin(ENGINES[name.lower()]["bin_names"],
+                                        ENGINES[name.lower()]["bin_fallbacks"]):
+                        self._json(400, {"error": f"{name} binary not found (install it or check PATH)"})
+                        return
             save_config(patch)
             # settings that affect ADO identity/token invalidate caches
             with _cache_lock:
                 _cache.pop("ado_mywork", None)
             with _az_lock:
                 _az_token.update(tok="", exp=0.0)
-            # An engine change must invalidate engine-scoped caches and tear down
-            # cached ACP procs, so the model picker, history, and live chat all
-            # follow the newly selected engine instead of serving the old one.
+            # On an engine change, retire only the previous engine's ACP procs so
+            # the switched session re-homes to the new CLI while sessions already
+            # on the new engine keep running (review finding N3). Model/history
+            # caches are engine-qualified (N4), so no cross-engine eviction is
+            # needed — the new engine simply reads its own keys.
             if _engine_name() != prev_engine:
-                with _cache_lock:
-                    _cache.pop("models", None)
-                    _cache.pop("sessions", None)
-                _acp_close_all()
+                _acp_close_stale(_engine_name())
             self._json(200, masked_config())
         else:
             self.send_error(404, "Not found")
@@ -2156,12 +2231,14 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
     eng = _engine()
-    if not Path(eng["bin"]).exists():
-        raise SystemExit(f"{eng['label']} binary not found at {eng['bin']}")
+    bin_path = _engine_bin(eng["name"])
+    if not (bin_path and Path(bin_path).exists()):
+        raise SystemExit(f"{eng['label']} binary not found "
+                         f"(tried {eng['bin_names']} + {eng['bin_fallbacks']})")
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     tok = "ok" if _hive_token() else "MISSING"
     print(f"HAL-UI Phase 2 on http://{args.host}:{args.port}/  "
-          f"(engine={eng['label']} bin={eng['bin']}, hive={_hive_url()} token={tok})")
+          f"(engine={eng['label']} bin={bin_path}, hive={_hive_url()} token={tok})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

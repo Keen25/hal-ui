@@ -48,8 +48,8 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   chat: `copilot` (default) or `opencode`. Both speak the **same ACP** (Zed Agent
   Client Protocol) over stdio, so the fast lane is engine-agnostic — only the
   launch argv differs (`copilot --acp` vs `opencode acp`). The legacy per-turn
-  lane and session-history tab parse Copilot's proprietary JSON, so they stay
-  Copilot-only; selecting opencode transparently forces the ACP fast lane.
+  lane and the on-disk history search parse Copilot's proprietary JSON, so they
+  stay Copilot-only; selecting opencode transparently forces the ACP fast lane.
 - **Hive drawer auto-poll** — an open task drawer refreshes progress + log tail
   every 4s while the task is non-terminal, then stops.
 
@@ -194,18 +194,23 @@ The **engine** setting (Settings pane) picks which coding-agent CLI backs chat.
 Both engines speak the same ACP fast lane; the default is unchanged from a
 Copilot-only install.
 
-| Engine | Fast lane (ACP) | Legacy per-turn lane | Session-history tab |
-|--------|:---------------:|:--------------------:|:-------------------:|
+| Engine | Fast lane (ACP) | Legacy per-turn lane | On-disk history |
+|--------|:---------------:|:--------------------:|:---------------:|
 | `copilot` (default) | ✅ | ✅ (full MCP) | ✅ |
 | `opencode` | ✅ | — (auto-forced to ACP) | — |
 
-The legacy lane and history tab parse Copilot's proprietary JSON, so they stay
-Copilot-only; selecting opencode transparently forces the ACP fast lane.
+The legacy lane and the **on-disk** history search parse Copilot's proprietary
+JSON, so they stay Copilot-only; selecting opencode transparently forces the ACP
+fast lane. The History tab itself still works under opencode for your
+**browser-local archived** sessions — only the on-disk transcript section is
+disabled (with an in-tab note). Switching engines retires only the previous
+engine's live chat processes; sessions already on the new engine keep running.
 
 **To use opencode:**
 1. Install the CLI: `curl -fsSL https://opencode.ai/install | bash` (or
    `npm i -g opencode-ai`). It need not be on `PATH` — HAL-UI also finds
-   `~/.opencode/bin/opencode`.
+   `~/.opencode/bin/opencode`. Installing it while HAL-UI is already running is
+   fine; the binary is re-resolved on each save (no restart needed).
 2. Settings → **Engine → opencode** → Save. Chat re-homes to opencode on the
    next turn; the model picker follows the new engine.
 3. Free "OpenCode Zen" models work without auth, so you can smoke-test right

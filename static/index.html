@@ -449,7 +449,7 @@
         <label class="muted">Default model</label>
         <select id="s-default_model"><option value="">default</option><option value="claude-sonnet-4.5">sonnet-4.5</option><option value="gpt-5.4">gpt-5.4</option></select>
         <label class="muted">Engine</label>
-        <select id="s-engine"><option value="copilot">GitHub Copilot CLI</option><option value="opencode">opencode</option></select>
+        <select id="s-engine"><option value="copilot">GitHub Copilot CLI</option></select>
         <span class="muted" style="font-size:11px">Coding-agent CLI backing chat. opencode uses the shared ACP lane (fast chat only); Copilot supports both lanes and session history.</span>
         <label class="muted">Fast chat</label>
         <label class="row2" style="gap:8px;cursor:pointer"><input id="s-chat_fast" type="checkbox" style="width:auto" /> <span class="muted">Disable MCP servers in chat for faster startup (~5-7s/msg). Turn off if you need MCP tools mid-chat.</span></label>
@@ -787,7 +787,13 @@
         <div class="hmeta">on disk<br>${histAgo(ts)}</div></div>`;
     }
     let diskHtml = "";
-    if (diskErr) {
+    if (window.__engineCaps && window.__engineCaps.session_history === false) {
+      // Engine without an on-disk transcript store (e.g. opencode): the archived
+      // (browser-local) list above still works; only the on-disk section is n/a.
+      const lbl = window.__engineCaps.engine || "this engine";
+      diskHtml = `<div class="toolbar" style="margin-top:14px"><strong>On disk</strong></div>`
+        + `<div class="muted">On-disk session history is only available with the Copilot engine (current: ${esc(lbl)}). Your archived sessions above are unaffected.</div>`;
+    } else if (diskErr) {
       diskHtml = `<div class="muted">On-disk sessions unavailable: ${esc(diskErr)}</div>`;
     } else if (q) {
       // full-text search mode: results come from /api/sessions/search (debounced)
@@ -1213,9 +1219,24 @@
     if(!enabled && $("#view-sf").classList.contains("active"))
       document.querySelector('.tab[data-view="chat"]').click();
   }
+  // Reflect the active engine's capabilities: an engine with no legacy lane
+  // (e.g. opencode) always runs the ACP fast lane, so the "Disable MCP" toggle
+  // is meaningless there — force it on and disable it so the UI can't imply a
+  // choice the backend ignores.
+  function applyEngineCaps(){
+    const caps = window.__engineCaps; if(!caps) return;
+    const cf = $("#s-chat_fast"); if(!cf) return;
+    if(caps.legacy_lane === false){
+      cf.checked = true; cf.disabled = true;
+      cf.closest("label").title = (caps.engine||"this engine")+" only supports the ACP fast lane";
+    } else {
+      cf.disabled = false;
+      cf.closest("label").title = "";
+    }
+  }
 
   // pull default model from settings for new sessions
-  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); }).catch(()=>{});
+  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; window.__engineCaps={engine:c.engine,session_history:c.session_history,legacy_lane:c.legacy_lane}; applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); applyEngineCaps(); }).catch(()=>{});
   // populate model selectors from the live catalog (mirrors the console picker)
   fetch("/api/models").then(r=>r.json()).then(d=>{ if(!d.error){ window.__models=d; fillModelSelects(d); } }).catch(()=>{});
 
@@ -1780,6 +1801,8 @@
       }
       eng.value=c.engine||"copilot";
       $("#s-chat_fast").checked=c.chat_fast!==false;
+      window.__engineCaps={engine:c.engine,session_history:c.session_history,legacy_lane:c.legacy_lane};
+      applyEngineCaps();
       $("#s-ado_pat").placeholder=c.ado_pat_set?"•••• set (leave blank to keep)":"blank = use az login";
       $("#s-hive_token").placeholder=c.hive_token_set?"•••• set (leave blank to keep)":"blank = ~/.hive/worker.token";
       loadSfStatus();
