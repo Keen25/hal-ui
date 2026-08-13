@@ -183,8 +183,36 @@ cd $env:USERPROFILE\hal-ui ; git pull --ff-only ; Restart-Service hal-ui
 
 ### Requirements
 - Python 3.10+
-- [`copilot`](https://github.com/github/copilot-cli) CLI on `PATH`
+- [`copilot`](https://github.com/github/copilot-cli) CLI on `PATH` (default engine)
+- [`opencode`](https://opencode.ai) CLI — **optional**, only if you select the
+  opencode engine (see below)
 - `gh` CLI (for GitHub views), `az` CLI (for ADO views) — optional per view
+
+## Chat engines
+
+The **engine** setting (Settings pane) picks which coding-agent CLI backs chat.
+Both engines speak the same ACP fast lane; the default is unchanged from a
+Copilot-only install.
+
+| Engine | Fast lane (ACP) | Legacy per-turn lane | Session-history tab |
+|--------|:---------------:|:--------------------:|:-------------------:|
+| `copilot` (default) | ✅ | ✅ (full MCP) | ✅ |
+| `opencode` | ✅ | — (auto-forced to ACP) | — |
+
+The legacy lane and history tab parse Copilot's proprietary JSON, so they stay
+Copilot-only; selecting opencode transparently forces the ACP fast lane.
+
+**To use opencode:**
+1. Install the CLI: `curl -fsSL https://opencode.ai/install | bash` (or
+   `npm i -g opencode-ai`). It need not be on `PATH` — HAL-UI also finds
+   `~/.opencode/bin/opencode`.
+2. Settings → **Engine → opencode** → Save. Chat re-homes to opencode on the
+   next turn; the model picker follows the new engine.
+3. Free "OpenCode Zen" models work without auth, so you can smoke-test right
+   away; sign in via `opencode auth login` for the full catalog.
+
+Saving an engine whose binary can't be found is rejected (the prior engine is
+kept), so you can't strand chat on a CLI that isn't installed.
 
 ## Roadmap
 - Convert `~/.copilot/mcp-config.json` to ACP `mcpServers` so the fast lane can
