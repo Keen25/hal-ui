@@ -1774,7 +1774,11 @@
       $("#s-ado_upn").value=c.ado_upn||"";
       $("#s-hive_url").value=c.hive_url||"";
       $("#s-default_model").value=c.default_model||"";
-      $("#s-engine").value=c.engine||"copilot";
+      const eng=$("#s-engine");
+      if(Array.isArray(c.engines)&&c.engines.length){
+        eng.innerHTML=c.engines.map(e=>`<option value="${esc(e.id)}">${esc(e.label)}</option>`).join("");
+      }
+      eng.value=c.engine||"copilot";
       $("#s-chat_fast").checked=c.chat_fast!==false;
       $("#s-ado_pat").placeholder=c.ado_pat_set?"•••• set (leave blank to keep)":"blank = use az login";
       $("#s-hive_token").placeholder=c.hive_token_set?"•••• set (leave blank to keep)":"blank = ~/.hive/worker.token";
@@ -1829,6 +1833,7 @@
     try{
       const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
       const c=await r.json();
+      if(!r.ok){ m.className="msgbox err"; m.textContent=c.error||("save failed ("+r.status+")"); return; }
       window.__defaultModel=c.default_model||"";
       applyHive(c.hive_enabled!==false);
       $("#s-ado_pat").value=""; $("#s-hive_token").value=""; loadSettings();

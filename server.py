@@ -64,8 +64,44 @@ def _resolve_bin(names: list[str], fallbacks: list[str]) -> str:
     return os.path.expanduser(fallbacks[0]) if fallbacks else names[0]
 
 
+def _parse_models_copilot(res: dict) -> dict:
+    """Copilot advertises its catalog under session/new ``models`` —
+    availableModels + currentModelId, filtered by copilotEnablement."""
+    models = res.get("models", {}) or {}
+    out = []
+    for m in models.get("availableModels", []) or []:
+        meta = m.get("_meta") or {}
+        if meta.get("copilotEnablement") not in (None, "enabled"):
+            continue
+        out.append({"id": m.get("modelId", ""), "name": m.get("name", ""),
+                    "usage": meta.get("copilotUsage", ""),
+                    "price": meta.get("copilotPriceCategory", "")})
+    if not out:
+        return {"error": "no models returned"}
+    return {"models": out, "default": models.get("currentModelId", "")}
+
+
+def _parse_models_opencode(res: dict) -> dict:
+    """opencode advertises its catalog under session/new ``configOptions`` — a
+    select with id "model" (value/name pairs + currentValue), not Copilot's
+    ``models.availableModels``."""
+    out, default = [], ""
+    for opt in res.get("configOptions", []) or []:
+        if opt.get("id") != "model" and opt.get("category") != "model":
+            continue
+        default = opt.get("currentValue", "") or default
+        for o in opt.get("options", []) or []:
+            out.append({"id": o.get("value", ""), "name": o.get("name", ""),
+                        "usage": "", "price": ""})
+        break
+    if not out:
+        return {"error": "no models returned"}
+    return {"models": out, "default": default}
+
+
 ENGINES: dict[str, dict] = {
     "copilot": {
+        "name": "copilot",
         "label": "GitHub Copilot CLI",
         "bin": _resolve_bin(["copilot"], ["~/.local/bin/copilot"]),
         "acp_argv": lambda b: [b, "--acp"],
@@ -73,10 +109,14 @@ ENGINES: dict[str, dict] = {
         "oneshot_argv": lambda b, prompt, sid, model: (
             [b, "-p", prompt, "--output-format", "json", "--allow-all-tools",
              "--session-id", sid] + (["--model", model] if model else [])),
+        "parse_models": _parse_models_copilot,
         "legacy_lane": True,       # supports the chat_fast-OFF subprocess lane
         "session_history": True,   # supports ACP session/list + session-state
+        # On-disk transcript store scanned by the History full-text search.
+        "session_state_dir": "~/.copilot/session-state",
     },
     "opencode": {
+        "name": "opencode",
         "label": "opencode",
         "bin": _resolve_bin(["opencode"],
                             ["~/.opencode/bin/opencode", "~/.local/bin/opencode"]),
@@ -87,20 +127,30 @@ ENGINES: dict[str, dict] = {
         "oneshot_argv": lambda b, prompt, sid, model: (
             [b, "run", "--format", "json"]
             + (["--model", model] if model else []) + [prompt]),
+        "parse_models": _parse_models_opencode,
         "legacy_lane": False,      # run-stream JSON schema differs -> ACP lane only
-        "session_history": False,  # no ACP session/list + no ~/.copilot state
+        # opencode exposes ACP session/list, but the History full-text search
+        # reads the on-disk transcript store, which is Copilot-specific — so the
+        # whole history surface stays gated off until an opencode store adapter
+        # exists.
+        "session_history": False,
+        "session_state_dir": None,
     },
 }
 
 
-def _engine() -> dict:
+def _engine_name(cfg: dict | None = None) -> str:
+    """The active engine id, validated against ENGINES. Tolerates a missing or
+    non-string ``engine`` config value (defaults to copilot) so a hand-edited
+    config or crafted request can never crash engine resolution."""
+    raw = (cfg or load_config()).get("engine")
+    name = raw.lower() if isinstance(raw, str) else ""
+    return name if name in ENGINES else "copilot"
+
+
+def _engine(cfg: dict | None = None) -> dict:
     """The active engine descriptor (from config ``engine``; default copilot)."""
-    name = (load_config().get("engine") or "copilot").lower()
-    return ENGINES.get(name, ENGINES["copilot"])
-
-
-def _engine_bin() -> str:
-    return _engine()["bin"]
+    return ENGINES[_engine_name(cfg)]
 
 
 def _acp_launch_argv() -> list[str]:
@@ -211,6 +261,12 @@ def masked_config() -> dict:
         out[k + "_set"] = bool(cfg.get(k))
     out["hive_enabled"] = _hive_enabled()
     out["sf_enabled"] = _sf_enabled()
+    # Advertise the engine registry so the Settings dropdown is generated from
+    # the backend (single source of truth) instead of a hardcoded list that can
+    # drift as engines are added/removed.
+    out["engine"] = _engine_name(cfg)
+    out["engines"] = [{"id": e["name"], "label": e["label"]}
+                      for e in ENGINES.values()]
     return out
 
 # Fixed namespace so a given browser session always maps to the same copilot
@@ -958,6 +1014,7 @@ class AcpProc:
     def __init__(self, model: str | None = None, load_id: str | None = None,
                  cwd: str | None = None):
         self.model = None
+        self.engine = _engine_name()   # bind the proc to the engine that launched it
         self.session_id: str | None = None
         self.dead = False
         self._id = 0
@@ -970,7 +1027,23 @@ class AcpProc:
             _acp_launch_argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1, cwd=os.path.expanduser("~"))
         threading.Thread(target=self._reader, daemon=True).start()
-        self._boot(model, load_id, cwd)
+        try:
+            self._boot(model, load_id, cwd)
+        except Exception:
+            # A failed handshake (missing/incompatible engine, timeout) must not
+            # leak the child process + its reader thread — tear it down before
+            # propagating so the caller can surface a launch error cleanly.
+            self.dead = True
+            try:
+                if self.proc.poll() is None:
+                    self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.proc.kill()
+            except Exception:
+                pass
+            raise
 
     # --- low level ----------------------------------------------------
     def _next_id(self) -> int:
@@ -1035,6 +1108,7 @@ class AcpProc:
         rid = obj["id"]
         if method == "session/request_permission":
             opts = obj.get("params", {}).get("options", []) or []
+            # Always prefer an exact allow_once (single-turn grant).
             pick = None
             for o in opts:
                 oid = (o.get("optionId") or "").lower()
@@ -1042,12 +1116,19 @@ class AcpProc:
                     pick = o
                     break
             if pick is None:
-                for o in opts:
-                    if "allow" in (o.get("optionId") or "").lower() or "allow" in (o.get("kind") or "").lower():
-                        pick = o
-                        break
-            if pick is None and opts:
-                pick = opts[0]
+                if self.engine == "copilot":
+                    # Preserve Copilot's original fallback chain (known option
+                    # vocabulary): any "allow"* option, then the first option.
+                    for o in opts:
+                        if ("allow" in (o.get("optionId") or "").lower()
+                                or "allow" in (o.get("kind") or "").lower()):
+                            pick = o
+                            break
+                    if pick is None and opts:
+                        pick = opts[0]
+                # For any other engine the option vocabulary is unverified: never
+                # auto-pick a broad/persistent (allow_always) or unknown-first
+                # option — cancel instead of guessing (fail-safe).
             result = ({"outcome": {"outcome": "selected", "optionId": pick["optionId"]}}
                       if pick else {"outcome": {"outcome": "cancelled"}})
             self._write({"jsonrpc": "2.0", "id": rid, "result": result})
@@ -1179,11 +1260,21 @@ _acp_lock = threading.Lock()
 
 def _acp_get(session: str, model: str | None,
              load_id: str | None = None, cwd: str | None = None) -> AcpProc:
+    cur = _engine_name()
     with _acp_lock:
         p = _acp_procs.get(session)
-        if p is not None and not p.dead and p.proc.poll() is None:
+        # Reuse only a live proc that still matches the active engine — a proc
+        # launched under a since-changed engine must be torn down and rebuilt so
+        # the session doesn't keep talking to the old CLI binary.
+        if p is not None and not p.dead and p.proc.poll() is None \
+                and getattr(p, "engine", cur) == cur:
             p.set_model(model)
             return p
+        if p is not None:
+            try:
+                p.close()
+            except Exception:
+                pass
         p = AcpProc(model, load_id=load_id, cwd=cwd)
         _acp_procs[session] = p
         return p
@@ -1203,6 +1294,24 @@ def _acp_close(session: str):
         _live_turns.pop(session, None)
     if p is not None:
         p.close()
+
+
+def _acp_close_all() -> int:
+    """Tear down every cached ACP process. Called on an engine change so no
+    session keeps a proc bound to the previous engine's CLI. Returns the count
+    closed."""
+    with _acp_lock:
+        procs = list(_acp_procs.items())
+        _acp_procs.clear()
+    with _live_lock:
+        for sess, _ in procs:
+            _live_turns.pop(sess, None)
+    for _, p in procs:
+        try:
+            p.close()
+        except Exception:
+            pass
+    return len(procs)
 
 
 def _list_models() -> dict:
@@ -1254,32 +1363,9 @@ def _list_models() -> dict:
         read_until(_id)
         i2 = send("session/new", {"cwd": os.path.expanduser("~"), "mcpServers": []})
         res = (read_until(i2) or {}).get("result", {})
-        models = res.get("models", {}) or {}
-        out = []
-        for m in models.get("availableModels", []) or []:
-            meta = m.get("_meta") or {}
-            if meta.get("copilotEnablement") not in (None, "enabled"):
-                continue
-            out.append({"id": m.get("modelId", ""), "name": m.get("name", ""),
-                        "usage": meta.get("copilotUsage", ""),
-                        "price": meta.get("copilotPriceCategory", "")})
-        default = models.get("currentModelId", "")
-        if not out:
-            # opencode (and other ACP agents) advertise the model catalog via the
-            # session/new `configOptions` list — a select with id "model" — rather
-            # than Copilot's `models.availableModels`. Parse that shape as a
-            # fallback so the picker is populated for every engine.
-            for opt in res.get("configOptions", []) or []:
-                if opt.get("id") != "model" and opt.get("category") != "model":
-                    continue
-                default = opt.get("currentValue", "") or default
-                for o in opt.get("options", []) or []:
-                    out.append({"id": o.get("value", ""), "name": o.get("name", ""),
-                                "usage": "", "price": ""})
-                break
-        if not out:
-            return {"error": "no models returned"}
-        return {"models": out, "default": default}
+        # Model-catalog shape is engine-specific (Copilot's models.availableModels
+        # vs opencode's configOptions), so parsing lives in the engine descriptor.
+        return _engine()["parse_models"](res)
     except Exception as exc:
         return {"error": str(exc)}
     finally:
@@ -1383,13 +1469,23 @@ def _list_sessions(cap: int = 200) -> dict:
 # event stream at ~/.copilot/session-state/<id>/events.jsonl; the user/assistant
 # message bodies live there. session/list only returns titles, so to let the
 # History search match transcript CONTENT (e.g. "coffee") we scan those files.
-_SESSION_STATE_DIR = os.path.expanduser("~/.copilot/session-state")
+# The store is engine-specific (see ENGINES[...]["session_state_dir"]).
 _BODY_CAP = 60_000   # per-session text budget so the index stays memory-bounded
+
+
+def _session_state_dir() -> str | None:
+    """Absolute on-disk transcript dir for the active engine, or None if the
+    engine has no Copilot-style session-state store."""
+    d = _engine().get("session_state_dir")
+    return os.path.expanduser(d) if d else None
 
 
 def _session_body(session_id: str) -> str:
     """Concatenated user+assistant message text for one on-disk session (capped)."""
-    path = os.path.join(_SESSION_STATE_DIR, session_id, "events.jsonl")
+    base = _session_state_dir()
+    if not base:
+        return ""
+    path = os.path.join(base, session_id, "events.jsonl")
     parts: list[str] = []
     total = 0
     try:
@@ -1961,10 +2057,16 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/api/sessions":
             self._json(200, cached("sessions", 20.0, _list_sessions))
         elif p.path == "/api/sessions/search":
-            qs = parse_qs(p.query)
-            q = (qs.get("q", [""])[0]).strip()
-            self._json(200, _search_sessions(q))
+            if not _engine().get("session_history", False):
+                self._json(200, {"sessions": []})
+            else:
+                qs = parse_qs(p.query)
+                q = (qs.get("q", [""])[0]).strip()
+                self._json(200, _search_sessions(q))
         elif p.path == "/api/session/transcript":
+            if not _engine().get("session_history", False):
+                self._json(404, {"error": "session history not supported for this engine"})
+                return
             qs = parse_qs(p.query)
             sid = (qs.get("id", [""])[0]).strip()
             cwd = (qs.get("cwd", [""])[0]).strip() or None
@@ -2015,12 +2117,34 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/api/sf/reconnect":
             self._json(200, _sf_reconnect_start())
         elif p.path == "/api/settings":
-            save_config(body if isinstance(body, dict) else {})
+            patch = body if isinstance(body, dict) else {}
+            # Reject an unknown/absent engine before persisting so the config can
+            # never be left naming a CLI that can't be launched. main() validates
+            # the startup engine; this is the runtime-change equivalent.
+            if "engine" in patch:
+                name = patch["engine"]
+                if not isinstance(name, str) or name.lower() not in ENGINES:
+                    self._json(400, {"error": f"unknown engine: {name!r}"})
+                    return
+                bin_path = ENGINES[name.lower()]["bin"]
+                if not Path(bin_path).exists():
+                    self._json(400, {"error": f"{name} binary not found at {bin_path}"})
+                    return
+            prev_engine = _engine_name()
+            save_config(patch)
             # settings that affect ADO identity/token invalidate caches
             with _cache_lock:
                 _cache.pop("ado_mywork", None)
             with _az_lock:
                 _az_token.update(tok="", exp=0.0)
+            # An engine change must invalidate engine-scoped caches and tear down
+            # cached ACP procs, so the model picker, history, and live chat all
+            # follow the newly selected engine instead of serving the old one.
+            if _engine_name() != prev_engine:
+                with _cache_lock:
+                    _cache.pop("models", None)
+                    _cache.pop("sessions", None)
+                _acp_close_all()
             self._json(200, masked_config())
         else:
             self.send_error(404, "Not found")
