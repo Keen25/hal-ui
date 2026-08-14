@@ -276,10 +276,12 @@
     <div class="tab" data-view="settings">⚙</div>
   </div>
 </header>
+<!-- Persistent session dock: stays visible across every tab so you can jump
+     back into an active session from ADO/Hive/CRs/etc. with one click. -->
+<div class="sesstrip" id="sesstrip"></div>
 <main>
   <!-- CHAT -->
   <section class="view active" id="view-chat">
-    <div class="sesstrip" id="sesstrip"></div>
     <div id="log"></div>
     <div id="pending"></div>
     <div id="attstrip"></div>
@@ -702,7 +704,10 @@
     renderStrip(); renderLog(); syncModel(); renderPending();
     const p = $("#prompt"); p.focus();
   }
-  function switchTo(sid) { state.active = sid; save(); renderStrip(); renderLog(); syncModel(); renderPending(); $("#prompt").focus(); }
+  function switchTo(sid) { state.active = sid; save();
+    const chatTab = document.querySelector('.tab[data-view="chat"]');
+    if (chatTab && !chatTab.classList.contains("active")) chatTab.click();
+    renderStrip(); renderLog(); syncModel(); renderPending(); $("#prompt").focus(); }
   function renameSession(sid) {
     const name = prompt("Rename session:", state.sessions[sid].label);
     if (name && name.trim()) { state.sessions[sid].label = name.trim(); save(); renderStrip(); }
