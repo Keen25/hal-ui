@@ -1851,8 +1851,12 @@
     const payload={ ado_org:$("#s-ado_org").value.trim(), ado_upn:$("#s-ado_upn").value.trim(),
       hive_url:$("#s-hive_url").value.trim(), default_model:$("#s-default_model").value,
       engine:$("#s-engine").value,
-      chat_fast:$("#s-chat_fast").checked,
       ado_pat:$("#s-ado_pat").value, hive_token:$("#s-hive_token").value };
+    // Only submit chat_fast when the control is actually editable. When the
+    // active engine has no legacy lane the box is force-checked + disabled to
+    // reflect the forced ACP lane; sending that forced `true` would clobber the
+    // user's stored preference (e.g. Copilot chat_fast=false) on a round trip.
+    if(!$("#s-chat_fast").disabled) payload.chat_fast=$("#s-chat_fast").checked;
     try{
       const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
       const c=await r.json();
@@ -1860,6 +1864,10 @@
       window.__defaultModel=c.default_model||"";
       applyHive(c.hive_enabled!==false);
       $("#s-ado_pat").value=""; $("#s-hive_token").value=""; loadSettings();
+      // The engine may have changed: /api/models is engine-qualified and only
+      // fetched at page init, so refresh the catalog now and repopulate every
+      // model selector instead of leaving the old engine's models until reload.
+      try{ const md=await (await fetch("/api/models")).json(); if(!md.error){ window.__models=md; fillModelSelects(md); } }catch(_){}
       m.className="msgbox ok"; m.textContent="saved"; 
     }catch(err){ m.className="msgbox err"; m.textContent=err.message; }
   });

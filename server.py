@@ -124,6 +124,10 @@ ENGINES: dict[str, dict] = {
         "bin_names": ["copilot"],
         "bin_fallbacks": ["~/.local/bin/copilot"],
         "acp_argv": lambda b: [b, "--acp"],
+        # Per-engine ACP model-switch op (method, params) for a live session —
+        # Copilot uses session/set_model{modelId}.
+        "set_model_op": lambda sid, model: (
+            "session/set_model", {"sessionId": sid, "modelId": model}),
         # Legacy per-turn spawn (chat_fast OFF); parsed by _run_subprocess_turn.
         "oneshot_argv": lambda b, prompt, sid, model: (
             [b, "-p", prompt, "--output-format", "json", "--allow-all-tools",
@@ -143,6 +147,11 @@ ENGINES: dict[str, dict] = {
         "bin_names": ["opencode"],
         "bin_fallbacks": ["~/.opencode/bin/opencode", "~/.local/bin/opencode"],
         "acp_argv": lambda b: [b, "acp"],
+        # opencode v1.18.18 does not honor session/set_model; it changes the
+        # active model through session/set_config_option{configId:"model",value}.
+        "set_model_op": lambda sid, model: (
+            "session/set_config_option",
+            {"sessionId": sid, "configId": "model", "value": model}),
         # opencode's `run --format json` stream schema differs from Copilot's, so
         # the legacy lane is disabled below and this argv is never taken today;
         # kept for a future per-engine stream adapter.
@@ -177,10 +186,17 @@ def _engine(cfg: dict | None = None) -> dict:
     return ENGINES[_engine_name(cfg)]
 
 
+def _engine_argv(name: str) -> list[str]:
+    """ACP-launch argv for a specific engine name (bin live-resolved). Callers
+    that captured an engine snapshot pass it here so a concurrent engine switch
+    can't change the argv out from under them mid-launch."""
+    e = ENGINES[name]
+    return e["acp_argv"](_engine_bin(name))
+
+
 def _acp_launch_argv() -> list[str]:
     """argv that starts the active engine as an ACP agent over stdio."""
-    e = _engine()
-    return e["acp_argv"](_engine_bin(e["name"]))
+    return _engine_argv(_engine_name())
 def _resolve_sf() -> tuple[str, str]:
     """Locate the `sf` CLI and the bin dir that must be on PATH to run it.
 
@@ -1066,9 +1082,13 @@ class AcpProc:
     BOOT_TIMEOUT = 90
 
     def __init__(self, model: str | None = None, load_id: str | None = None,
-                 cwd: str | None = None):
+                 cwd: str | None = None, engine: str | None = None):
         self.model = None
-        self.engine = _engine_name()   # bind the proc to the engine that launched it
+        # Bind the proc to a single engine snapshot: the caller passes the engine
+        # it resolved so a settings save landing between resolution and launch
+        # can't spawn one CLI while tagging the proc as another (review finding
+        # N5). argv below is built from this same captured name.
+        self.engine = engine or _engine_name()
         self.session_id: str | None = None
         self.dead = False
         self._id = 0
@@ -1078,7 +1098,7 @@ class AcpProc:
         self._event_q: queue.Queue | None = None  # active turn's notification sink
         self._event_lock = threading.Lock()
         self.proc = subprocess.Popen(
-            _acp_launch_argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            _engine_argv(self.engine), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1, cwd=os.path.expanduser("~"))
         threading.Thread(target=self._reader, daemon=True).start()
         try:
@@ -1224,8 +1244,15 @@ class AcpProc:
     def set_model(self, model: str | None):
         if not model or model == self.model or not self.session_id:
             return
+        # Model-switch wire op is engine-specific (Copilot: session/set_model;
+        # opencode: session/set_config_option), so it lives in the descriptor of
+        # the engine THIS proc was launched under (review finding N3).
+        op = ENGINES.get(self.engine, {}).get("set_model_op")
+        if not op:
+            return
+        method, params = op(self.session_id, model)
         try:
-            self._request("session/set_model", {"sessionId": self.session_id, "modelId": model}, timeout=30)
+            self._request(method, params, timeout=30)
             self.model = model
         except Exception:
             pass  # unknown model id => keep default
@@ -1334,7 +1361,7 @@ def _acp_get(session: str, model: str | None,
                 p.close()
             except Exception:
                 pass
-        p = AcpProc(model, load_id=load_id, cwd=cwd)
+        p = AcpProc(model, load_id=load_id, cwd=cwd, engine=cur)
         _acp_procs[session] = p
         return p
 
@@ -1380,15 +1407,16 @@ def _acp_close_stale(keep_engine: str) -> int:
     return len(stale)
 
 
-def _list_models() -> dict:
-    """Return the live model catalog copilot exposes over ACP.
+def _list_models(engine: str | None = None) -> dict:
+    """Return the live model catalog the engine exposes over ACP.
 
-    We run a short one-shot `copilot --acp` handshake (initialize + session/new
-    with no MCP servers) and read models.availableModels + currentModelId — the
-    same source the interactive `/model` picker uses — so the web UI's model
-    lists never go stale. Cached by the caller. On any failure returns
-    {"error": ...} and the client keeps its built-in fallback list."""
-    eng = _engine()   # snapshot once: launch and parse must use the same engine
+    We run a short one-shot `<engine> acp` handshake (initialize + session/new
+    with no MCP servers) and parse its catalog — the same source the interactive
+    `/model` picker uses — so the web UI's model lists never go stale. Cached by
+    the caller. On any failure returns {"error": ...} and the client keeps its
+    built-in fallback list. `engine` is the caller's snapshot so the cache key
+    and the launched CLI never disagree across a concurrent switch (finding N4)."""
+    eng = ENGINES[engine] if engine else _engine()
     try:
         p = subprocess.Popen(eng["acp_argv"](_engine_bin(eng["name"])),
                              stdin=subprocess.PIPE,
@@ -1444,13 +1472,15 @@ def _list_models() -> dict:
 
 
 
-def _acp_oneshot():
-    """Spawn a short-lived `copilot --acp` and return (proc, send, pump) helpers
+def _acp_oneshot(engine: str | None = None):
+    """Spawn a short-lived `<engine> acp` and return (proc, send, pump) helpers
     for one-off queries (session/list, session/load). pump(target) reads lines
     until the response to request id `target` arrives, auto-answering any
     agent->client requests, and returns (result_obj, notifications) where
-    notifications is the list of session/update payloads seen meanwhile."""
-    p = subprocess.Popen(_acp_launch_argv(), stdin=subprocess.PIPE,
+    notifications is the list of session/update payloads seen meanwhile.
+    `engine` pins the launch to the caller's snapshot (finding N4)."""
+    argv = _engine_argv(engine) if engine else _acp_launch_argv()
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          text=True, bufsize=1)
     state = {"id": 0}
@@ -1490,16 +1520,18 @@ def _acp_oneshot():
     return p, send, pump
 
 
-def _list_sessions(cap: int = 200) -> dict:
+def _list_sessions(cap: int = 200, engine: str | None = None) -> dict:
     """Enumerate on-disk copilot sessions via ACP session/list (paginated).
 
     Returns every session copilot knows about — console, other tools, and ones
     hal-ui created — newest first, so the History tab can surface them. Cached by
-    the caller. On failure returns {"error": ...}."""
-    if not _engine().get("session_history", False):
+    the caller. On failure returns {"error": ...}. `engine` is the caller's
+    snapshot so gating, cache key, and launch stay consistent (finding N4)."""
+    eng = ENGINES[engine] if engine else _engine()
+    if not eng.get("session_history", False):
         return {"sessions": []}   # engine has no ACP session/list surface
     try:
-        p, send, pump = _acp_oneshot()
+        p, send, pump = _acp_oneshot(engine=eng["name"])
     except Exception as exc:
         return {"error": f"launch failed: {exc}"}
     try:
@@ -2121,12 +2153,16 @@ class Handler(BaseHTTPRequestHandler):
                 key = "sf_crs:" + ",".join(sorted(products))
                 self._json(200, cached(key, 30.0, lambda: _sf_crs(products)))
         elif p.path == "/api/models":
-            # Engine-qualified key so a switch reads a fresh catalog instead of a
-            # stale-engine value, and an in-flight old-engine producer can't
-            # repopulate the new engine's key (see review finding N4).
-            self._json(200, cached("models:" + _engine_name(), 600.0, _list_models))
+            # Snapshot the engine ONCE so the cache key and the producer's
+            # launch/parse agree even if a settings save lands mid-request; an
+            # in-flight old-engine producer can't repopulate the new key (N4).
+            eng = _engine_name()
+            self._json(200, cached("models:" + eng, 600.0,
+                                   lambda: _list_models(eng)))
         elif p.path == "/api/sessions":
-            self._json(200, cached("sessions:" + _engine_name(), 20.0, _list_sessions))
+            eng = _engine_name()
+            self._json(200, cached("sessions:" + eng, 20.0,
+                                   lambda: _list_sessions(engine=eng)))
         elif p.path == "/api/sessions/search":
             if not _engine().get("session_history", False):
                 self._json(200, {"sessions": []})
