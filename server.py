@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import concurrent.futures
 import json
 import os
@@ -263,6 +264,18 @@ DEFAULT_CONFIG = {
     "chat_fast": True,      # disable MCP servers in the chat lane for faster startup
     "chat_idle_timeout": 900,  # legacy lane: reap a copilot -p turn after this many
                                # seconds with zero output (wedged subprocess). 0 = off.
+    "acp_idle_timeout": 900,   # ACP fast lane: abort + reap a turn after this many
+                               # seconds with zero streamed output. 0 = off.
+    "acp_cancel_grace": 8,     # seconds to wait for a cancelled ACP turn to stop
+                               # before force-killing the wedged process. 0 = off.
+    "acp_reap_idle": 1800,     # background reaper: close an ACP process untouched
+                               # for this many seconds (abandoned session). 0 = off.
+    "chat_permission_mode": "auto",  # ACP permission policy: auto (accept offered
+                               # allow_once) | prompt (ask the browser each time).
+    "chat_permission_timeout": 120,  # seconds to wait for a browser permission
+                               # decision in prompt mode before cancelling (fail-safe).
+    "chat_cwd": "",            # server default working directory for new chat sessions
+                               # (validated; blank => user home).
     "sf_org": "",           # Salesforce target org username/alias; blank => auto-resolve
     "sf_products": "ActiveRolesServer,PasswordManager",  # default R&D queues for the CR tab
 }
@@ -337,7 +350,32 @@ def masked_config() -> dict:
     _e = _engine(cfg)
     out["session_history"] = bool(_e.get("session_history"))
     out["legacy_lane"] = bool(_e.get("legacy_lane"))
+    # Effective (validated) server default working directory for new chats, so
+    # the frontend can show it and offer a per-session override (R3).
+    out["chat_cwd"] = _validated_cwd(cfg.get("chat_cwd"))
+    out["chat_permission_mode"] = _permission_mode(cfg.get("chat_permission_mode"))
     return out
+
+
+def _validated_cwd(raw: str | None) -> str:
+    """Resolve a working directory to an existing absolute path, or fall back to
+    the user home. Guards against a hand-edited/crafted value pointing at a
+    missing path or a non-directory (R3): an invalid cwd would otherwise make the
+    engine's session/new fail on every turn."""
+    home = os.path.expanduser("~")
+    if not isinstance(raw, str) or not raw.strip():
+        return home
+    path = os.path.abspath(os.path.expanduser(raw.strip()))
+    try:
+        return path if os.path.isdir(path) else home
+    except Exception:
+        return home
+
+
+def _permission_mode(raw: str | None) -> str:
+    """The ACP permission policy, validated (R1). ``prompt`` surfaces each
+    permission request to the browser; anything else is the auto default."""
+    return "prompt" if isinstance(raw, str) and raw.strip().lower() == "prompt" else "auto"
 
 # Fixed namespace so a given browser session always maps to the same copilot
 # session UUID. Using a stable UUID (via --session-id) makes each turn an
@@ -1049,7 +1087,7 @@ def _mcp_server_names() -> list[str]:
 
 
 def _build_argv(prompt: str, session: str, model: str | None,
-                copilot_id: str | None = None) -> list[str]:
+                copilot_id: str | None = None, engine: str | None = None) -> list[str]:
     """Legacy per-turn spawn (used when chat_fast is OFF => full MCP available).
 
     Resumes by a stable per-session UUID via --session-id: copilot creates the
@@ -1060,9 +1098,12 @@ def _build_argv(prompt: str, session: str, model: str | None,
 
     When copilot_id is given (a session revived from disk in the History tab), we
     resume THAT real copilot session id directly so the conversation continues
-    with its full server-side context, instead of our uuid5-derived id."""
+    with its full server-side context, instead of our uuid5-derived id.
+
+    ``engine`` is the caller's snapshot (F1): the legacy argv must match the
+    engine the lane was chosen for, never a concurrently-switched one."""
     sid = copilot_id or _copilot_session_id(session)
-    e = _engine()
+    e = ENGINES[engine] if engine else _engine()
     return e["oneshot_argv"](_engine_bin(e["name"]), prompt, sid, model)
 
 
@@ -1078,6 +1119,26 @@ def _build_argv(prompt: str, session: str, model: str | None,
 #   agent->client session/request_permission -> auto-answer allow_once
 #   session/cancel{sessionId}     (notification) -> abort the running turn
 # ======================================================================
+def _classify_acp_error(err) -> tuple[str, str]:
+    """Map a JSON-RPC error from session/prompt to (kind, message) so the UI can
+    distinguish an authentication / model / provider / protocol failure (R2)."""
+    if isinstance(err, dict):
+        msg = str(err.get("message") or err.get("data") or "prompt failed")
+    else:
+        msg = str(err or "prompt failed")
+    low = msg.lower()
+    if any(k in low for k in ("auth", "unauthor", "token", "login", "credential", "api key")):
+        kind = "authentication"
+    elif any(k in low for k in ("model", "unknown model", "no such model")):
+        kind = "model"
+    elif any(k in low for k in ("provider", "upstream", "rate limit", "quota",
+                                 "overloaded", "server error", "503", "429")):
+        kind = "provider"
+    else:
+        kind = "protocol"
+    return kind, msg
+
+
 class AcpProc:
     BOOT_TIMEOUT = 90
 
@@ -1091,16 +1152,30 @@ class AcpProc:
         self.engine = engine or _engine_name()
         self.session_id: str | None = None
         self.dead = False
+        self.cwd = _validated_cwd(cwd) if cwd else os.path.expanduser("~")
+        # Per-session permission policy (R1): "auto" accepts an offered
+        # allow_once; "prompt" surfaces each request to the browser. Set by the
+        # caller from the chat request; independent of the agent's own mode.
+        self.perm_mode = "auto"
+        self.last_used = time.time()   # updated each turn; drives idle reaping (R4)
         self._id = 0
         self._io_lock = threading.Lock()          # guards stdin writes + id counter
         self._pending: dict[int, queue.Queue] = {}  # req id -> Queue for its response
         self._turn_lock = threading.Lock()        # one turn at a time per process
         self._event_q: queue.Queue | None = None  # active turn's notification sink
         self._event_lock = threading.Lock()
+        self._active_emit = None                  # active turn's emit (for R1 prompts)
+        self._perm_q: queue.Queue = queue.Queue() # browser permission decisions (R1)
+        self._awaiting_perm = False               # true while blocked on a browser decision
+        self._stderr_tail: collections.deque = collections.deque(maxlen=50)
         self.proc = subprocess.Popen(
             _engine_argv(self.engine), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, bufsize=1, cwd=os.path.expanduser("~"))
+            stderr=subprocess.PIPE, text=True, bufsize=1, cwd=self.cwd)
         threading.Thread(target=self._reader, daemon=True).start()
+        # Persistent stderr drainer (R4): a chatty engine (MCP logs/warnings) can
+        # fill the 64 KB stderr pipe, block the child on write(), and wedge stdout
+        # forever. Continuously drain it, keeping only a short tail for diagnostics.
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
         try:
             self._boot(model, load_id, cwd)
         except Exception:
@@ -1182,11 +1257,35 @@ class AcpProc:
                 if self._event_q is not None:
                     self._event_q.put({"sessionUpdate": "__dead__"})
 
+    def _drain_stderr(self):
+        """Continuously drain the child's stderr so it can never fill its pipe and
+        block the child on write() (R4). Keeps only a short rolling tail, used to
+        enrich error messages."""
+        try:
+            if self.proc.stderr is None:
+                return
+            for line in self.proc.stderr:
+                line = line.rstrip("\n")
+                if line:
+                    self._stderr_tail.append(line)
+        except Exception:
+            pass
+
+    def provide_permission(self, option_id: str | None):
+        """Deliver a browser permission decision (R1) to a turn blocked in
+        prompt mode. ``None``/unknown id => the request is cancelled (fail-safe)."""
+        self._perm_q.put(option_id)
+
     def _on_agent_request(self, obj: dict):
         method = obj.get("method", "")
         rid = obj["id"]
         if method == "session/request_permission":
             opts = obj.get("params", {}).get("options", []) or []
+            # R1: in prompt mode, surface the request to the browser and block
+            # (bounded) for an explicit decision instead of auto-selecting.
+            if getattr(self, "perm_mode", "auto") == "prompt" and self._active_emit:
+                self._prompt_permission(rid, opts)
+                return
             # Always prefer an exact allow_once (single-turn grant).
             pick = None
             for o in opts:
@@ -1215,6 +1314,44 @@ class AcpProc:
             # unknown agent->client request: answer empty so the agent never blocks
             self._write({"jsonrpc": "2.0", "id": rid, "result": {}})
 
+    def _prompt_permission(self, rid, opts: list):
+        """Ask the browser to resolve a permission request (R1). Runs on the
+        reader thread; the agent is blocked awaiting our response, so blocking
+        here (bounded) is safe. On timeout or an unknown reply we cancel."""
+        valid = {o.get("optionId") for o in opts if o.get("optionId")}
+        # Drop any stale decision from an earlier request.
+        try:
+            while True:
+                self._perm_q.get_nowait()
+        except queue.Empty:
+            pass
+        self._awaiting_perm = True
+        try:
+            self._active_emit("permission", {
+                "id": str(rid),
+                "options": [{"optionId": o.get("optionId"),
+                             "name": o.get("name") or o.get("optionId"),
+                             "kind": o.get("kind")} for o in opts],
+            })
+            try:
+                timeout = float(load_config().get("chat_permission_timeout", 120) or 0) or None
+            except (TypeError, ValueError):
+                timeout = 120.0
+            try:
+                chosen = self._perm_q.get(timeout=timeout)
+            except queue.Empty:
+                chosen = None
+        finally:
+            self._awaiting_perm = False
+        if chosen in valid:
+            result = {"outcome": {"outcome": "selected", "optionId": chosen}}
+        else:
+            chosen = None
+            result = {"outcome": {"outcome": "cancelled"}}
+        if self._active_emit:
+            self._active_emit("permission_resolved", {"id": str(rid), "optionId": chosen})
+        self._write({"jsonrpc": "2.0", "id": rid, "result": result})
+
     # --- lifecycle ----------------------------------------------------
     def _boot(self, model: str | None, load_id: str | None = None,
               cwd: str | None = None):
@@ -1222,7 +1359,7 @@ class AcpProc:
             "protocolVersion": 1,
             "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
         }, timeout=self.BOOT_TIMEOUT)
-        wd = cwd or os.path.expanduser("~")
+        wd = self.cwd
         if load_id:
             # Resume an existing on-disk session (revived from the History tab).
             # session/load replays the full history as session/update notifications
@@ -1263,20 +1400,62 @@ class AcpProc:
                 self._notify("session/cancel", {"sessionId": self.session_id})
             except Exception:
                 pass
+        # Unblock a turn parked on a browser permission decision so it can wind
+        # down instead of hanging until the permission timeout (R1/R4).
+        if getattr(self, "_awaiting_perm", False):
+            try:
+                self._perm_q.put(None)
+            except Exception:
+                pass
+
+    def kill(self):
+        """Bounded terminate -> wait -> kill -> wait, then close pipes (F2/R4).
+        Idempotent; used by close() and by the wedged-turn force path."""
+        self.dead = True
+        p = self.proc
+        try:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    try:
+                        p.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+        except Exception:
+            pass
+        for stream in (p.stdin, p.stdout, p.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
 
     def close(self):
+        """Fully tear down the process (F2). Previously this only sent
+        terminate() with no wait/kill, so an engine that ignored SIGTERM stayed
+        alive indefinitely after being dropped from tracking. Now we cancel the
+        turn, unblock any permission wait, then reap the process and close its
+        pipes."""
         try:
             self.cancel()
         except Exception:
             pass
-        try:
-            if self.proc.poll() is None:
-                self.proc.terminate()
-        except Exception:
-            pass
+        self.kill()
 
     def prompt(self, text: str, emit, images: list | None = None):
-        """Run one turn; translate ACP session/update stream to the SSE contract."""
+        """Run one turn; translate ACP session/update stream to the SSE contract.
+
+        Robustness:
+          * R2 — the final session/prompt response is inspected, not discarded:
+            a JSON-RPC error emits an ``error`` + ``done`` code 1 (classified as
+            auth/model/provider/protocol) while still preserving partial streamed
+            text; a ``cancelled`` stopReason is reported as a cancel, not code 0.
+          * R4 — an idle turn (no streamed output for ``acp_idle_timeout``) is
+            force-killed and reported instead of hanging the session forever.
+        """
         if self.dead or not self.session_id:
             emit("error", {"message": "acp session unavailable"})
             emit("done", {"code": 1})
@@ -1289,7 +1468,13 @@ class AcpProc:
                            "data": im.get("data", "")})
         if not blocks:
             blocks = [{"type": "text", "text": text}]
+        try:
+            idle_timeout = float(load_config().get("acp_idle_timeout", 900) or 0)
+        except (TypeError, ValueError):
+            idle_timeout = 900.0
         with self._turn_lock:
+            self.last_used = time.time()
+            self._active_emit = emit
             q: queue.Queue = queue.Queue()
             with self._event_lock:
                 self._event_q = q
@@ -1298,12 +1483,47 @@ class AcpProc:
             self._pending[rid] = resp_q
             full = []
             tools: list[str] = []
+            resp = None
+            failed = None          # (kind, message) for a JSON-RPC failure
+            wedged = False
+            last_activity = time.monotonic()
+
+            def _apply(upd) -> bool:
+                """Handle one session/update. Returns False if the stream is
+                dead (agent exited) and the turn must stop."""
+                su = upd.get("sessionUpdate")
+                if su == "__dead__":
+                    emit("error", {"message": "acp process exited"})
+                    return False
+                if su == "agent_message_chunk":
+                    t = (upd.get("content") or {}).get("text", "")
+                    if t:
+                        full.append(t)
+                        emit("delta", {"text": t})
+                elif su == "agent_thought_chunk":
+                    emit("thinking", {})
+                elif su == "tool_call":
+                    name = upd.get("title") or upd.get("kind") or "tool"
+                    if name not in tools:
+                        tools.append(name)
+                    emit("tool", {"type": "tool_call", "name": name})
+                # tool_call_update / usage_update / config_option_update: ignored
+                return True
+
             try:
                 self._write({"jsonrpc": "2.0", "id": rid, "method": "session/prompt",
                              "params": {"sessionId": self.session_id, "prompt": blocks}})
                 while True:
                     try:
-                        resp_q.get_nowait()
+                        resp = resp_q.get_nowait()
+                        # The response can race ahead of trailing session/update
+                        # notifications the reader already queued. Drain them so
+                        # partial (and final) streamed text is never lost (R2).
+                        while True:
+                            try:
+                                _apply(q.get_nowait())
+                            except queue.Empty:
+                                break
                         break
                     except queue.Empty:
                         pass
@@ -1313,31 +1533,53 @@ class AcpProc:
                         if self.dead:
                             emit("error", {"message": "acp process exited"})
                             break
+                        # R4 idle-timeout: a wedged turn produces no updates and
+                        # never returns a response. Don't count time spent parked
+                        # on a browser permission decision (R1).
+                        if (idle_timeout and not self._awaiting_perm
+                                and time.monotonic() - last_activity >= idle_timeout):
+                            wedged = True
+                            emit("error", {"message":
+                                 f"acp turn idle >{int(idle_timeout)}s — aborted"})
+                            try:
+                                self.cancel()
+                            except Exception:
+                                pass
+                            break
                         continue
-                    su = upd.get("sessionUpdate")
-                    if su == "__dead__":
-                        emit("error", {"message": "acp process exited"})
+                    last_activity = time.monotonic()
+                    if not _apply(upd):
                         break
-                    if su == "agent_message_chunk":
-                        t = (upd.get("content") or {}).get("text", "")
-                        if t:
-                            full.append(t)
-                            emit("delta", {"text": t})
-                    elif su == "agent_thought_chunk":
-                        emit("thinking", {})
-                    elif su == "tool_call":
-                        name = upd.get("title") or upd.get("kind") or "tool"
-                        if name not in tools:
-                            tools.append(name)
-                        emit("tool", {"type": "tool_call", "name": name})
-                    # tool_call_update / usage_update / config_option_update: ignored
             finally:
                 self._pending.pop(rid, None)
                 with self._event_lock:
                     self._event_q = None
+                self._active_emit = None
+            # R2: inspect the session/prompt outcome instead of assuming success.
+            stop_reason = None
+            if isinstance(resp, dict):
+                if "error" in resp:
+                    err = resp.get("error") or {}
+                    kind, msg = _classify_acp_error(err)
+                    failed = (kind, msg)
+                else:
+                    stop_reason = (resp.get("result") or {}).get("stopReason")
+            # Always surface whatever text streamed so far (partial on failure).
             emit("message", {"text": "".join(full), "model": self.model, "tools": tools})
-            emit("idle", {})
-            emit("done", {"code": 0})
+            if wedged:
+                # Force-terminate the unresponsive process so a reused session
+                # rebuilds a clean one (R4). Pool eviction happens in the caller.
+                self.kill()
+                emit("done", {"code": 1, "reason": "idle_timeout"})
+            elif failed is not None:
+                kind, msg = failed
+                emit("error", {"message": f"{kind} error: {msg}", "kind": kind})
+                emit("done", {"code": 1, "reason": kind})
+            elif stop_reason == "cancelled":
+                emit("done", {"code": 0, "reason": "cancelled"})
+            else:
+                emit("idle", {})
+                emit("done", {"code": 0, "reason": stop_reason or "end_turn"})
 
 
 _acp_procs: dict[str, AcpProc] = {}
@@ -1345,16 +1587,26 @@ _acp_lock = threading.Lock()
 
 
 def _acp_get(session: str, model: str | None,
-             load_id: str | None = None, cwd: str | None = None) -> AcpProc:
-    cur = _engine_name()
+             load_id: str | None = None, cwd: str | None = None,
+             engine: str | None = None, perm_mode: str | None = None) -> AcpProc:
+    # Use the caller's engine snapshot (F1) so a settings save landing mid-turn
+    # can't launch/tag this proc under a different engine than the lane the turn
+    # was planned for. Falls back to the live engine only when no snapshot given.
+    cur = engine or _engine_name()
+    want_cwd = _validated_cwd(cwd) if cwd else None
     with _acp_lock:
         p = _acp_procs.get(session)
-        # Reuse only a live proc that still matches the active engine — a proc
-        # launched under a since-changed engine must be torn down and rebuilt so
-        # the session doesn't keep talking to the old CLI binary.
+        # Reuse only a live proc that still matches the active engine AND the
+        # requested working directory — a proc launched under a since-changed
+        # engine or a different cwd must be torn down and rebuilt so the session
+        # doesn't keep talking to the old CLI binary / wrong directory.
         if p is not None and not p.dead and p.proc.poll() is None \
-                and getattr(p, "engine", cur) == cur:
+                and getattr(p, "engine", cur) == cur \
+                and (want_cwd is None or getattr(p, "cwd", None) == want_cwd):
+            if perm_mode is not None:
+                p.perm_mode = perm_mode
             p.set_model(model)
+            p.last_used = time.time()
             return p
         if p is not None:
             try:
@@ -1362,6 +1614,8 @@ def _acp_get(session: str, model: str | None,
             except Exception:
                 pass
         p = AcpProc(model, load_id=load_id, cwd=cwd, engine=cur)
+        if perm_mode is not None:
+            p.perm_mode = perm_mode
         _acp_procs[session] = p
         return p
 
@@ -1373,6 +1627,17 @@ def _acp_stop(session: str):
         p.cancel()
 
 
+def _acp_provide_permission(session: str, option_id: str | None) -> bool:
+    """Route a browser permission decision (R1) to the session's ACP proc.
+    Returns False if there is no live proc to receive it."""
+    with _acp_lock:
+        p = _acp_procs.get(session)
+    if p is None or p.dead:
+        return False
+    p.provide_permission(option_id)
+    return True
+
+
 def _acp_close(session: str):
     with _acp_lock:
         p = _acp_procs.pop(session, None)
@@ -1380,6 +1645,42 @@ def _acp_close(session: str):
         _live_turns.pop(session, None)
     if p is not None:
         p.close()
+
+
+def _acp_reap_idle() -> int:
+    """Close ACP processes that no session has touched for ``acp_reap_idle``
+    seconds (R4): a browser can walk away leaving a live engine + its threads
+    parked forever. Skips procs with a turn in flight. Returns the count closed."""
+    try:
+        ttl = float(load_config().get("acp_reap_idle", 1800) or 0)
+    except (TypeError, ValueError):
+        ttl = 1800.0
+    if ttl <= 0:
+        return 0
+    now = time.time()
+    with _live_lock:
+        busy = {s for s, lt in _live_turns.items() if lt is not None and not lt.done}
+    with _acp_lock:
+        idle = [(s, p) for s, p in _acp_procs.items()
+                if s not in busy and now - getattr(p, "last_used", now) > ttl]
+        for s, _ in idle:
+            _acp_procs.pop(s, None)
+    for _, p in idle:
+        try:
+            p.close()
+        except Exception:
+            pass
+    return len(idle)
+
+
+def _acp_reaper_loop():
+    """Background daemon: periodically reap abandoned ACP processes (R4)."""
+    while True:
+        time.sleep(60)
+        try:
+            _acp_reap_idle()
+        except Exception:
+            pass
 
 
 def _acp_close_stale(keep_engine: str) -> int:
@@ -1623,7 +1924,8 @@ def _search_sessions(query: str, cap: int = 100) -> dict:
     if not q:
         return {"sessions": []}
     ql = q.lower()
-    meta = cached("sessions:" + _engine_name(), 20.0, _list_sessions)
+    eng = _engine_name()
+    meta = cached("sessions:" + eng, 20.0, lambda: _list_sessions(engine=eng))
     if isinstance(meta, dict) and meta.get("error"):
         return {"error": meta["error"]}
     out = []
@@ -1787,12 +2089,17 @@ _live_lock = threading.Lock()
 
 
 def _run_acp_turn(session, model, prompt, images, lt: LiveTurn,
-                  copilot_id=None, copilot_cwd=None):
+                  copilot_id=None, copilot_cwd=None, engine=None,
+                  perm_mode=None, cwd=None):
     """Fast lane: run one turn on the persistent ACP process, buffering events.
     When copilot_id is set (a revived on-disk session) the process boots by
-    session/load-ing that id so the turn continues its real context."""
+    session/load-ing that id so the turn continues its real context.
+
+    ``engine``/``cwd``/``perm_mode`` are the caller's snapshot (F1/R1/R3) so the
+    proc launched/reused matches the lane the turn was planned for."""
     try:
-        acp = _acp_get(session, model, load_id=copilot_id, cwd=copilot_cwd)
+        acp = _acp_get(session, model, load_id=copilot_id,
+                       cwd=copilot_cwd or cwd, engine=engine, perm_mode=perm_mode)
     except Exception as exc:
         lt.append("error", {"message": f"acp launch failed: {exc}"})
         lt.append("done", {"code": 1})
@@ -1803,9 +2110,17 @@ def _run_acp_turn(session, model, prompt, images, lt: LiveTurn,
     except Exception as exc:
         lt.append("error", {"message": str(exc)})
         lt.append("done", {"code": 1})
+    finally:
+        # R4: a wedged/dead proc is evicted from the pool so the next turn on
+        # this session rebuilds a clean one instead of reusing a corpse.
+        if acp.dead:
+            with _acp_lock:
+                if _acp_procs.get(session) is acp:
+                    _acp_procs.pop(session, None)
 
 
-def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
+def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None,
+                         engine=None, cwd=None):
     """Legacy lane (chat_fast OFF => full MCP): spawn `copilot -p ...` per turn,
     parse its JSONL, buffer events. Survives browser close because it runs in the
     turn worker thread, not the HTTP request.
@@ -1819,10 +2134,10 @@ def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
         seconds the subprocess is killed and the turn is closed, so the browser
         stops waiting and queued messages can drain."""
     emit = lt.append
-    argv = _build_argv(prompt, session, model, copilot_id=copilot_id)
+    argv = _build_argv(prompt, session, model, copilot_id=copilot_id, engine=engine)
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                cwd=os.path.expanduser("~"), text=True, bufsize=1)
+                                cwd=_validated_cwd(cwd), text=True, bufsize=1)
     except Exception as exc:
         emit("error", {"message": f"launch failed: {exc}"})
         emit("done", {})
@@ -1917,7 +2232,8 @@ def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
 
 
 def _start_turn(session: str, model: str | None, prompt: str, images: list,
-                copilot_id: str | None = None, copilot_cwd: str | None = None) -> LiveTurn:
+                copilot_id: str | None = None, copilot_cwd: str | None = None,
+                cwd: str | None = None, perm_mode: str | None = None) -> LiveTurn:
     """Begin a turn in a background worker thread that buffers its SSE events into
     a LiveTurn. Returns the buffer immediately so the HTTP request can relay it.
     Because the turn runs off-thread, a browser close does not end it — a reopened
@@ -1940,20 +2256,33 @@ def _start_turn(session: str, model: str | None, prompt: str, images: list,
         if prev is not None and not prev.done:
             return prev
         _live_turns[session] = lt
+    # F1: snapshot the engine ONCE and derive the lane from that same snapshot,
+    # then thread it through the worker. Previously `fast` was computed from the
+    # live engine while the worker re-resolved it later, so a settings save
+    # landing between could run the ACP lane's `fast` flag against the other
+    # engine's argv (e.g. parse `opencode run` output as Copilot JSONL).
+    cfg = load_config()
+    eng_name = _engine_name(cfg)
+    eng = ENGINES[eng_name]
+    eff_cwd = cwd if cwd else _validated_cwd(cfg.get("chat_cwd"))
+    eff_perm = perm_mode if perm_mode is not None else _permission_mode(cfg.get("chat_permission_mode"))
     # Engines without a legacy per-turn parser (e.g. opencode) always take the
     # ACP lane — their `run` stream schema isn't the Copilot JSONL that
     # _run_subprocess_turn expects.
-    fast = (bool(load_config().get("chat_fast", True)) or bool(images)
-            or not _engine().get("legacy_lane", True))
-    lt.append("start", {"session": session, "acp": fast, "turn": turn_id})
+    fast = (bool(cfg.get("chat_fast", True)) or bool(images)
+            or not eng.get("legacy_lane", True))
+    lt.append("start", {"session": session, "acp": fast, "turn": turn_id,
+                        "engine": eng_name, "cwd": eff_cwd})
 
     def worker():
         try:
             if fast:
                 _run_acp_turn(session, model, prompt, images, lt,
-                              copilot_id=copilot_id, copilot_cwd=copilot_cwd)
+                              copilot_id=copilot_id, copilot_cwd=copilot_cwd,
+                              engine=eng_name, perm_mode=eff_perm, cwd=eff_cwd)
             else:
-                _run_subprocess_turn(session, model, prompt, lt, copilot_id=copilot_id)
+                _run_subprocess_turn(session, model, prompt, lt,
+                                     copilot_id=copilot_id, engine=eng_name, cwd=eff_cwd)
         finally:
             lt.finish()
 
@@ -1963,7 +2292,11 @@ def _start_turn(session: str, model: str | None, prompt: str, images: list,
 
 def _turn_stop(session: str):
     """Stop the in-flight turn for a session (Stop button): cancel the ACP prompt
-    or kill the subprocess, and also cancel the persistent ACP session."""
+    or kill the subprocess, and also cancel the persistent ACP session.
+
+    Bounded cancellation (R4): after signalling cancel we give the turn a short
+    grace period to settle; if it doesn't, we force-terminate the ACP process and
+    evict it from the pool so a wedged agent can't hold the session hostage."""
     with _live_lock:
         lt = _live_turns.get(session)
     if lt is not None and lt.canceller is not None:
@@ -1972,6 +2305,31 @@ def _turn_stop(session: str):
         except Exception:
             pass
     _acp_stop(session)
+    try:
+        grace = float(load_config().get("acp_cancel_grace", 8) or 0)
+    except (TypeError, ValueError):
+        grace = 8.0
+    if grace <= 0:
+        return
+
+    def _watch():
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            with _live_lock:
+                cur = _live_turns.get(session)
+            if cur is None or cur.done:
+                return
+            time.sleep(0.2)
+        # Still running after the grace window: force-kill + evict the ACP proc.
+        with _acp_lock:
+            p = _acp_procs.pop(session, None)
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    threading.Thread(target=_watch, name=f"cancel-{session}", daemon=True).start()
 
 
 # --- image attachment store (paste-to-chat) ---------------------------
@@ -2086,6 +2444,12 @@ class Handler(BaseHTTPRequestHandler):
         images = _attach_take(attach_ids) if attach_ids else []
         copilot_id = (qs.get("copilot", [""])[0]).strip() or None
         copilot_cwd = (qs.get("cwd", [""])[0]).strip() or None
+        # R3: per-session working directory override (distinct from `cwd`, which
+        # is the on-disk cwd of a revived Copilot session). R1: per-session
+        # permission policy override. Both fall back to the server defaults.
+        wd = (qs.get("wd", [""])[0]).strip() or None
+        perm = (qs.get("perm", [""])[0]).strip() or None
+        perm_mode = _permission_mode(perm) if perm else None
         if not prompt and not images:
             self.send_error(400, "missing prompt")
             return
@@ -2099,7 +2463,8 @@ class Handler(BaseHTTPRequestHandler):
         # DO NOT cancel — the worker keeps running and a reopened tab reattaches via
         # /api/chat/resume. Lane (ACP vs subprocess) is chosen inside _start_turn.
         lt = _start_turn(session, model, prompt, images,
-                         copilot_id=copilot_id, copilot_cwd=copilot_cwd)
+                         copilot_id=copilot_id, copilot_cwd=copilot_cwd,
+                         cwd=wd, perm_mode=perm_mode)
         self._relay_live(lt, 0)
 
     # --- routing -------------------------------------------------------
@@ -2117,6 +2482,14 @@ class Handler(BaseHTTPRequestHandler):
             session = (parse_qs(p.query).get("session", [""])[0] or "").strip()
             _acp_close(session)
             self._json(200, {"closed": bool(session)})
+        elif p.path == "/api/chat/permission":
+            # R1: deliver a browser permission decision to a turn parked in
+            # prompt mode. `option` blank/absent => cancel (fail-safe).
+            qp = parse_qs(p.query)
+            session = (qp.get("session", [""])[0] or "").strip()
+            option = (qp.get("option", [""])[0] or "").strip() or None
+            ok = _acp_provide_permission(session, option) if session else False
+            self._json(200, {"delivered": ok})
         elif p.path == "/api/hive/status":
             if not _hive_enabled():
                 self._json(404, {"error": "hive disabled"})
@@ -2243,6 +2616,17 @@ class Handler(BaseHTTPRequestHandler):
                                         ENGINES[name.lower()]["bin_fallbacks"]):
                         self._json(400, {"error": f"{name} binary not found (install it or check PATH)"})
                         return
+            # R3: reject a working directory that isn't an existing directory so
+            # the user learns at save time instead of every turn failing later.
+            if patch.get("chat_cwd"):
+                cw = patch["chat_cwd"]
+                if not isinstance(cw, str) or not os.path.isdir(
+                        os.path.abspath(os.path.expanduser(cw.strip()))):
+                    self._json(400, {"error": f"working directory not found: {cw!r}"})
+                    return
+            # R1: normalise the permission mode to the known vocabulary.
+            if "chat_permission_mode" in patch:
+                patch["chat_permission_mode"] = _permission_mode(patch.get("chat_permission_mode"))
             save_config(patch)
             # settings that affect ADO identity/token invalidate caches
             with _cache_lock:
@@ -2272,6 +2656,8 @@ def main():
         raise SystemExit(f"{eng['label']} binary not found "
                          f"(tried {eng['bin_names']} + {eng['bin_fallbacks']})")
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    # R4: background reaper for abandoned ACP processes.
+    threading.Thread(target=_acp_reaper_loop, name="acp-reaper", daemon=True).start()
     tok = "ok" if _hive_token() else "MISSING"
     print(f"HAL-UI Phase 2 on http://{args.host}:{args.port}/  "
           f"(engine={eng['label']} bin={bin_path}, hive={_hive_url()} token={tok})")

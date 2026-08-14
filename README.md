@@ -26,12 +26,14 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   via `az` + ADO REST.
 - **Open-as-session** — any ADO/GitHub item spawns a context-pinned chat session
   ("this is what we'll discuss") without dumping boilerplate in the composer.
-- **Settings pane** — wire ADO org/PAT/UPN, Hive URL/token, default model, and the
-  `chat_fast` toggle. Stored server-side at `~/.config/hal-ui/config.json` (0600).
+- **Settings pane** — wire ADO org/PAT/UPN, Hive URL/token, default model, the
+  `chat_fast` toggle, the default working directory, and the tool-permission
+  policy. Stored server-side at `~/.config/hal-ui/config.json` (0600).
 - **Persistent ACP chat lane** — with `chat_fast` on, each session runs one
   long-lived `copilot --acp` process (Agent Client Protocol over stdio). The CLI
   boots once; later turns skip startup entirely (cold ~10s → warm ~2-3s to first
-  token). Tool-permission requests are auto-approved (`allow_once`).
+  token). Tool-permission requests are auto-approved (`allow_once`) by default,
+  or surfaced to the browser for an explicit decision in **prompt** mode.
 - **Rich markdown rendering** — HAL responses render as formatted HTML (GitHub
   tables, headings, bold/italic, inline + fenced code, lists, blockquotes, links)
   via a small zero-dependency, XSS-safe renderer. The copy button puts **rich
@@ -44,6 +46,19 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   in-flight turn instantly; queued messages are cleared.
 - **Fast chat toggle** — `chat_fast` ON = ACP persistent lane (fast, no MCP);
   OFF = legacy per-turn spawn with full MCP servers available mid-chat.
+- **Per-chat working directory & permissions** — each chat can override the
+  server-default working directory (validated; blank = home) and the
+  tool-permission policy (auto-accept vs ask-me-each-time) from a toolbar above
+  the composer. Both are shown live, retained with browser-archived sessions,
+  and passed through the engine-snapshot lane so a mid-turn settings change can
+  never mismatch the running turn.
+- **Turn lifecycle hardening** — the ACP `session/prompt` response is inspected
+  (auth / model / provider / protocol errors surface with a nonzero exit and
+  partial text preserved, cancellation is distinguished from failure); an idle
+  turn is force-aborted after `acp_idle_timeout`; a cancelled-but-wedged process
+  is force-killed after `acp_cancel_grace` and evicted; abandoned ACP processes
+  are reaped after `acp_reap_idle`; stderr is drained continuously so a chatty
+  engine can't deadlock on a full pipe.
 - **Pluggable engine** — the `engine` setting picks which coding-agent CLI backs
   chat: `copilot` (default) or `opencode`. Both speak the **same ACP** (Zed Agent
   Client Protocol) over stdio, so the fast lane is engine-agnostic — only the
@@ -75,7 +90,10 @@ server.py (Python stdlib http.server, threaded)
 - Chat, fast lane (`chat_fast` on): persistent ACP process per session
   (`<engine> acp` — JSON-RPC over stdio: `initialize` → `session/new` →
   `session/prompt`, streamed `session/update` → SSE). `session/cancel` powers
-  Stop; permission requests auto-answered `allow_once`.
+  Stop (bounded, escalating to force-kill); permission requests are auto-answered
+  `allow_once` or routed to the browser (`/api/chat/permission`) in prompt mode.
+  The engine, working directory, and permission mode are snapshotted per turn so
+  a concurrent settings change can't cross lanes.
 - Chat, legacy lane (`chat_fast` off, Copilot only): per-turn
   `copilot -p … --output-format json` spawn with full MCP servers.
 - Data: `gh` CLI (TTL-cached), `az account get-access-token` → ADO REST, Hive REST.

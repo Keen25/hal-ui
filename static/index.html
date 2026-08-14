@@ -282,7 +282,21 @@
     <div class="sesstrip" id="sesstrip"></div>
     <div id="log"></div>
     <div id="pending"></div>
+    <div id="perm-bar" style="display:none;margin:6px 0;padding:8px 10px;border:1px solid var(--accent,#7aa2f7);border-radius:8px;background:rgba(122,162,247,.08)">
+      <div id="perm-text" style="font-size:12px;margin-bottom:6px">HAL is requesting permission.</div>
+      <div id="perm-opts" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+    </div>
     <div id="attstrip"></div>
+    <div class="chatbar" id="chatbar" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:4px 0;font-size:12px">
+      <label class="muted" style="display:flex;gap:5px;align-items:center">dir
+        <input id="chat-wd" placeholder="(default)" title="Working directory for this chat's turns" style="width:220px;font-size:12px;padding:3px 6px" /></label>
+      <label class="muted" style="display:flex;gap:5px;align-items:center">permissions
+        <select id="chat-perm" title="Tool-permission policy for this chat" style="font-size:12px;padding:3px 6px">
+          <option value="auto">auto-accept</option>
+          <option value="prompt">ask me</option>
+        </select></label>
+      <span id="chat-wd-active" class="muted" style="font-size:11px"></span>
+    </div>
     <div class="hint">Enter to send · Shift+Enter for newline · paste an image to attach it · messages sent while HAL is working are queued and sent in order</div>
     <form class="chat" id="f">
       <select id="model" title="Model for this session">
@@ -453,6 +467,11 @@
         <span class="muted" style="font-size:11px">Coding-agent CLI backing chat. opencode uses the shared ACP lane (fast chat only); Copilot supports both lanes and session history.</span>
         <label class="muted">Fast chat</label>
         <label class="row2" style="gap:8px;cursor:pointer"><input id="s-chat_fast" type="checkbox" style="width:auto" /> <span class="muted">Disable MCP servers in chat for faster startup (~5-7s/msg). Turn off if you need MCP tools mid-chat.</span></label>
+        <label class="muted">Working directory</label>
+        <input id="s-chat_cwd" placeholder="blank = home (~). New chats run here." />
+        <label class="muted">Tool permissions</label>
+        <select id="s-chat_permission_mode"><option value="auto">Auto-accept offered permissions</option><option value="prompt">Ask me each time</option></select>
+        <span class="muted" style="font-size:11px">Default policy for new chats. Per-chat toggle lives in the chat toolbar.</span>
         <div class="row2"><span class="grow"></span><button type="submit">Save settings</button></div>
         <div id="set-msg"></div>
       </form>
@@ -674,6 +693,7 @@
     state.history ||= {};
     state.history[sid] = { label: s.label, model: s.model || "",
       copilotId: s.copilotId || "", copilotCwd: s.copilotCwd || "",
+      wd: s.wd || "", permMode: s.permMode || "",
       messages: s.messages.slice(-120), closedAt: Date.now() };
     // evict oldest beyond the cap
     const ids = Object.keys(state.history).sort((a,b)=>(state.history[b].closedAt||0)-(state.history[a].closedAt||0));
@@ -698,6 +718,8 @@
     const nsid = state.sessions[sid] ? newSid() : sid;    // avoid colliding with a live session id
     state.sessions[nsid] = { label: h.label, model: h.model || "", messages: h.messages || [] };
     if (h.copilotId) { state.sessions[nsid].copilotId = h.copilotId; state.sessions[nsid].copilotCwd = h.copilotCwd || ""; }
+    if (h.wd) state.sessions[nsid].wd = h.wd;
+    if (h.permMode) state.sessions[nsid].permMode = h.permMode;
     state.order.push(nsid); state.active = nsid;
     delete state.history[sid];
     save();
@@ -868,7 +890,18 @@
   }
   function onHistInput() { renderHistory(); scheduleDiskSearch(); }
   $("#hist-q").addEventListener("input", onHistInput);
-  function syncModel() { $("#model").value = cur().model || ""; }
+  function syncModel() {
+    $("#model").value = cur().model || "";
+    const s = cur() || {};
+    const d = window.__chatDefaults || {cwd:"", perm:"auto"};
+    $("#chat-wd").value = s.wd || "";
+    $("#chat-wd").placeholder = d.cwd ? d.cwd : "(default: ~)";
+    $("#chat-perm").value = s.permMode || d.perm || "auto";
+    $("#chat-wd-active").textContent = "";
+    renderPermBar();
+  }
+  $("#chat-wd").addEventListener("change", () => { const c=cur(); if(c){ c.wd=$("#chat-wd").value.trim(); save(); } });
+  $("#chat-perm").addEventListener("change", () => { const c=cur(); if(c){ c.permMode=$("#chat-perm").value; save(); } });
 
   // Populate the three model <select>s from the live catalog (/api/models),
   // so they mirror the console's picker instead of a hard-coded list. Falls
@@ -994,6 +1027,7 @@
 
   const pendingQ = {};  // sid -> [{text, atts},...] messages waiting for the current turn to finish
   const pendingAtt = {}; // sid -> [{mime, data, dataUrl},...] images pasted into the composer
+  const pendingPerms = {}; // sid -> {id, options:[{optionId,name,kind}]} R1 permission prompt
 
   // Downscale an image dataURL to a small thumbnail (bounded longest edge, JPEG).
   // Used so the *persisted* transcript never carries multi-MB base64 blobs — those
@@ -1105,6 +1139,8 @@
     const ids = await uploadAtts(atts);  // stage images server-side, reference by id
     let url = `/api/chat?session=${encodeURIComponent(sid)}&model=${encodeURIComponent(s.model||"")}&prompt=${encodeURIComponent(sendText)}`;
     if (ids.length) url += `&attach=${encodeURIComponent(ids.join(","))}`;
+    if (s.wd) url += `&wd=${encodeURIComponent(s.wd)}`;
+    if (s.permMode) url += `&perm=${encodeURIComponent(s.permMode)}`;
     if (s.copilotId) {                                 // revived on-disk session: resume its real copilot session
       url += `&copilot=${encodeURIComponent(s.copilotId)}`;
       if (s.copilotCwd) url += `&cwd=${encodeURIComponent(s.copilotCwd)}`;
@@ -1134,13 +1170,33 @@
     // old partial text before deltas rebuild it. (A stale resume sends no `start`,
     // so the previously-shown text is preserved.)
     source.addEventListener("start",(ev)=>{
-      try{ const d=JSON.parse(ev.data); if(d.turn){ s.pendingTurn = d.turn; save(); } }catch(e){}
+      try{ const d=JSON.parse(ev.data); if(d.turn){ s.pendingTurn = d.turn; save(); }
+        if(sid===state.active && d.cwd){ $("#chat-wd-active").textContent = "↳ "+d.cwd; } }catch(e){}
       if (resumed && !bot._reset){ bot._reset = true; bot.text = ""; liveUpdate(sid); }
     });
     source.addEventListener("delta",(ev)=>{ bot.text += JSON.parse(ev.data).text; liveUpdate(sid); });
     source.addEventListener("message",(ev)=>{ const d=JSON.parse(ev.data); if(d.text) bot.text=d.text; if(d.tools&&d.tools.length) bot.tools=d.tools; liveUpdate(sid); });
-    source.addEventListener("done",(ev)=>{ const d=JSON.parse(ev.data||"{}"); if(d.code&&d.code!==0&&d.stderr&&!bot.text) bot.text="[exit "+d.code+": "+d.stderr+"]"; finish(); });
+    source.addEventListener("permission",(ev)=>{ try{ const d=JSON.parse(ev.data); pendingPerms[sid]={id:d.id,options:d.options||[]}; if(sid===state.active) renderPermBar(); }catch(e){} });
+    source.addEventListener("permission_resolved",(ev)=>{ delete pendingPerms[sid]; if(sid===state.active) renderPermBar(); });
+    source.addEventListener("done",(ev)=>{ const d=JSON.parse(ev.data||"{}"); delete pendingPerms[sid]; if(sid===state.active) renderPermBar();
+      if(d.code&&d.code!==0){ if(!bot.text){ bot.text = d.stderr ? "[exit "+d.code+": "+d.stderr+"]" : "[failed"+(d.reason?" — "+d.reason:"")+"]"; } else if(d.reason){ bot.text += "\n\n_["+d.reason+"]_"; } }
+      finish(); });
     source.addEventListener("error",()=>{ if(!bot.text) bot.text="[stream error — is server.py running?]"; finish(); });
+  }
+
+  // R1: interactive permission prompt bar for the active session.
+  function renderPermBar(){
+    const bar=$("#perm-bar"), sid=state.active, pp=pendingPerms[sid];
+    if(!bar) return;
+    if(!pp){ bar.style.display="none"; $("#perm-opts").innerHTML=""; return; }
+    bar.style.display="block";
+    const opts=(pp.options||[]).map(o=>`<button type="button" class="ghost" data-opt="${esc(o.optionId)}">${esc(o.name||o.optionId)}</button>`).join("");
+    $("#perm-opts").innerHTML=opts+`<button type="button" class="ghost" data-opt="">Deny</button>`;
+    $("#perm-opts").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>decidePermission(sid,b.dataset.opt)));
+  }
+  function decidePermission(sid,optionId){
+    fetch(`/api/chat/permission?session=${encodeURIComponent(sid)}&option=${encodeURIComponent(optionId||"")}`).catch(()=>{});
+    delete pendingPerms[sid]; if(sid===state.active) renderPermBar();
   }
 
   // Reattach to a turn that was still running server-side when the tab closed.
@@ -1236,7 +1292,7 @@
   }
 
   // pull default model from settings for new sessions
-  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; window.__engineCaps={engine:c.engine,session_history:c.session_history,legacy_lane:c.legacy_lane}; applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); applyEngineCaps(); }).catch(()=>{});
+  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; window.__engineCaps={engine:c.engine,session_history:c.session_history,legacy_lane:c.legacy_lane}; window.__chatDefaults={cwd:c.chat_cwd||"",perm:c.chat_permission_mode||"auto"}; applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); applyEngineCaps(); }).catch(()=>{});
   // populate model selectors from the live catalog (mirrors the console picker)
   fetch("/api/models").then(r=>r.json()).then(d=>{ if(!d.error){ window.__models=d; fillModelSelects(d); } }).catch(()=>{});
 
@@ -1801,7 +1857,10 @@
       }
       eng.value=c.engine||"copilot";
       $("#s-chat_fast").checked=c.chat_fast!==false;
+      $("#s-chat_cwd").value=c.chat_cwd||"";
+      $("#s-chat_permission_mode").value=c.chat_permission_mode||"auto";
       window.__engineCaps={engine:c.engine,session_history:c.session_history,legacy_lane:c.legacy_lane};
+      window.__chatDefaults={cwd:c.chat_cwd||"",perm:c.chat_permission_mode||"auto"};
       applyEngineCaps();
       $("#s-ado_pat").placeholder=c.ado_pat_set?"•••• set (leave blank to keep)":"blank = use az login";
       $("#s-hive_token").placeholder=c.hive_token_set?"•••• set (leave blank to keep)":"blank = ~/.hive/worker.token";
@@ -1851,6 +1910,8 @@
     const payload={ ado_org:$("#s-ado_org").value.trim(), ado_upn:$("#s-ado_upn").value.trim(),
       hive_url:$("#s-hive_url").value.trim(), default_model:$("#s-default_model").value,
       engine:$("#s-engine").value,
+      chat_cwd:$("#s-chat_cwd").value.trim(),
+      chat_permission_mode:$("#s-chat_permission_mode").value,
       ado_pat:$("#s-ado_pat").value, hive_token:$("#s-hive_token").value };
     // Only submit chat_fast when the control is actually editable. When the
     // active engine has no legacy lane the box is force-checked + disabled to
