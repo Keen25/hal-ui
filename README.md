@@ -20,7 +20,11 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   session. Token-by-token streaming over SSE, per-session message queue (sends
   while busy are queued, not dropped), copy-to-clipboard on replies.
 - **Native Hive control** — fleet + queue view, task-detail/logs drawer, and a
-  "→ Hive" button that turns the current chat into a queued task.
+  "→ Hive" button that turns the current chat into a queued task. The Hive tab,
+  its "→ Hive" button, and the hive API routes only appear when a hive is
+  actually deployed: the server probes the configured `hive_url` and treats any
+  HTTP response (even auth/404) as live, hiding everything when the address is
+  unreachable or the URL is cleared.
 - **GitHub "My Work"** — assigned PRs and issues via the `gh` CLI.
 - **Azure DevOps** — assigned PBIs and PRs (as author *and* reviewer, role-tagged)
   via `az` + ADO REST.

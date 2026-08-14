@@ -421,11 +421,43 @@ def _hive_url() -> str:
     return (load_config().get("hive_url") or HIVE_URL_DEFAULT).rstrip("/")
 
 
+def _hive_reachable() -> bool:
+    """Probe whether a hive is actually running at the configured URL.
+
+    A URL string alone isn't proof of deployment: `hive_url` defaults to a
+    localhost address, so a plain "is it configured" check left the Hive tab
+    visible on every box even when no hive was ever stood up. Here we make one
+    short, cached request: any HTTP answer (200, or even 401/404) means a hive
+    is deployed and the tab should show; a connection-level failure (refused /
+    timeout / DNS) means it isn't, so the tab stays hidden. Cached briefly so
+    the probe adds no latency to repeated /api/settings reads and, when a hive
+    is down, costs at most one short timeout per TTL window."""
+    url = _hive_url()
+
+    def _probe() -> bool:
+        req = urllib.request.Request(
+            url + "/status", method="GET",
+            headers={"Authorization": f"Bearer {_hive_token()}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=1.5):
+                return True
+        except urllib.error.HTTPError:
+            return True  # the hive answered (even an auth/404 error) => deployed
+        except Exception:
+            return False  # refused / timeout / DNS => not deployed
+
+    return cached("hive_reachable:" + url, 20.0, _probe)
+
+
 def _hive_enabled() -> bool:
-    """Hive integration is optional: enabled only when a hive URL is configured.
-    Clear the Hive URL in Settings to decommission the hive (hides its tab and
-    buttons, and disables the hive API routes)."""
-    return bool((load_config().get("hive_url") or "").strip())
+    """Hive integration is optional: enabled only when a hive URL is configured
+    AND a hive is actually reachable there. Clear the Hive URL in Settings to
+    decommission the hive; either way, if no hive is deployed the tab, buttons,
+    and API routes stay disabled."""
+    if not (load_config().get("hive_url") or "").strip():
+        return False
+    return _hive_reachable()
 
 
 def _hive_request(path: str, method: str = "GET", body: dict | None = None):
