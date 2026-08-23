@@ -1178,9 +1178,15 @@
     source.addEventListener("message",(ev)=>{ const d=JSON.parse(ev.data); if(d.text) bot.text=d.text; if(d.tools&&d.tools.length) bot.tools=d.tools; liveUpdate(sid); });
     source.addEventListener("permission",(ev)=>{ try{ const d=JSON.parse(ev.data); pendingPerms[sid]={id:d.id,options:d.options||[]}; if(sid===state.active) renderPermBar(); }catch(e){} });
     source.addEventListener("permission_resolved",(ev)=>{ delete pendingPerms[sid]; if(sid===state.active) renderPermBar(); });
+    // F5: a server-sent application failure. Distinct from the native EventSource
+    // `error` event (transport drop) so its message survives and the following
+    // `done` still lands. Show it, mark the bubble so `done` won't re-annotate.
+    source.addEventListener("turn_error",(ev)=>{ let m=""; try{ m=(JSON.parse(ev.data||"{}").message)||""; }catch(e){}
+      if(m){ bot.text = bot.text ? bot.text+"\n\n_["+m+"]_" : "["+m+"]"; } bot._errShown=true; liveUpdate(sid); });
     source.addEventListener("done",(ev)=>{ const d=JSON.parse(ev.data||"{}"); delete pendingPerms[sid]; if(sid===state.active) renderPermBar();
-      if(d.code&&d.code!==0){ if(!bot.text){ bot.text = d.stderr ? "[exit "+d.code+": "+d.stderr+"]" : "[failed"+(d.reason?" — "+d.reason:"")+"]"; } else if(d.reason){ bot.text += "\n\n_["+d.reason+"]_"; } }
+      if(d.code&&d.code!==0&&!bot._errShown){ if(!bot.text){ bot.text = d.stderr ? "[exit "+d.code+": "+d.stderr+"]" : "[failed"+(d.reason?" — "+d.reason:"")+"]"; } else if(d.reason){ bot.text += "\n\n_["+d.reason+"]_"; } }
       finish(); });
+    // Native EventSource error = transport/connection failure ONLY.
     source.addEventListener("error",()=>{ if(!bot.text) bot.text="[stream error — is server.py running?]"; finish(); });
   }
 
@@ -1195,7 +1201,10 @@
     $("#perm-opts").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>decidePermission(sid,b.dataset.opt)));
   }
   function decidePermission(sid,optionId){
-    fetch(`/api/chat/permission?session=${encodeURIComponent(sid)}&option=${encodeURIComponent(optionId||"")}`).catch(()=>{});
+    // F4: send the request id the bar is resolving so a click on a superseded
+    // prompt can't answer a different ACP request.
+    const rid=(pendingPerms[sid]&&pendingPerms[sid].id)||"";
+    fetch(`/api/chat/permission?session=${encodeURIComponent(sid)}&option=${encodeURIComponent(optionId||"")}&id=${encodeURIComponent(rid)}`).catch(()=>{});
     delete pendingPerms[sid]; if(sid===state.active) renderPermBar();
   }
 
