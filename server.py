@@ -28,6 +28,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -41,6 +42,20 @@ from urllib.parse import parse_qs, urlparse, quote
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 GH_BIN = shutil.which("gh") or "/usr/bin/gh"
 AZ_BIN = shutil.which("az") or "/usr/bin/az"
+
+# Lightweight stderr diagnostics. Reader-thread drops (a single malformed or
+# unsupported ACP message, F9) are logged here so the cause + offending payload
+# is never silently swallowed, without pulling in the logging module or changing
+# the app's quiet stdout. Set HALUI_DEBUG=0 to silence.
+_DEBUG = os.environ.get("HALUI_DEBUG", "1") not in ("0", "false", "no", "")
+
+
+def _dbg(msg: str) -> None:
+    if _DEBUG:
+        try:
+            print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
 
 # --- Engine abstraction: which coding-agent CLI drives the chat lanes --------
@@ -1264,7 +1279,40 @@ class AcpProc:
     def _notify(self, method: str, params: dict):
         self._write({"jsonrpc": "2.0", "method": method, "params": params})
 
+    def _dispatch(self, obj: dict):
+        """Route one decoded ACP JSON-RPC message.
+
+        Uses defensive field access so an unexpected message shape raises a
+        caught exception in _reader (logged, then skipped) rather than a bare
+        KeyError that would unwind the whole reader loop and falsely mark a
+        live process dead (F9)."""
+        if not isinstance(obj, dict):
+            return
+        if "method" in obj and "id" in obj:          # request from agent
+            self._on_agent_request(obj)
+        elif "method" in obj:                         # notification
+            if obj.get("method") == "session/update":
+                params = obj.get("params") or {}
+                update = params.get("update") if isinstance(params, dict) else None
+                if update is not None:
+                    with self._event_lock:
+                        if self._event_q is not None:
+                            self._event_q.put(update)
+        elif "id" in obj:                             # response to our request
+            q = self._pending.get(obj["id"])
+            if q is not None:
+                q.put(obj)
+
     def _reader(self):
+        """Consume ACP JSON-RPC messages until stdout EOF.
+
+        A single malformed or unsupported message must never tear down the
+        reader: each message is dispatched under its own guard so one bad
+        payload (e.g. an opencode notification with an unexpected shape) is
+        logged and skipped while the still-alive child keeps streaming (F9).
+        The process is declared dead — and ``__dead__`` injected into the
+        active turn — only when stdout reaches EOF / the child exits, or when
+        the read loop itself fails."""
         try:
             assert self.proc.stdout is not None
             for line in self.proc.stdout:
@@ -1274,21 +1322,23 @@ class AcpProc:
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
+                    _dbg(f"[acp:{self.engine}] dropped non-JSON line: {line[:200]!r}")
                     continue
-                if "method" in obj and "id" in obj:          # request from agent
-                    self._on_agent_request(obj)
-                elif "method" in obj:                         # notification
-                    if obj["method"] == "session/update":
-                        with self._event_lock:
-                            if self._event_q is not None:
-                                self._event_q.put(obj["params"]["update"])
-                elif "id" in obj:                             # response to our request
-                    q = self._pending.get(obj["id"])
-                    if q is not None:
-                        q.put(obj)
-        except Exception:
-            pass
+                try:
+                    self._dispatch(obj)
+                except Exception as exc:
+                    # F9: an unsupported/malformed single message must not kill
+                    # the reader. Surface the cause + offending payload and keep
+                    # reading — the child is alive and mid-turn.
+                    _dbg(f"[acp:{self.engine}] dropped a message: {exc!r} "
+                         f"payload={line[:500]!r}")
+        except Exception as exc:
+            # Only a fatal loop-level failure (e.g. the pipe broke) reaches here;
+            # it genuinely ends the stream, so fall through to mark dead.
+            _dbg(f"[acp:{self.engine}] reader loop aborted: {exc!r}")
         finally:
+            # Reached on stdout EOF / child exit or a fatal loop error — the
+            # stream is truly over, so the process is dead.
             self.dead = True
             with self._event_lock:
                 if self._event_q is not None:
