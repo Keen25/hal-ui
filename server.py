@@ -296,6 +296,10 @@ DEFAULT_CONFIG = {
 }
 _SECRET_KEYS = {"ado_pat", "hive_token"}
 _config_lock = threading.Lock()
+_cfg_cache_lock = threading.Lock()   # guards the cache pair below so a concurrent
+                                     # load_config()/save_config() can't read a torn
+                                     # (dict, mtime) combination (lock order is
+                                     # always _config_lock -> _cfg_cache_lock)
 _cfg_cache: dict | None = None       # last parsed config
 _cfg_cache_mtime: float = -1.0       # mtime it was parsed at (-1 = none/no file)
 
@@ -306,21 +310,27 @@ def load_config() -> dict:
     Backed by an mtime-keyed in-memory cache so the hot paths that resolve the
     active engine per request (review finding N8) don't re-read + re-parse the
     file every call; an external edit still takes effect because a changed mtime
-    invalidates the cache. Returns a copy so callers can't mutate the cache."""
+    invalidates the cache. Returns a copy so callers can't mutate the cache.
+
+    The cache pair is read and written under ``_cfg_cache_lock`` so a request
+    thread can never observe a torn (dict, mtime) combination (an updated dict
+    paired with a stale mtime, or vice versa) that a concurrent save could leave
+    between its two global stores."""
     global _cfg_cache, _cfg_cache_mtime
     try:
         mtime = os.path.getmtime(CONFIG_FILE)
     except OSError:
         mtime = -1.0
-    cached_cfg = _cfg_cache
-    if cached_cfg is not None and mtime == _cfg_cache_mtime:
-        return dict(cached_cfg)
+    with _cfg_cache_lock:
+        if _cfg_cache is not None and mtime == _cfg_cache_mtime:
+            return dict(_cfg_cache)
     cfg = dict(DEFAULT_CONFIG)
     try:
         cfg.update(json.loads(Path(CONFIG_FILE).read_text()))
     except (OSError, json.JSONDecodeError):
         pass
-    _cfg_cache, _cfg_cache_mtime = dict(cfg), mtime
+    with _cfg_cache_lock:
+        _cfg_cache, _cfg_cache_mtime = dict(cfg), mtime
     return cfg
 
 
@@ -339,10 +349,11 @@ def save_config(patch: dict) -> dict:
         os.chmod(CONFIG_FILE, 0o600)
         # Refresh the cache under the write's new mtime so the very next
         # load_config() returns this value without a re-read.
-        try:
-            _cfg_cache, _cfg_cache_mtime = dict(cfg), os.path.getmtime(CONFIG_FILE)
-        except OSError:
-            _cfg_cache = None
+        with _cfg_cache_lock:
+            try:
+                _cfg_cache, _cfg_cache_mtime = dict(cfg), os.path.getmtime(CONFIG_FILE)
+            except OSError:
+                _cfg_cache = None
     return cfg
 
 
