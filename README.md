@@ -20,18 +20,24 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   session. Token-by-token streaming over SSE, per-session message queue (sends
   while busy are queued, not dropped), copy-to-clipboard on replies.
 - **Native Hive control** — fleet + queue view, task-detail/logs drawer, and a
-  "→ Hive" button that turns the current chat into a queued task.
+  "→ Hive" button that turns the current chat into a queued task. The Hive tab,
+  its "→ Hive" button, and the hive API routes only appear when a hive is
+  actually deployed: the server probes the configured `hive_url` and treats any
+  HTTP response (even auth/404) as live, hiding everything when the address is
+  unreachable or the URL is cleared.
 - **GitHub "My Work"** — assigned PRs and issues via the `gh` CLI.
 - **Azure DevOps** — assigned PBIs and PRs (as author *and* reviewer, role-tagged)
   via `az` + ADO REST.
 - **Open-as-session** — any ADO/GitHub item spawns a context-pinned chat session
   ("this is what we'll discuss") without dumping boilerplate in the composer.
-- **Settings pane** — wire ADO org/PAT/UPN, Hive URL/token, default model, and the
-  `chat_fast` toggle. Stored server-side at `~/.config/hal-ui/config.json` (0600).
+- **Settings pane** — wire ADO org/PAT/UPN, Hive URL/token, default model, the
+  `chat_fast` toggle, the default working directory, and the tool-permission
+  policy. Stored server-side at `~/.config/hal-ui/config.json` (0600).
 - **Persistent ACP chat lane** — with `chat_fast` on, each session runs one
   long-lived `copilot --acp` process (Agent Client Protocol over stdio). The CLI
   boots once; later turns skip startup entirely (cold ~10s → warm ~2-3s to first
-  token). Tool-permission requests are auto-approved (`allow_once`).
+  token). Tool-permission requests are auto-approved (`allow_once`) by default,
+  or surfaced to the browser for an explicit decision in **prompt** mode.
 - **Rich markdown rendering** — HAL responses render as formatted HTML (GitHub
   tables, headings, bold/italic, inline + fenced code, lists, blockquotes, links)
   via a small zero-dependency, XSS-safe renderer. The copy button puts **rich
@@ -44,6 +50,25 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   in-flight turn instantly; queued messages are cleared.
 - **Fast chat toggle** — `chat_fast` ON = ACP persistent lane (fast, no MCP);
   OFF = legacy per-turn spawn with full MCP servers available mid-chat.
+- **Per-chat working directory & permissions** — each chat can override the
+  server-default working directory (validated; blank = home) and the
+  tool-permission policy (auto-accept vs ask-me-each-time) from a toolbar above
+  the composer. Both are shown live, retained with browser-archived sessions,
+  and passed through the engine-snapshot lane so a mid-turn settings change can
+  never mismatch the running turn.
+- **Turn lifecycle hardening** — the ACP `session/prompt` response is inspected
+  (auth / model / provider / protocol errors surface with a nonzero exit and
+  partial text preserved, cancellation is distinguished from failure); an idle
+  turn is force-aborted after `acp_idle_timeout`; a cancelled-but-wedged process
+  is force-killed after `acp_cancel_grace` and evicted; abandoned ACP processes
+  are reaped after `acp_reap_idle`; stderr is drained continuously so a chatty
+  engine can't deadlock on a full pipe.
+- **Pluggable engine** — the `engine` setting picks which coding-agent CLI backs
+  chat: `copilot` (default) or `opencode`. Both speak the **same ACP** (Zed Agent
+  Client Protocol) over stdio, so the fast lane is engine-agnostic — only the
+  launch argv differs (`copilot --acp` vs `opencode acp`). The legacy per-turn
+  lane and the on-disk history search parse Copilot's proprietary JSON, so they
+  stay Copilot-only; selecting opencode transparently forces the ACP fast lane.
 - **Hive drawer auto-poll** — an open task drawer refreshes progress + log tail
   every 4s while the task is non-terminal, then stops.
 
@@ -62,12 +87,19 @@ server.py (Python stdlib http.server, threaded)
 
 ### Backend — `server.py`
 - Python 3 **stdlib only**: `http.server.ThreadingHTTPServer`, thread-per-request.
-- Chat, fast lane (`chat_fast` on): persistent `copilot --acp` process per session
-  (JSON-RPC over stdio — `initialize` → `session/new` → `session/prompt`, streamed
-  `session/update` → SSE). `session/cancel` powers Stop; permission requests
-  auto-answered `allow_once`.
-- Chat, legacy lane (`chat_fast` off): per-turn `copilot -p … --output-format json`
-  spawn with full MCP servers.
+- **Engine abstraction** (`ENGINES` registry): each entry maps a CLI to its ACP
+  launch argv, legacy oneshot argv, and capability flags (`legacy_lane`,
+  `session_history`). Copilot and opencode are the built-ins; adding another ACP
+  agent is one registry entry.
+- Chat, fast lane (`chat_fast` on): persistent ACP process per session
+  (`<engine> acp` — JSON-RPC over stdio: `initialize` → `session/new` →
+  `session/prompt`, streamed `session/update` → SSE). `session/cancel` powers
+  Stop (bounded, escalating to force-kill); permission requests are auto-answered
+  `allow_once` or routed to the browser (`/api/chat/permission`) in prompt mode.
+  The engine, working directory, and permission mode are snapshotted per turn so
+  a concurrent settings change can't cross lanes.
+- Chat, legacy lane (`chat_fast` off, Copilot only): per-turn
+  `copilot -p … --output-format json` spawn with full MCP servers.
 - Data: `gh` CLI (TTL-cached), `az account get-access-token` → ADO REST, Hive REST.
 - Config: `~/.config/hal-ui/config.json` (0600); secrets masked on read, preserved
   if POSTed blank.
@@ -173,8 +205,41 @@ cd $env:USERPROFILE\hal-ui ; git pull --ff-only ; Restart-Service hal-ui
 
 ### Requirements
 - Python 3.10+
-- [`copilot`](https://github.com/github/copilot-cli) CLI on `PATH`
+- [`copilot`](https://github.com/github/copilot-cli) CLI on `PATH` (default engine)
+- [`opencode`](https://opencode.ai) CLI — **optional**, only if you select the
+  opencode engine (see below)
 - `gh` CLI (for GitHub views), `az` CLI (for ADO views) — optional per view
+
+## Chat engines
+
+The **engine** setting (Settings pane) picks which coding-agent CLI backs chat.
+Both engines speak the same ACP fast lane; the default is unchanged from a
+Copilot-only install.
+
+| Engine | Fast lane (ACP) | Legacy per-turn lane | On-disk history |
+|--------|:---------------:|:--------------------:|:---------------:|
+| `copilot` (default) | ✅ | ✅ (full MCP) | ✅ |
+| `opencode` | ✅ | — (auto-forced to ACP) | — |
+
+The legacy lane and the **on-disk** history search parse Copilot's proprietary
+JSON, so they stay Copilot-only; selecting opencode transparently forces the ACP
+fast lane. The History tab itself still works under opencode for your
+**browser-local archived** sessions — only the on-disk transcript section is
+disabled (with an in-tab note). Switching engines retires only the previous
+engine's live chat processes; sessions already on the new engine keep running.
+
+**To use opencode:**
+1. Install the CLI: `curl -fsSL https://opencode.ai/install | bash` (or
+   `npm i -g opencode-ai`). It need not be on `PATH` — HAL-UI also finds
+   `~/.opencode/bin/opencode`. Installing it while HAL-UI is already running is
+   fine; the binary is re-resolved on each save (no restart needed).
+2. Settings → **Engine → opencode** → Save. Chat re-homes to opencode on the
+   next turn; the model picker follows the new engine.
+3. Free "OpenCode Zen" models work without auth, so you can smoke-test right
+   away; sign in via `opencode auth login` for the full catalog.
+
+Saving an engine whose binary can't be found is rejected (the prior engine is
+kept), so you can't strand chat on a CLI that isn't installed.
 
 ## Roadmap
 - Convert `~/.copilot/mcp-config.json` to ACP `mcpServers` so the fast lane can
