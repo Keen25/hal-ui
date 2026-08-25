@@ -43,6 +43,14 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 GH_BIN = shutil.which("gh") or "/usr/bin/gh"
 AZ_BIN = shutil.which("az") or "/usr/bin/az"
 
+# Decoding for every child we read in text mode. `text=True` alone defers to
+# locale.getpreferredencoding(): UTF-8 on Linux/macOS but cp1252 on Windows, so
+# an engine's valid UTF-8 stdout (containing e.g. §, →, emoji) raises
+# UnicodeDecodeError there — aborting the ACP reader loop *before* per-message
+# handling and falsely reporting a live child as exited (PR #6, finding F9
+# round 2). Pin UTF-8 explicitly with lossless-on-error replacement everywhere.
+TEXT_IO = {"encoding": "utf-8", "errors": "replace"}
+
 # Lightweight stderr diagnostics. Reader-thread drops (a single malformed or
 # unsupported ACP message, F9) are logged here so the cause + offending payload
 # is never silently swallowed, without pulling in the logging module or changing
@@ -510,7 +518,7 @@ def _hive_request(path: str, method: str = "GET", body: dict | None = None):
 def _gh_json(args: list[str]):
     try:
         out = subprocess.run(
-            [GH_BIN, *args], capture_output=True, text=True, timeout=25,
+            [GH_BIN, *args], capture_output=True, text=True, timeout=25, **TEXT_IO,
         )
         if out.returncode != 0:
             return {"error": out.stderr.strip()[:300]}
@@ -586,7 +594,7 @@ def _ado_auth_header() -> tuple[str, str | None]:
             out = subprocess.run(
                 [AZ_BIN, "account", "get-access-token", "--resource", ADO_RESOURCE,
                  "--query", "accessToken", "-o", "tsv"],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=30, **TEXT_IO,
             )
             if out.returncode != 0:
                 return "", out.stderr.strip()[:200] or "az token failed"
@@ -628,7 +636,7 @@ def _ado_identity(org: str) -> str:
         try:
             out = subprocess.run(
                 [AZ_BIN, "account", "show", "--query", "user.name", "-o", "tsv"],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, timeout=20, **TEXT_IO,
             )
             upn = out.stdout.strip()
         except Exception:
@@ -821,7 +829,7 @@ def _sf_run(args: list, timeout: float = 60) -> dict:
     {'error': ...} on any failure."""
     try:
         out = subprocess.run([SF_BIN, *args, "--json"],
-                             capture_output=True, text=True, timeout=timeout,
+                             capture_output=True, text=True, timeout=timeout, **TEXT_IO,
                              env=_sf_env())
     except FileNotFoundError:
         return {"error": "sf CLI not found"}
@@ -960,7 +968,8 @@ def _sf_reconnect_start() -> dict:
                "--instance-url", "https://login.salesforce.com", "--alias", "90729"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, env=env)
+                                    stderr=subprocess.STDOUT, text=True, env=env,
+                                    **TEXT_IO)
         except Exception as exc:
             with _sf_login_lock:
                 _sf_login_state.update(running=False, done=True, ok=False,
@@ -1233,7 +1242,7 @@ class AcpProc:
         self._stderr_tail: collections.deque = collections.deque(maxlen=50)
         self.proc = subprocess.Popen(
             _engine_argv(self.engine), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, bufsize=1, cwd=self.cwd)
+            stderr=subprocess.PIPE, text=True, bufsize=1, cwd=self.cwd, **TEXT_IO)
         threading.Thread(target=self._reader, daemon=True).start()
         # Persistent stderr drainer (R4): a chatty engine (MCP logs/warnings) can
         # fill the 64 KB stderr pipe, block the child on write(), and wedge stdout
@@ -1847,7 +1856,7 @@ def _list_models(engine: str | None = None) -> dict:
         p = subprocess.Popen(eng["acp_argv"](_engine_bin(eng["name"])),
                              stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             text=True, bufsize=1)
+                             text=True, bufsize=1, **TEXT_IO)
     except Exception as exc:
         return {"error": f"launch failed: {exc}"}
     _id = 0
@@ -1908,7 +1917,7 @@ def _acp_oneshot(engine: str | None = None):
     argv = _engine_argv(engine) if engine else _acp_launch_argv()
     p = subprocess.Popen(argv, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                         text=True, bufsize=1)
+                         text=True, bufsize=1, **TEXT_IO)
     state = {"id": 0}
 
     def send(method, params):
@@ -2263,7 +2272,8 @@ def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None,
     argv = _build_argv(prompt, session, model, copilot_id=copilot_id, engine=engine)
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                cwd=_validated_cwd(cwd), text=True, bufsize=1)
+                                cwd=_validated_cwd(cwd), text=True, bufsize=1,
+                                **TEXT_IO)
     except Exception as exc:
         emit("turn_error", {"message": f"launch failed: {exc}", "kind": "launch"})
         emit("done", {"code": 1, "reason": "launch"})

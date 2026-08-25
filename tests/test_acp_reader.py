@@ -170,5 +170,58 @@ class ReaderRobustnessTest(unittest.TestCase):
         self.assertEqual(kinds, ["__dead__"])  # nothing before EOF
 
 
+class Cp1252StdoutDecodeTest(unittest.TestCase):
+    """F9 round 2 — a Windows host decodes ACP stdout as cp1252 unless UTF-8 is
+    pinned, so an engine's valid UTF-8 (`§`, `→`, emoji) raises UnicodeDecodeError
+    inside the reader loop before per-message handling, faking a process exit.
+
+    The child emits real UTF-8 bytes; cp1252 is the encoding a stock Windows
+    Python resolves `text=True` to. The fix test drives server.TEXT_IO and
+    asserts the bytes decode cleanly; the control drives the bare cp1252 path
+    this fix replaces and asserts it raises — a regression that drops the
+    explicit encoding turns the control green and fails the suite.
+    """
+
+    NON_ASCII = "§ → 😀 café \u201cquote\u201d"
+
+    def _child_argv(self):
+        # Emit one UTF-8 ACP-shaped line, independent of the child's own locale:
+        # ensure_ascii=False keeps the non-ASCII chars, written as raw UTF-8.
+        line = json.dumps({"jsonrpc": "2.0", "method": "session/update",
+                           "params": {"update": {"sessionUpdate": "agent_message_chunk",
+                                                  "content": {"text": self.NON_ASCII}}}},
+                          ensure_ascii=False)
+        code = ("import sys;"
+                "sys.stdout.buffer.write(%r.encode('utf-8'));"
+                "sys.stdout.buffer.write(b'\\n');sys.stdout.buffer.flush()" % line)
+        return [sys.executable, "-c", code]
+
+    def test_utf8_stdout_survives_with_pinned_encoding(self):
+        import subprocess as sp
+        p = sp.Popen(self._child_argv(), stdout=sp.PIPE, stderr=sp.DEVNULL,
+                     text=True, bufsize=1, **server.TEXT_IO)
+        try:
+            line = p.stdout.readline()
+        finally:
+            p.stdout.close()
+            p.wait(timeout=10)
+        obj = json.loads(line)
+        self.assertEqual(obj["params"]["update"]["content"]["text"], self.NON_ASCII)
+
+    def test_control_cp1252_decode_raises_on_utf8(self):
+        # The pre-fix pattern on Windows: text mode resolved to cp1252. The
+        # emoji's UTF-8 bytes (0xF0 0x9F ...) hit an undefined cp1252 code point
+        # and raise 'charmap' UnicodeDecodeError — Robert's reproduced failure.
+        import subprocess as sp
+        p = sp.Popen(self._child_argv(), stdout=sp.PIPE, stderr=sp.DEVNULL,
+                     text=True, bufsize=1, encoding="cp1252")
+        try:
+            with self.assertRaises(UnicodeDecodeError):
+                p.stdout.readline()
+        finally:
+            p.stdout.close()
+            p.wait(timeout=10)
+
+
 if __name__ == "__main__":
     unittest.main()
