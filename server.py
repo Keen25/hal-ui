@@ -161,15 +161,23 @@ _cache: dict[str, tuple[float, object]] = {}
 _cache_lock = threading.Lock()
 
 
-def cached(key: str, ttl: float, producer):
+def cached(key: str, ttl: float, producer, keep=None):
+    """Memoize `producer()` for `ttl` seconds.
+
+    `keep`, if given, is called with the produced value and must return True
+    for the result to be stored. Transient error payloads (e.g. an ADO auth
+    blip) can thus be excluded so they don't pin a stale error for the full
+    TTL — the next poll retries instead.
+    """
     now = time.time()
     with _cache_lock:
         hit = _cache.get(key)
         if hit and now - hit[0] < ttl:
             return hit[1]
     val = producer()
-    with _cache_lock:
-        _cache[key] = (now, val)
+    if keep is None or keep(val):
+        with _cache_lock:
+            _cache[key] = (now, val)
     return val
 
 
@@ -279,6 +287,73 @@ def _github_mywork():
     return {"prs": prs, "issues": issues}
 
 
+def _github_gists():
+    # `gh api` paginates newest-first; 50 is plenty for a control-plane list.
+    raw = _gh_json(["api", "/gists?per_page=50"])
+    if isinstance(raw, dict) and raw.get("error"):
+        return {"gists": raw}
+    gists = []
+    for g in raw or []:
+        files = list((g.get("files") or {}).keys())
+        gists.append({
+            "id": g.get("id"),
+            "description": (g.get("description") or "").strip(),
+            "public": bool(g.get("public")),
+            "url": g.get("html_url"),
+            "files": files,
+            "comments": g.get("comments") or 0,
+            "createdAt": g.get("created_at"),
+            "updatedAt": g.get("updated_at"),
+        })
+    return {"gists": gists}
+
+
+def _github_gist_detail(gid: str):
+    """Return one gist's files with contents for inline preview.
+
+    `gh api /gists/<id>` embeds file `content` inline (GitHub truncates very
+    large files and instead exposes a `raw_url`; we fetch that so preview is
+    complete). Errors surface as {"error": ...}.
+    """
+    if not gid or not re.fullmatch(r"[0-9a-zA-Z]+", gid):
+        return {"error": "bad gist id"}
+    raw = _gh_json(["api", f"/gists/{gid}"])
+    if isinstance(raw, dict) and raw.get("error"):
+        return raw
+    files = []
+    for name, f in (raw.get("files") or {}).items():
+        content = f.get("content") or ""
+        if f.get("truncated") and f.get("raw_url"):
+            fetched = _gh_json(["api", f.get("raw_url")])
+            # raw_url returns text, not JSON; _gh_json yields {"error":...} on
+            # a decode failure but the stdout is the file — grab it directly.
+            content = _gh_raw(f.get("raw_url")) if isinstance(fetched, dict) and fetched.get("error") else content
+        files.append({
+            "name": name,
+            "language": f.get("language") or "",
+            "size": f.get("size") or 0,
+            "type": f.get("type") or "",
+            "content": content,
+        })
+    return {
+        "id": raw.get("id"),
+        "description": (raw.get("description") or "").strip(),
+        "public": bool(raw.get("public")),
+        "url": raw.get("html_url"),
+        "files": files,
+    }
+
+
+def _gh_raw(path: str) -> str:
+    """Fetch a gh api path expecting a raw (non-JSON) text body."""
+    try:
+        out = subprocess.run([GH_BIN, "api", path], capture_output=True,
+                             text=True, timeout=25)
+        return out.stdout if out.returncode == 0 else ""
+    except Exception:  # pragma: no cover
+        return ""
+
+
 # ---------------- Azure DevOps -----------------------------------------
 _az_token: dict = {"tok": "", "exp": 0.0}
 _az_lock = threading.Lock()
@@ -308,26 +383,63 @@ def _ado_auth_header() -> tuple[str, str | None]:
             return "", str(exc)
 
 
+def _ado_parse_json(status: int, raw: bytes):
+    """Parse an ADO response body as JSON, or surface a readable error.
+
+    ADO occasionally answers with a non-JSON body (an HTML sign-in/gateway
+    page from an auth blip or proxy). Report the real HTTP status plus a short
+    snippet instead of leaking a cryptic `json.JSONDecodeError` string, so the
+    UI shows something diagnosable rather than a misleading "502 Expecting
+    value: line 3 column 1".
+    """
+    try:
+        return status, json.loads(raw or b"{}")
+    except (json.JSONDecodeError, ValueError):
+        snippet = (raw or b"").decode("utf-8", "replace").strip()[:120]
+        return status, {"error": f"non-JSON response (HTTP {status}): {snippet}"}
+
+
+# Conditions worth one automatic retry: transient gateway/throttling statuses.
+_ADO_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
 def _ado_request(url: str, method: str = "GET", body: dict | None = None):
     auth, err = _ado_auth_header()
     if err:
         return 401, {"error": f"ADO auth: {err}"}
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url, data=data, method=method,
-        headers={"Authorization": auth, "Content-Type": "application/json",
-                 "Accept": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            return resp.status, json.loads(resp.read() or b"{}")
-    except urllib.error.HTTPError as exc:
+    last = (502, {"error": "unknown"})
+    for attempt in range(2):
+        req = urllib.request.Request(
+            url, data=data, method=method,
+            headers={"Authorization": auth, "Content-Type": "application/json",
+                     "Accept": "application/json"},
+        )
         try:
-            return exc.code, json.loads(exc.read() or b"{}")
-        except Exception:
-            return exc.code, {"error": exc.reason}
-    except Exception as exc:  # pragma: no cover
-        return 502, {"error": str(exc)}
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                status, parsed = _ado_parse_json(resp.status, resp.read())
+                # A 200 with a non-JSON body is a transient blip worth retrying.
+                if "error" in parsed and status == 200 and attempt == 0:
+                    last = (status, parsed)
+                    time.sleep(0.4)
+                    continue
+                return status, parsed
+        except urllib.error.HTTPError as exc:
+            try:
+                last = _ado_parse_json(exc.code, exc.read())
+            except Exception:
+                last = (exc.code, {"error": exc.reason})
+            if exc.code in _ADO_RETRY_STATUS and attempt == 0:
+                time.sleep(0.4)
+                continue
+            return last
+        except Exception as exc:
+            last = (502, {"error": str(exc)})
+            if attempt == 0:
+                time.sleep(0.4)
+                continue
+            return last
+    return last
 
 
 def _ado_identity(org: str) -> str:
@@ -1748,10 +1860,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = target.read_bytes()
         ctype = {".html": "text/html; charset=utf-8", ".js": "text/javascript",
-                 ".css": "text/css"}.get(target.suffix, "application/octet-stream")
+                 ".css": "text/css", ".json": "application/json",
+                 ".webmanifest": "application/manifest+json",
+                 ".png": "image/png", ".svg": "image/svg+xml",
+                 ".ico": "image/x-icon", ".map": "application/json",
+                 ".woff2": "font/woff2"}.get(target.suffix, "application/octet-stream")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # The service worker must control the root scope; let it be served from /.
+        if target.name == "sw.js":
+            self.send_header("Service-Worker-Allowed", "/")
+            self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1854,9 +1974,22 @@ class Handler(BaseHTTPRequestHandler):
                 code, data = _hive_request("/task/" + quote(tid, safe=""))
                 self._json(200 if code == 200 else (code or 502), data)
         elif p.path == "/api/github/mywork":
-            self._json(200, cached("mywork", 30.0, _github_mywork))
+            self._json(200, cached("mywork", 30.0, _github_mywork,
+                                   keep=lambda v: "error" not in v))
+        elif p.path == "/api/github/gists":
+            self._json(200, cached("gists", 30.0, _github_gists,
+                                   keep=lambda v: not (isinstance(v.get("gists"), dict))))
+        elif p.path == "/api/github/gist":
+            gid = (parse_qs(p.query).get("id", [""])[0] or "").strip()
+            if not gid:
+                self._json(400, {"error": "id is required"})
+            else:
+                self._json(200, cached("gist:" + gid, 60.0,
+                                       lambda: _github_gist_detail(gid),
+                                       keep=lambda v: "error" not in v))
         elif p.path == "/api/ado/mywork":
-            self._json(200, cached("ado_mywork", 30.0, _ado_mywork))
+            self._json(200, cached("ado_mywork", 30.0, _ado_mywork,
+                                   keep=lambda v: "error" not in v))
         elif p.path == "/api/sf/products":
             if not _sf_enabled():
                 self._json(404, {"error": "salesforce disabled"})
