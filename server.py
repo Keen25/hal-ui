@@ -614,6 +614,56 @@ def _ado_mywork():
             "identity_resolved": bool(ident)}
 
 
+def _ado_my_testcases():
+    """All Test Cases assigned to the current user (every state), org-wide.
+
+    Test Cases live in the Test plans area but are ordinary work items, so a
+    plain WIQL on WorkItemType='Test Case' + AssignedTo=@Me returns them. We
+    surface Automation Status too so a tester can see auto-vs-manual at a glance.
+    """
+    cfg = load_config()
+    org = (cfg.get("ado_org") or "").rstrip("/")
+    if not org:
+        return {"error": "ado_org not configured"}
+
+    wiql = {"query": (
+        "SELECT [System.Id] FROM WorkItems "
+        "WHERE [System.WorkItemType] = 'Test Case' "
+        "AND [System.AssignedTo] = @Me "
+        "ORDER BY [System.ChangedDate] DESC")}
+    code, data = _ado_request(f"{org}/_apis/wit/wiql?api-version=7.0",
+                              method="POST", body=wiql)
+    if code != 200:
+        return {"error": f"wiql {code}: {data.get('error') or data.get('message','')}"[:200]}
+
+    testcases = []
+    ids = [w["id"] for w in (data.get("workItems") or [])]
+    fields = ["System.Id", "System.Title", "System.State",
+              "System.AreaPath", "System.TeamProject",
+              "Microsoft.VSTS.TCM.AutomationStatus", "System.ChangedDate"]
+    # workitemsbatch caps at 200 ids per call.
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        c2, d2 = _ado_request(f"{org}/_apis/wit/workitemsbatch?api-version=7.0",
+                              method="POST", body={"ids": chunk, "fields": fields})
+        if c2 != 200:
+            return {"error": f"workitemsbatch {c2}: {d2.get('error') or d2.get('message','')}"[:200]}
+        for w in d2.get("value") or []:
+            f = w.get("fields", {})
+            proj = f.get("System.TeamProject", "")
+            testcases.append({
+                "id": w.get("id"),
+                "title": f.get("System.Title", ""),
+                "state": f.get("System.State", ""),
+                "auto": f.get("Microsoft.VSTS.TCM.AutomationStatus", ""),
+                "area": f.get("System.AreaPath", ""),
+                "project": proj,
+                "changed": f.get("System.ChangedDate", ""),
+                "url": f"{org}/{urllib.parse.quote(proj)}/_workitems/edit/{w.get('id')}",
+            })
+    return {"testcases": testcases}
+
+
 # ======================================================================
 # Salesforce Collaboration Requests (CRs). Support escalates customer cases to
 # R&D as CRs (custom object Collaboration_Request__c). We shell out to the `sf`
@@ -2037,6 +2087,9 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/api/ado/mywork":
             self._json(200, cached("ado_mywork", 30.0, _ado_mywork,
                                    keep=lambda v: "error" not in v))
+        elif p.path == "/api/ado/testcases":
+            self._json(200, cached("ado_testcases", 30.0, _ado_my_testcases,
+                                   keep=lambda v: "error" not in v))
         elif p.path == "/api/sf/products":
             if not _sf_enabled():
                 self._json(404, {"error": "salesforce disabled"})
@@ -2117,6 +2170,7 @@ class Handler(BaseHTTPRequestHandler):
             # settings that affect ADO identity/token invalidate caches
             with _cache_lock:
                 _cache.pop("ado_mywork", None)
+                _cache.pop("ado_testcases", None)
             with _az_lock:
                 _az_token.update(tok="", exp=0.0)
             self._json(200, masked_config())
