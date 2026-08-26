@@ -297,6 +297,7 @@
     <div class="tab" data-view="github">GitHub<span class="nbadge"></span></div>
     <div class="tab" data-view="gists">Gists<span class="nbadge"></span></div>
     <div class="tab" data-view="ado">ADO<span class="nbadge"></span></div>
+    <div class="tab" data-view="tests">Tests<span class="nbadge"></span></div>
     <div class="tab" data-view="sf">CRs<span class="nbadge"></span></div>
     <div class="tab" data-view="history">History</div>
     <div class="tab" data-view="settings">⚙</div>
@@ -430,6 +431,20 @@
         <select id="adowi-type" class="mini"><option value="">all</option></select></div>
       <table id="workitems"><thead><tr><th>ID</th><th>Type</th><th>State</th><th>Project</th><th>Title</th>
         <th class="sortable" id="adowi-sort">Changed <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- TESTS -->
+  <section class="view" id="view-tests">
+    <div class="scroll">
+      <div class="toolbar"><strong>Tests</strong><span class="muted" id="tests-updated">—</span>
+        <span class="grow"></span><button class="ghost" id="tests-refresh" type="button">Refresh</button></div>
+      <div id="tests-err"></div>
+      <div class="lhead"><h3>My test cases</h3><span class="muted" id="tc-count"></span>
+        <span class="grow"></span><span class="muted mini-l">state</span>
+        <select id="tc-state" class="mini"><option value="">all</option></select></div>
+      <table id="testcases"><thead><tr><th>ID</th><th>State</th><th>Auto</th><th>Project</th><th>Title</th>
+        <th class="sortable" id="tc-sort">Changed <span class="arr">▼</span></th><th></th></tr></thead><tbody></tbody></table>
     </div>
   </section>
 
@@ -1237,6 +1252,7 @@
     if (t.dataset.view === "github") loadGithub();
     if (t.dataset.view === "gists") loadGists();
     if (t.dataset.view === "ado") loadAdo();
+    if (t.dataset.view === "tests") loadTests();
     if (t.dataset.view === "sf") loadSf();
     if (t.dataset.view === "history") loadHistory();
     if (t.dataset.view === "settings") loadSettings();
@@ -1476,8 +1492,8 @@
   const NOTIF_POLL_MS=90000;
   let notifSeen=(()=>{ try{ return JSON.parse(localStorage.getItem(NOTIF_SEEN_KEY))||{}; }catch(e){ return {}; } })();
   let notifInit=(()=>{ try{ return JSON.parse(localStorage.getItem(NOTIF_INIT_KEY))||{}; }catch(e){ return {}; } })();
-  const nUnread={github:new Set(),ado:new Set(),sf:new Set(),hive:new Set()};
-  const NOTIF_VIEWS=["github","gists","ado","sf","hive"];
+  const nUnread={github:new Set(),ado:new Set(),tests:new Set(),sf:new Set(),hive:new Set()};
+  const NOTIF_VIEWS=["github","gists","ado","tests","sf","hive"];
   function nVer(v){ return String(v==null?"":v); }
   function notifSave(){ try{ localStorage.setItem(NOTIF_SEEN_KEY,JSON.stringify(notifSeen)); localStorage.setItem(NOTIF_INIT_KEY,JSON.stringify(notifInit)); }catch(e){} }
   // {key,ver} list for a view, built from the data the view already fetched.
@@ -1489,6 +1505,7 @@
     if(view==="ado") return [
       ...adoData.prs.map(p=>({key:"ado:pr:"+p.id, ver:p.updated||p.created})),
       ...adoData.workitems.map(w=>({key:"ado:wi:"+w.id, ver:w.changed}))];
+    if(view==="tests") return testsData.testcases.map(t=>({key:"test:tc:"+t.id, ver:t.changed}));
     if(view==="sf") return [...sfData.mine,...sfData.unassigned,...sfData.all]
       .map(r=>({key:"sf:"+(r.id||r.name), ver:r.modified||r.created}));
     if(view==="hive") return (((typeof hiveData!=="undefined"&&hiveData&&hiveData.tasks)||[]))
@@ -1525,7 +1542,7 @@
     notifInit[view]=true; if(ch) notifSave();
     nUnread[view]=new Set(); nSetBadge(view,0);
   }
-  function nViewOfKey(k){ return k.indexOf("gist:")===0?"gists":k.indexOf("gh:")===0?"github":k.indexOf("ado:")===0?"ado":k.indexOf("sf:")===0?"sf":k.indexOf("hive:")===0?"hive":null; }
+  function nViewOfKey(k){ return k.indexOf("gist:")===0?"gists":k.indexOf("gh:")===0?"github":k.indexOf("test:")===0?"tests":k.indexOf("ado:")===0?"ado":k.indexOf("sf:")===0?"sf":k.indexOf("hive:")===0?"hive":null; }
   // Acknowledge a single item (called when you click its row).
   function nAckOne(key,ver){
     if(!key) return; const v=nVer(ver); if(notifSeen[key]===v) return;
@@ -1548,6 +1565,7 @@
     if(typeof loadGithub==="function") jobs.push(loadGithub());
     if(typeof loadGists==="function") jobs.push(loadGists());
     if(typeof loadAdo==="function") jobs.push(loadAdo());
+    if(typeof loadTests==="function") jobs.push(loadTests());
     if(!document.body.classList.contains("sf-off") && typeof loadSf==="function") jobs.push(loadSf());
     if(!document.body.classList.contains("hive-off") && typeof loadHive==="function") jobs.push(loadHive());
     try{ await Promise.allSettled(jobs); }catch(e){}
@@ -1777,6 +1795,44 @@
   $("#adopr-role").addEventListener("change",renderAdo);
   $("#adowi-sort").addEventListener("click",()=>{ adoSort.wi=-adoSort.wi; renderAdo(); });
   $("#adopr-sort").addEventListener("click",()=>{ adoSort.pr=-adoSort.pr; renderAdo(); });
+
+  /* ================= TESTS (assigned test cases) ================= */
+  const testsData={testcases:[]};
+  const testsSort={tc:-1};
+  function testTcRow(t){
+    const nk="test:tc:"+t.id;
+    const ctx={ banner:`ADO Test Case ${t.id} · ${t.project} — ${t.title}`, url:t.url,
+      preamble:`We'll be discussing this Azure DevOps test case; keep it in context for our whole conversation:\nTest Case ${t.id} — state "${t.state}", automation "${t.auto||'—'}", project "${t.project}"\n"${t.title}"\n${t.url}\n\n` };
+    return `<tr data-nk="${esc(nk)}" data-nv="${esc(nVer(t.changed))}">
+      <td>${nDot("tests",nk)}<a href="${esc(t.url)}" target="_blank">${esc(t.id)}</a></td>
+      <td><span class="pill s-${esc((t.state||'').toLowerCase().replace(/ /g,'_'))}">${esc(t.state)}</span></td>
+      <td class="muted">${esc(t.auto||'—')}</td>
+      <td class="muted">${esc(t.project)}</td>
+      <td class="title" title="${esc(t.title)}">${esc(t.title)}</td>
+      <td class="muted">${esc(ago(t.changed))}</td>${chatCell("TC "+t.id, ctx)}</tr>`;
+  }
+  function renderTests(){
+    nComputeUnread("tests");
+    const stateSel=$("#tc-state"); fillSelect(stateSel,[...new Set(testsData.testcases.map(t=>t.state).filter(Boolean))].sort());
+    const tc=testsData.testcases.filter(t=>!stateSel.value||t.state===stateSel.value).slice().sort(byDate("changed",testsSort.tc));
+    $("#tc-count").textContent=`(${tc.length})`;
+    $("#testcases tbody").innerHTML=tc.map(testTcRow).join("")||`<tr><td colspan="7" class="muted">none</td></tr>`;
+    setArr("#tc-sort",testsSort.tc);
+    nSetBadge("tests",nUnread.tests.size);
+  }
+  async function loadTests(){
+    const err=$("#tests-err"); err.innerHTML="";
+    try{
+      const r=await fetch("/api/ado/testcases"); const d=await r.json();
+      $("#tests-updated").textContent="updated "+new Date().toLocaleTimeString();
+      if(d.error){ err.innerHTML=`<div class="msgbox err">${esc(d.error)}</div>`; }
+      testsData.testcases=Array.isArray(d.testcases)?d.testcases:[];
+      renderTests();
+    }catch(e){ err.innerHTML=`<div class="msgbox err">${esc(e.message)}</div>`; }
+  }
+  $("#tests-refresh").addEventListener("click",loadTests);
+  $("#tc-state").addEventListener("change",renderTests);
+  $("#tc-sort").addEventListener("click",()=>{ testsSort.tc=-testsSort.tc; renderTests(); });
 
   /* ================= SALESFORCE CRs ================= */
   const sfData={mine:[],unassigned:[],all:[]};
