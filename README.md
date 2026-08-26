@@ -44,6 +44,11 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   in-flight turn instantly; queued messages are cleared.
 - **Fast chat toggle** — `chat_fast` ON = ACP persistent lane (fast, no MCP);
   OFF = legacy per-turn spawn with full MCP servers available mid-chat.
+- **Opt-in fast-lane MCP context** — `chat_mcp_servers` (Settings →
+  "Fast-lane context") keeps chosen `~/.copilot/mcp-config.json` servers
+  (e.g. `one-identity`) warm in the fast ACP lane too, paying their startup
+  cost once at session boot instead of forcing the slow legacy lane for
+  org/topic context.
 - **Hive drawer auto-poll** — an open task drawer refreshes progress + log tail
   every 4s while the task is non-terminal, then stops.
 
@@ -177,7 +182,5 @@ cd $env:USERPROFILE\hal-ui ; git pull --ff-only ; Restart-Service hal-ui
 - `gh` CLI (for GitHub views), `az` CLI (for ADO views) — optional per view
 
 ## Roadmap
-- Convert `~/.copilot/mcp-config.json` to ACP `mcpServers` so the fast lane can
-  keep chosen MCP servers warm (best of both lanes).
 - Multi-turn ACP session persistence across server restarts (`session/load`).
 - Per-turn token/cost usage surfaced in the chat UI (ACP `usage_update`).
