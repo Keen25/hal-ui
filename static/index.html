@@ -494,6 +494,11 @@
         <select id="s-default_model"><option value="">default</option><option value="claude-sonnet-4.5">sonnet-4.5</option><option value="gpt-5.4">gpt-5.4</option></select>
         <label class="muted">Fast chat</label>
         <label class="row2" style="gap:8px;cursor:pointer"><input id="s-chat_fast" type="checkbox" style="width:auto" /> <span class="muted">Disable MCP servers in chat for faster startup (~5-7s/msg). Turn off if you need MCP tools mid-chat.</span></label>
+        <label class="muted">Fast-lane context</label>
+        <div id="s-chat_mcp_servers" class="muted">
+          <span class="muted">Keep selected MCP servers warm in fast chat too (paid once at session boot, not per turn) — e.g. tick <code>one-identity</code> for org/topic context on demand.</span>
+          <div id="s-chat_mcp_servers-list" style="margin-top:6px"></div>
+        </div>
         <div class="row2"><span class="grow"></span><button type="submit">Save settings</button></div>
         <div id="set-msg"></div>
       </form>
@@ -1913,6 +1918,22 @@
   $("#sf-all-sort").addEventListener("click",()=>{ sfSort.all=-sfSort.all; renderSf(); });
 
   /* ================= SETTINGS ================= */
+  let __mcpNames=[];
+  async function loadMcpServerNames(){
+    if(__mcpNames.length) return __mcpNames;
+    try{ __mcpNames=(await (await fetch("/api/settings/mcp-servers")).json()).names||[]; }
+    catch(e){ __mcpNames=[]; }
+    return __mcpNames;
+  }
+  function renderMcpServerList(names, selected){
+    const box=$("#s-chat_mcp_servers-list");
+    if(!names.length){ box.innerHTML=`<span class="muted">no MCP servers found in ~/.copilot/mcp-config.json</span>`; return; }
+    box.innerHTML=names.map(n=>{
+      const id="s-mcp-"+n.replace(/[^a-zA-Z0-9]/g,"_");
+      const checked=selected.includes(n)?" checked":"";
+      return `<label class="row2" style="gap:8px;cursor:pointer"><input type="checkbox" data-mcp="${esc(n)}" id="${id}" style="width:auto"${checked} /> <span class="muted">${esc(n)}</span></label>`;
+    }).join("");
+  }
   async function loadSettings(){
     try{
       const c=await (await fetch("/api/settings")).json();
@@ -1923,6 +1944,7 @@
       $("#s-chat_fast").checked=c.chat_fast!==false;
       $("#s-ado_pat").placeholder=c.ado_pat_set?"•••• set (leave blank to keep)":"blank = use az login";
       $("#s-hive_token").placeholder=c.hive_token_set?"•••• set (leave blank to keep)":"blank = ~/.hive/worker.token";
+      renderMcpServerList(await loadMcpServerNames(), Array.isArray(c.chat_mcp_servers)?c.chat_mcp_servers:[]);
       loadSfStatus();
     }catch(e){}
   }
@@ -1969,6 +1991,7 @@
     const payload={ ado_org:$("#s-ado_org").value.trim(), ado_upn:$("#s-ado_upn").value.trim(),
       hive_url:$("#s-hive_url").value.trim(), default_model:$("#s-default_model").value,
       chat_fast:$("#s-chat_fast").checked,
+      chat_mcp_servers:[...document.querySelectorAll("#s-chat_mcp_servers-list input[data-mcp]:checked")].map(el=>el.dataset.mcp),
       ado_pat:$("#s-ado_pat").value, hive_token:$("#s-hive_token").value };
     try{
       const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});

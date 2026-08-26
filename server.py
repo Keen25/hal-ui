@@ -104,6 +104,10 @@ DEFAULT_CONFIG = {
     "hive_token": "",       # optional override; blank => ~/.hive/worker.token
     "default_model": "",
     "chat_fast": True,      # disable MCP servers in the chat lane for faster startup
+    "chat_mcp_servers": [],  # names (from ~/.copilot/mcp-config.json) to keep warm in
+                              # the fast ACP lane too, e.g. ["one-identity"]. Each boot
+                              # pays that server's startup cost once; [] keeps the
+                              # original all-cold fast-lane behavior.
     "chat_idle_timeout": 900,  # legacy lane: reap a copilot -p turn after this many
                                # seconds with zero output (wedged subprocess). 0 = off.
     "sf_org": "",           # Salesforce target org username/alias; blank => auto-resolve
@@ -949,22 +953,56 @@ def _sf_crs(products: list) -> dict:
             "products": products, "identity_resolved": bool(me)}
 
 
-def _mcp_server_names() -> list[str]:
-    """Names of configured MCP servers (read once, cached), used to disable them for speed."""
-    global _mcp_names_cache
+def _mcp_config_raw() -> dict:
+    """Raw `~/.copilot/mcp-config.json` mcpServers dict (read once, cached)."""
+    global _mcp_config_cache
     try:
-        return _mcp_names_cache
+        return _mcp_config_cache
     except NameError:
         pass
-    names: list[str] = []
+    servers: dict = {}
     try:
         with open(os.path.expanduser("~/.copilot/mcp-config.json")) as fh:
             d = json.load(fh)
-        names = list((d.get("mcpServers") or d or {}).keys())
+        servers = d.get("mcpServers") or d or {}
     except Exception:
-        names = []
-    _mcp_names_cache = names
-    return names
+        servers = {}
+    _mcp_config_cache = servers
+    return servers
+
+
+def _mcp_server_names() -> list[str]:
+    """Names of all MCP servers configured for the CLI, for the settings picker."""
+    return list(_mcp_config_raw().keys())
+
+
+def _acp_mcp_servers(names: list[str] | None = None) -> list[dict]:
+    """Convert selected entries from `~/.copilot/mcp-config.json` (copilot CLI
+    format) into the ACP `session/new.mcpServers` shape: [{name, command, args,
+    env: [{name,value}]}] for local/stdio servers, [{name, type:"http", url}]
+    for http ones. Unknown/missing names are silently skipped so a stale saved
+    selection never breaks session boot. names=None reads the live setting."""
+    if names is None:
+        names = load_config().get("chat_mcp_servers", [])
+    raw = _mcp_config_raw()
+    out: list[dict] = []
+    for name in names:
+        cfg = raw.get(name)
+        if not cfg:
+            continue
+        if cfg.get("type") == "http":
+            entry = {"name": name, "type": "http", "url": cfg.get("url", "")}
+            if cfg.get("headers"):
+                entry["headers"] = cfg["headers"]
+            out.append(entry)
+        elif cfg.get("command"):
+            out.append({
+                "name": name,
+                "command": cfg["command"],
+                "args": cfg.get("args", []),
+                "env": [{"name": k, "value": v} for k, v in (cfg.get("env") or {}).items()],
+            })
+    return out
 
 
 def _build_argv(prompt: str, session: str, model: str | None,
@@ -990,10 +1028,14 @@ def _build_argv(prompt: str, session: str, model: str | None,
 
 # ======================================================================
 # ACP persistent chat lane (chat_fast ON): one long-lived `copilot --acp`
-# process per browser session. MCP stays cold (mcpServers:[]) so first turn
-# boots once and later turns skip the ~5-7s CLI+MCP startup entirely.
+# process per browser session. MCP stays cold by default (mcpServers:[]) so
+# first turn boots once and later turns skip the ~5-7s CLI+MCP startup
+# entirely. Config's chat_mcp_servers can opt specific servers back in (see
+# _acp_mcp_servers) when a session needs live org/topic context (e.g. the
+# One Identity MCP server) — that server's startup cost is then paid once,
+# at boot, not per turn.
 # Protocol (JSON-RPC over stdio):
-#   initialize -> session/new{cwd,mcpServers:[]} -> sessionId
+#   initialize -> session/new{cwd,mcpServers:[...configured...]} -> sessionId
 #   session/set_model{modelId}    (optional)
 #   session/prompt{sessionId,prompt:[{type:text,text}]} -> streams
 #       session/update notifications, ends with the request's response (stopReason)
@@ -1111,6 +1153,11 @@ class AcpProc:
             "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
         }, timeout=self.BOOT_TIMEOUT)
         wd = cwd or os.path.expanduser("~")
+        # Fast lane stays cold by default (mcpServers: []); config's
+        # chat_mcp_servers opts specific servers (e.g. "one-identity") back in
+        # when a session needs live org/topic context, at the cost of that
+        # server's startup time, paid once here at boot.
+        mcp_servers = _acp_mcp_servers()
         if load_id:
             # Resume an existing on-disk session (revived from the History tab).
             # session/load replays the full history as session/update notifications
@@ -1118,12 +1165,12 @@ class AcpProc:
             # harmlessly dropped here — the transcript is shown from /api/session/
             # transcript instead. The session is left ready to continue.
             self._request("session/load", {
-                "sessionId": load_id, "cwd": wd, "mcpServers": [],
+                "sessionId": load_id, "cwd": wd, "mcpServers": mcp_servers,
             }, timeout=self.BOOT_TIMEOUT)
             self.session_id = load_id
         else:
             res = self._request("session/new", {
-                "cwd": wd, "mcpServers": [],
+                "cwd": wd, "mcpServers": mcp_servers,
             }, timeout=self.BOOT_TIMEOUT)
             self.session_id = res.get("sessionId")
         if model:
@@ -2023,6 +2070,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, _load_transcript(sid, cwd))
         elif p.path == "/api/settings":
             self._json(200, masked_config())
+        elif p.path == "/api/settings/mcp-servers":
+            self._json(200, {"names": _mcp_server_names()})
         else:
             self._serve_static(p.path)
 
