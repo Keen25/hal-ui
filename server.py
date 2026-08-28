@@ -89,7 +89,6 @@ def _sf_env(base: dict | None = None) -> dict:
     env.setdefault("SF_USE_GENERIC_UNIX_KEYCHAIN", "true")
     env.setdefault("SFDX_USE_GENERIC_UNIX_KEYCHAIN", "true")
     return env
-HIVE_URL_DEFAULT = os.environ.get("HIVE_URL", "http://127.0.0.1:5001")
 HIVE_TOKEN_FILE = os.path.expanduser("~/.hive/worker.token")
 ADO_RESOURCE = "499b84ac-1321-427f-aa17-267ca6975798"  # Azure DevOps AAD app id
 CONFIG_DIR = os.path.expanduser("~/.config/hal-ui")
@@ -100,7 +99,11 @@ DEFAULT_CONFIG = {
     "ado_pat": "",          # optional; blank => use `az` AAD token
     "ado_identity": "",     # optional; blank => auto-resolve from ado_upn / az user
     "ado_upn": "",          # used to resolve identity; blank => `az account show` user
-    "hive_url": HIVE_URL_DEFAULT,
+    # Empty by default so a fresh install does not auto-wire a hive (no Hive tab
+    # until the user opts in via Settings). Existing installs keep their saved
+    # hive_url on upgrade (config.json layers over these defaults). Setting the
+    # HIVE_URL env var still seeds it for headless/scripted deploys.
+    "hive_url": os.environ.get("HIVE_URL", ""),
     "hive_token": "",       # optional override; blank => ~/.hive/worker.token
     "default_model": "",
     "chat_fast": True,      # disable MCP servers in the chat lane for faster startup
@@ -114,16 +117,193 @@ DEFAULT_CONFIG = {
     "sf_products": "ActiveRolesServer,PasswordManager",  # default R&D queues for the CR tab
 }
 _SECRET_KEYS = {"ado_pat", "hive_token"}
+_SECRET_ENC_SUFFIX = "_enc"
+# Secrets can be supplied out-of-band via the environment (e.g. systemd
+# EnvironmentFile) so they never have to touch disk. Env always wins and is
+# never persisted back into config.json.
+_SECRET_ENV = {
+    "ado_pat": ("HALUI_ADO_PAT", "AZURE_DEVOPS_EXT_PAT"),
+    "hive_token": ("HALUI_HIVE_TOKEN",),
+}
+SECRET_KEY_FILE = os.path.join(CONFIG_DIR, ".secret.key")
 _config_lock = threading.Lock()
+_secret_key_lock = threading.Lock()
+_SECRET_TOKEN_PREFIX = "HALUI1:"  # versioned; lets the format evolve later
+
+
+def _chmod_600(path: str) -> None:
+    """Best-effort tighten to owner rw. On POSIX this is 0600; on Windows
+    os.chmod only toggles the read-only bit (0600 keeps it writable) and the
+    file inherits the profile dir's ACL — no exception either way. Swallow
+    OSError so an exotic filesystem can never crash a config write."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _secret_key() -> bytes | None:
+    """Return the 32-byte master key from a 0600 key file, generating it on
+    first use. Stdlib only (no third-party crypto) so this behaves identically
+    on the Linux and Windows (WinSW) hosts. Returns None only if the key cannot
+    be read or created (e.g. read-only FS), in which case callers fall back to
+    plaintext-at-0600 rather than crashing."""
+    import base64 as _b64
+    with _secret_key_lock:
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            if os.path.exists(SECRET_KEY_FILE):
+                return _b64.urlsafe_b64decode(Path(SECRET_KEY_FILE).read_text().strip())
+            import secrets as _secrets
+            key = _secrets.token_bytes(32)
+            Path(SECRET_KEY_FILE).write_text(_b64.urlsafe_b64encode(key).decode())
+            _chmod_600(SECRET_KEY_FILE)
+            return key
+        except (OSError, ValueError):
+            return None
+
+
+def _subkeys(key: bytes) -> tuple[bytes, bytes]:
+    import hmac as _hmac
+    import hashlib as _hashlib
+    enc = _hmac.new(key, b"halui-enc", _hashlib.sha256).digest()
+    mac = _hmac.new(key, b"halui-mac", _hashlib.sha256).digest()
+    return enc, mac
+
+
+def _keystream(enc_key: bytes, nonce: bytes, n: int) -> bytes:
+    """HMAC-SHA256 in counter mode: block_i = HMAC(enc_key, nonce||counter_be4).
+    A fresh random nonce per message keeps the keystream unique."""
+    import hmac as _hmac
+    import hashlib as _hashlib
+    out = bytearray()
+    counter = 0
+    while len(out) < n:
+        block = _hmac.new(enc_key, nonce + counter.to_bytes(4, "big"),
+                          _hashlib.sha256).digest()
+        out.extend(block)
+        counter += 1
+    return bytes(out[:n])
+
+
+def _encrypt_secret(val: str) -> str | None:
+    """Encrypt-then-MAC a secret with the stdlib HMAC keystream cipher.
+    Returns a `HALUI1:<b64>` token, or None if no key is available."""
+    if not val:
+        return None
+    key = _secret_key()
+    if not key:
+        return None
+    try:
+        import base64 as _b64
+        import hmac as _hmac
+        import hashlib as _hashlib
+        import secrets as _secrets
+        enc_key, mac_key = _subkeys(key)
+        nonce = _secrets.token_bytes(16)
+        pt = val.encode("utf-8")
+        ct = bytes(a ^ b for a, b in zip(pt, _keystream(enc_key, nonce, len(pt))))
+        tag = _hmac.new(mac_key, nonce + ct, _hashlib.sha256).digest()
+        return _SECRET_TOKEN_PREFIX + _b64.urlsafe_b64encode(nonce + ct + tag).decode()
+    except Exception:
+        return None
+
+
+def _decrypt_secret(token: str) -> str:
+    """Inverse of _encrypt_secret. Returns "" on any tampering/format/key
+    mismatch (e.g. an encrypted config copied to a host without its key)."""
+    if not token or not token.startswith(_SECRET_TOKEN_PREFIX):
+        return ""
+    key = _secret_key()
+    if not key:
+        return ""
+    try:
+        import base64 as _b64
+        import hmac as _hmac
+        import hashlib as _hashlib
+        raw = _b64.urlsafe_b64decode(token[len(_SECRET_TOKEN_PREFIX):])
+        if len(raw) < 16 + 32:
+            return ""
+        nonce, body, tag = raw[:16], raw[16:-32], raw[-32:]
+        enc_key, mac_key = _subkeys(key)
+        want = _hmac.new(mac_key, nonce + body, _hashlib.sha256).digest()
+        if not _hmac.compare_digest(want, tag):
+            return ""  # tampered or wrong key
+        pt = bytes(a ^ b for a, b in zip(body, _keystream(enc_key, nonce, len(body))))
+        return pt.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _env_secret(key: str) -> str | None:
+    for name in _SECRET_ENV.get(key, ()):
+        v = os.environ.get(name)
+        if v:
+            return v.strip()
+    return None
 
 
 def load_config() -> dict:
+    """Effective config with secrets resolved to plaintext for runtime use.
+
+    Secret precedence: environment override > encrypted `<key>_enc` on disk >
+    legacy plaintext `<key>` on disk. The returned dict never contains the
+    internal `_enc` keys — callers keep reading `cfg["ado_pat"]` as before."""
     cfg = dict(DEFAULT_CONFIG)
     try:
-        cfg.update(json.loads(Path(CONFIG_FILE).read_text()))
+        raw = json.loads(Path(CONFIG_FILE).read_text())
     except (OSError, json.JSONDecodeError):
-        pass
+        raw = {}
+    for k, v in raw.items():
+        if k in _SECRET_KEYS or k.endswith(_SECRET_ENC_SUFFIX):
+            continue  # secrets resolved below; never surface stored ciphertext
+        cfg[k] = v
+    for k in _SECRET_KEYS:
+        env_v = _env_secret(k)
+        if env_v is not None:
+            cfg[k] = env_v
+            continue
+        enc = raw.get(k + _SECRET_ENC_SUFFIX)
+        if enc:
+            cfg[k] = _decrypt_secret(enc)
+        else:
+            cfg[k] = raw.get(k, DEFAULT_CONFIG.get(k, ""))  # legacy plaintext
     return cfg
+
+
+def _write_config(cfg: dict) -> None:
+    """Serialize config to disk with secrets encrypted, never in plaintext.
+    A secret sourced purely from the environment is not persisted, but any
+    ciphertext already on disk is preserved so unsetting the env var later does
+    not silently lose a stored secret."""
+    try:
+        prior = json.loads(Path(CONFIG_FILE).read_text())
+    except (OSError, json.JSONDecodeError):
+        prior = {}
+    out = {}
+    for k, v in cfg.items():
+        if k in _SECRET_KEYS or k.endswith(_SECRET_ENC_SUFFIX):
+            continue
+        out[k] = v
+    for k in _SECRET_KEYS:
+        val = cfg.get(k)
+        enc_key = k + _SECRET_ENC_SUFFIX
+        if val and _env_secret(k) == val:
+            # Provided by env: keep it out of the file, but retain any existing
+            # ciphertext so the stored secret survives the env var going away.
+            if prior.get(enc_key):
+                out[enc_key] = prior[enc_key]
+            continue
+        if not val:
+            continue
+        enc = _encrypt_secret(val)
+        if enc:
+            out[enc_key] = enc
+        else:
+            out[k] = val  # no key available: plaintext, still 0600 best-effort
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    Path(CONFIG_FILE).write_text(json.dumps(out, indent=2))
+    _chmod_600(CONFIG_FILE)
 
 
 def save_config(patch: dict) -> dict:
@@ -135,10 +315,21 @@ def save_config(patch: dict) -> dict:
             if k in _SECRET_KEYS and (v is None or v == ""):
                 continue  # blank secret => keep existing value
             cfg[k] = v
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        Path(CONFIG_FILE).write_text(json.dumps(cfg, indent=2))
-        os.chmod(CONFIG_FILE, 0o600)
+        _write_config(cfg)
     return cfg
+
+
+def _migrate_secrets() -> None:
+    """One-shot on startup: if config.json still holds a plaintext secret,
+    rewrite it in encrypted form so the PAT/token no longer sits in cleartext."""
+    try:
+        raw = json.loads(Path(CONFIG_FILE).read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    has_plaintext = any(k in raw for k in _SECRET_KEYS)
+    if has_plaintext and _secret_key() is not None:
+        with _config_lock:
+            _write_config(load_config())
 
 
 def masked_config() -> dict:
@@ -159,6 +350,56 @@ _COPILOT_SESSION_NS = uuid.UUID("5f3d9b2e-1c4a-4e77-9a10-7b6c8d2e4f01")
 
 def _copilot_session_id(session: str) -> str:
     return str(uuid.uuid5(_COPILOT_SESSION_NS, session))
+
+
+# --- ACP <-> legacy session bridge ------------------------------------
+# The legacy lane pins a deterministic uuid5 per browser label, so it resumes
+# the same on-disk copilot session every turn. The ACP fast lane instead calls
+# session/new, which mints a RANDOM v4 id that previously lived only in the
+# in-memory _acp_procs dict — so an AcpProc death, a hal-ui restart, or a
+# chat_fast lane toggle orphaned the conversation and the next turn started
+# empty (the "lost context mid-turn" bug). This tiny disk map remembers the
+# real copilot id last used for a label and lets EITHER lane resume it, closing
+# that leak.
+_SESSION_MAP_FILE = os.path.join(CONFIG_DIR, "sessions.json")
+_session_map_lock = threading.Lock()
+
+
+def _session_map_load() -> dict:
+    try:
+        return json.loads(Path(_SESSION_MAP_FILE).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _session_map_get(label: str) -> str | None:
+    """The real copilot session id last used for this browser label, but only if
+    that session still exists on disk (a stale id would make the ACP lane's
+    session/load fail)."""
+    if not label:
+        return None
+    with _session_map_lock:
+        sid = _session_map_load().get(label)
+    if sid and os.path.isdir(os.path.join(_SESSION_STATE_DIR, sid)):
+        return sid
+    return None
+
+
+def _session_map_put(label: str, sid: str | None) -> None:
+    if not label or not sid:
+        return
+    with _session_map_lock:
+        m = _session_map_load()
+        if m.get(label) == sid:
+            return
+        m[label] = sid
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            Path(_SESSION_MAP_FILE).write_text(json.dumps(m, indent=2))
+            _chmod_600(_SESSION_MAP_FILE)
+        except OSError:
+            pass
+
 
 # --- tiny TTL cache for GitHub (gh calls are ~1s each) -----------------
 _cache: dict[str, tuple[float, object]] = {}
@@ -199,7 +440,9 @@ def _hive_token() -> str:
 
 
 def _hive_url() -> str:
-    return (load_config().get("hive_url") or HIVE_URL_DEFAULT).rstrip("/")
+    # No localhost fallback: an empty hive_url means hive is disabled (see
+    # _hive_enabled), so callers are gated and must not invent a default.
+    return (load_config().get("hive_url") or "").strip().rstrip("/")
 
 
 def _hive_enabled() -> bool:
@@ -1730,6 +1973,9 @@ def _run_acp_turn(session, model, prompt, images, lt: LiveTurn,
         lt.append("error", {"message": f"acp launch failed: {exc}"})
         lt.append("done", {"code": 1})
         return
+    # Remember the real copilot id (session/new mints a random v4) so any later
+    # turn — in either lane, after a restart or lane toggle — resumes it.
+    _session_map_put(session, acp.session_id)
     lt.canceller = acp.cancel
     try:
         acp.prompt(prompt, lt.append, images=images)
@@ -1752,6 +1998,10 @@ def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
         seconds the subprocess is killed and the turn is closed, so the browser
         stops waiting and queued messages can drain."""
     emit = lt.append
+    # The id this turn actually resumes/creates (revive id, bridged id, or the
+    # deterministic uuid5). Persist it so the ACP lane can resume it too.
+    sid = copilot_id or _copilot_session_id(session)
+    _session_map_put(session, sid)
     argv = _build_argv(prompt, session, model, copilot_id=copilot_id)
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1873,6 +2123,12 @@ def _start_turn(session: str, model: str | None, prompt: str, images: list,
         if prev is not None and not prev.done:
             return prev
         _live_turns[session] = lt
+    # Bridge: with no explicit revive id, resume whatever real copilot session
+    # this label last used (ACP v4 or legacy uuid5). This is what survives an
+    # AcpProc death, a hal-ui restart, or a chat_fast lane toggle. An explicit
+    # copilot_id (History-tab revive) always wins.
+    if copilot_id is None:
+        copilot_id = _session_map_get(session)
     fast = bool(load_config().get("chat_fast", True)) or bool(images)
     lt.append("start", {"session": session, "acp": fast, "turn": turn_id})
 
@@ -2185,10 +2441,12 @@ def main():
     args = ap.parse_args()
     if not Path(COPILOT_BIN).exists():
         raise SystemExit(f"copilot binary not found at {COPILOT_BIN}")
+    _migrate_secrets()  # encrypt any legacy plaintext PAT/token left in config.json
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     tok = "ok" if _hive_token() else "MISSING"
+    hive_desc = f"{_hive_url()} token={tok}" if _hive_enabled() else "disabled"
     print(f"HAL-UI Phase 2 on http://{args.host}:{args.port}/  "
-          f"(copilot={COPILOT_BIN}, hive={_hive_url()} token={tok})")
+          f"(copilot={COPILOT_BIN}, hive={hive_desc})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

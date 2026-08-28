@@ -20,7 +20,10 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   session. Token-by-token streaming over SSE, per-session message queue (sends
   while busy are queued, not dropped), copy-to-clipboard on replies.
 - **Native Hive control** — fleet + queue view, task-detail/logs drawer, and a
-  "→ Hive" button that turns the current chat into a queued task.
+  "→ Hive" button that turns the current chat into a queued task. **Off by
+  default**: the Hive tab and button stay hidden until you set a Hive URL in
+  Settings (or start with the `HIVE_URL` env var). Existing installs keep their
+  configured URL on upgrade.
 - **GitHub "My Work"** — assigned PRs and issues via the `gh` CLI.
 - **Azure DevOps** — assigned PBIs and PRs (as author *and* reviewer, role-tagged)
   via `az` + ADO REST.
@@ -28,10 +31,20 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   ("this is what we'll discuss") without dumping boilerplate in the composer.
 - **Settings pane** — wire ADO org/PAT/UPN, Hive URL/token, default model, and the
   `chat_fast` toggle. Stored server-side at `~/.config/hal-ui/config.json` (0600).
+  Secrets (`ado_pat`, `hive_token`) are **encrypted at rest** with a stdlib-only
+  keyed cipher (per-host key in `~/.config/hal-ui/.secret.key`, 0600); they never
+  hit disk in cleartext and are masked on read. Any legacy plaintext is migrated
+  to ciphertext on the next start. Each secret can also be supplied via the
+  environment — `HALUI_ADO_PAT`/`AZURE_DEVOPS_EXT_PAT`, `HALUI_HIVE_TOKEN` — which
+  wins and is never persisted (works with a systemd `EnvironmentFile`).
 - **Persistent ACP chat lane** — with `chat_fast` on, each session runs one
   long-lived `copilot --acp` process (Agent Client Protocol over stdio). The CLI
   boots once; later turns skip startup entirely (cold ~10s → warm ~2-3s to first
-  token). Tool-permission requests are auto-approved (`allow_once`).
+  token). Tool-permission requests are auto-approved (`allow_once`). The real
+  copilot session id each turn uses is remembered per browser tab in
+  `~/.config/hal-ui/sessions.json` (0600), so a turn resumes the same
+  conversation across an `--acp` process death, a hal-ui restart, or a
+  `chat_fast` lane toggle — instead of silently starting an empty session.
 - **Rich markdown rendering** — HAL responses render as formatted HTML (GitHub
   tables, headings, bold/italic, inline + fenced code, lists, blockquotes, links)
   via a small zero-dependency, XSS-safe renderer. The copy button puts **rich
@@ -74,8 +87,10 @@ server.py (Python stdlib http.server, threaded)
 - Chat, legacy lane (`chat_fast` off): per-turn `copilot -p … --output-format json`
   spawn with full MCP servers.
 - Data: `gh` CLI (TTL-cached), `az account get-access-token` → ADO REST, Hive REST.
-- Config: `~/.config/hal-ui/config.json` (0600); secrets masked on read, preserved
-  if POSTed blank.
+- Config: `~/.config/hal-ui/config.json` (0600); secrets encrypted at rest
+  (stdlib keyed cipher, key in `.secret.key`), masked on read, preserved if
+  POSTed blank, overridable via env. Per-tab copilot session ids in
+  `sessions.json` (0600).
 
 ### Frontend — `static/index.html`
 - Vanilla HTML/CSS/JS, no framework, no bundler — served straight off disk.
@@ -182,5 +197,4 @@ cd $env:USERPROFILE\hal-ui ; git pull --ff-only ; Restart-Service hal-ui
 - `gh` CLI (for GitHub views), `az` CLI (for ADO views) — optional per view
 
 ## Roadmap
-- Multi-turn ACP session persistence across server restarts (`session/load`).
 - Per-turn token/cost usage surfaced in the chat UI (ACP `usage_update`).
