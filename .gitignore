@@ -4,4 +4,6 @@ __pycache__/
 .DS_Store
 # runtime config lives outside the repo, but never commit it if copied in
 config.json
+sessions.json
+.secret.key
 *.token
