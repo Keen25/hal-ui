@@ -64,7 +64,7 @@ def _resolve_sf() -> tuple[str, str]:
 
 
 SF_BIN, SF_BIN_DIR = _resolve_sf()
-SF_EXPECTED_ORG_ID = "00D30000000n44BEAQ"   # Quest/One Identity Salesforce org
+SF_EXPECTED_ORG_ID = "00Da500001UOLuLEAX"   # One Identity Salesforce org (new RDE instance; was Quest 00D30000000n44BEAQ)
 
 
 def _sf_env(base: dict | None = None) -> dict:
