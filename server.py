@@ -510,7 +510,10 @@ def _context_source_files(context_path: str) -> list[str]:
             break
         files += _md_files_sorted(cur, confine_root=CONTEXT_REPO_ROOT)
     for pd in PERSONAL_CONTEXT_DIRS:
-        files += _md_files_sorted(pd)
+        # Confine each personal dir to itself: it legitimately lives outside the
+        # context repo, but a .md symlink inside it must not escape to arbitrary
+        # files (the compose/tree endpoints would otherwise disclose them).
+        files += _md_files_sorted(pd, confine_root=pd)
     for pf in PERSONAL_INSTRUCTIONS_FILES:
         try:
             if os.path.isfile(pf) and os.path.getsize(pf) > 0:
@@ -589,7 +592,19 @@ def _context_tree() -> dict:
     selected. Shape: {name, path, children:[...]}."""
     root = CONTEXT_REPO_ROOT
 
-    def walk(d: str, rel: str) -> dict | None:
+    def walk(d: str, rel: str, chain: frozenset) -> dict | None:
+        # Guard against symlink cycles (a subdir resolving to one of its own
+        # ancestors). Track resolved (device, inode) along the ACTIVE ancestor
+        # chain only — not globally — so two distinct non-cyclic symlink aliases
+        # to the same real dir both still appear in the picker.
+        try:
+            st = os.stat(d)
+            key = (st.st_dev, st.st_ino)
+        except OSError:
+            return None
+        if key in chain:
+            return None
+        chain = chain | {key}
         children = []
         has_md = False
         try:
@@ -600,10 +615,10 @@ def _context_tree() -> dict:
             full = os.path.join(d, name)
             if os.path.isdir(full):
                 # Don't follow a symlinked dir that escapes the repo root (guards
-                # against exposing external trees or a symlink cycle).
+                # against exposing external trees).
                 if os.path.islink(full) and not _within_root(full, root):
                     continue
-                sub = walk(full, f"{rel}/{name}" if rel else name)
+                sub = walk(full, f"{rel}/{name}" if rel else name, chain)
                 if sub is not None:
                     children.append(sub)
             elif name.lower().endswith(".md"):
@@ -613,40 +628,58 @@ def _context_tree() -> dict:
         return {"name": os.path.basename(d) or "context",
                 "path": rel, "children": children}
 
-    node = walk(root, "")
+    node = walk(root, "", frozenset())
     if node is None:
         return {"name": "context", "path": "", "children": [], "available": False}
     node["available"] = True
     return node
 
 
-# Per-session context state: the context_path last injected, so we prepend the
-# preamble once per session and re-inject only when the selection changes. Reset
+# Per-session context state: the (context_path, generation) last injected, so we
+# prepend the preamble once per session and re-inject only when the selection
+# changes. The generation token lets a launch-failure rollback target the exact
+# injection it made — so a stale worker from a closed+reused session label can't
+# clear a newer turn's mark (path-only matching couldn't tell them apart). Reset
 # when a session is closed.
-_ctx_state: dict[str, str] = {}
+_ctx_state: dict[str, tuple[str, int]] = {}
 _ctx_lock = threading.Lock()
+_ctx_gen = 0
 
 
-def _context_preamble(session: str, context_path: str) -> str:
-    """Return the context block to prepend to this turn's prompt, or "" if the
-    session's context is unchanged (already injected) or empty. Marks the
-    session as injected for this context_path. Lane-agnostic: works for both the
-    ACP and legacy lanes because it rides in the prompt text, exactly like AW's
-    AGENTS.md rode in copilot's system prompt."""
+def _next_ctx_gen() -> int:
+    """Monotonic injection-generation counter (call under _ctx_lock)."""
+    global _ctx_gen
+    _ctx_gen += 1
+    return _ctx_gen
+
+
+def _context_preamble(session: str, context_path: str):
+    """Return (preamble, token) for this turn. `preamble` is the context block to
+    prepend to the prompt, or "" if the session's context is unchanged (already
+    injected) or empty. `token` is an opaque (context_path, generation) marker
+    identifying THIS injection — pass it to _context_rollback on a launch failure
+    so only this exact injection is undone — or None when nothing was injected.
+    Lane-agnostic: the preamble rides in the prompt text (both ACP and legacy
+    lanes), exactly like AW's AGENTS.md rode in copilot's system prompt."""
     context_path = (context_path or "").strip()
     with _ctx_lock:
-        if _ctx_state.get(session) == context_path:
-            return ""
-    if not context_path:
-        with _ctx_lock:
-            _ctx_state[session] = ""
-        return ""
+        cur = _ctx_state.get(session)
+        if cur is not None and cur[0] == context_path:
+            return "", None
+        if not context_path:
+            _ctx_state[session] = ("", _next_ctx_gen())
+            return "", None
     text, _bundle = _materialize_context({"context_path": context_path})
-    with _ctx_lock:
-        _ctx_state[session] = context_path
     if not text:
-        return ""
-    return (
+        # Composed to nothing (empty/unreadable context repo). Do NOT mark the
+        # session as injected — otherwise a later turn, once the files exist,
+        # would be deduped away and never get the context. Leaving the mark unset
+        # means we retry compose next turn (cheap; the tree is small).
+        return "", None
+    with _ctx_lock:
+        token = (context_path, _next_ctx_gen())
+        _ctx_state[session] = token
+    preamble = (
         "The following is your operating context for this session (project, "
         "persona, conventions, and workflow rules). Treat it as authoritative "
         "system guidance for the entire session, then respond to the user's "
@@ -656,6 +689,7 @@ def _context_preamble(session: str, context_path: str) -> str:
         "===== END SESSION CONTEXT =====\n\n"
         "User message:\n"
     )
+    return preamble, token
 
 
 def _context_forget(session: str) -> None:
@@ -663,13 +697,16 @@ def _context_forget(session: str) -> None:
         _ctx_state.pop(session, None)
 
 
-def _context_rollback(session: str, context_path: str) -> None:
-    """Undo the once-per-session injection mark after a turn failed to launch, so
-    the next turn re-injects the context. Only rolls back if the session's mark
-    still matches the path we injected (a concurrent selection change wins)."""
-    context_path = (context_path or "").strip()
+def _context_rollback(session: str, token) -> None:
+    """Undo a specific injection after its turn failed to launch/deliver, so the
+    next turn re-injects. `token` is the (context_path, generation) returned by
+    _context_preamble. Only rolls back if the session's mark is still that exact
+    token — a newer selection or a newer turn's injection (different generation)
+    always wins, so a stale worker can't clear a live mark."""
+    if not token:
+        return
     with _ctx_lock:
-        if _ctx_state.get(session) == context_path:
+        if _ctx_state.get(session) == token:
             _ctx_state.pop(session, None)
 
 
@@ -1768,12 +1805,17 @@ class AcpProc:
         except Exception:
             pass
 
-    def prompt(self, text: str, emit, images: list | None = None):
-        """Run one turn; translate ACP session/update stream to the SSE contract."""
+    def prompt(self, text: str, emit, images: list | None = None) -> bool:
+        """Run one turn; translate ACP session/update stream to the SSE contract.
+        Returns True once the session/prompt request was successfully written to
+        the child (i.e. the prompt — including any injected context preamble —
+        was delivered), False if the process was unavailable or died before the
+        write. Callers use this to decide whether to roll back a once-per-session
+        context injection: only a pre-delivery failure should re-inject."""
         if self.dead or not self.session_id:
             emit("error", {"message": "acp session unavailable"})
             emit("done", {"code": 1})
-            return
+            return False
         blocks: list[dict] = []
         if text:
             blocks.append({"type": "text", "text": text})
@@ -1782,6 +1824,7 @@ class AcpProc:
                            "data": im.get("data", "")})
         if not blocks:
             blocks = [{"type": "text", "text": text}]
+        delivered = False
         with self._turn_lock:
             q: queue.Queue = queue.Queue()
             with self._event_lock:
@@ -1791,9 +1834,11 @@ class AcpProc:
             self._pending[rid] = resp_q
             full = []
             tools: list[str] = []
+            ok = False
             try:
                 self._write({"jsonrpc": "2.0", "id": rid, "method": "session/prompt",
                              "params": {"sessionId": self.session_id, "prompt": blocks}})
+                delivered = True
                 while True:
                     try:
                         resp_q.get_nowait()
@@ -1824,13 +1869,23 @@ class AcpProc:
                             tools.append(name)
                         emit("tool", {"type": "tool_call", "name": name})
                     # tool_call_update / usage_update / config_option_update: ignored
+                ok = True
+            except Exception as exc:
+                # Never let a transport error escape: emit the failure and report
+                # delivery via the return value so the caller's context-rollback
+                # decision stays correct (delivered stays False if _write raised
+                # before it landed).
+                emit("error", {"message": str(exc)})
+                emit("done", {"code": 1})
             finally:
                 self._pending.pop(rid, None)
                 with self._event_lock:
                     self._event_q = None
-            emit("message", {"text": "".join(full), "model": self.model, "tools": tools})
-            emit("idle", {})
-            emit("done", {"code": 0})
+            if ok:
+                emit("message", {"text": "".join(full), "model": self.model, "tools": tools})
+                emit("idle", {})
+                emit("done", {"code": 0})
+        return delivered
 
 
 _acp_procs: dict[str, AcpProc] = {}
@@ -2254,10 +2309,21 @@ def _run_acp_turn(session, model, prompt, images, lt: LiveTurn,
     _session_map_put(session, acp.session_id)
     lt.canceller = acp.cancel
     try:
-        acp.prompt(prompt, lt.append, images=images)
+        delivered = acp.prompt(prompt, lt.append, images=images)
     except Exception as exc:
+        # prompt() is designed not to raise; if it somehow does, delivery is
+        # unknown — err toward re-injecting rather than silently losing context.
+        if injected_ctx is not None:
+            _context_rollback(session, injected_ctx)
         lt.append("error", {"message": str(exc)})
         lt.append("done", {"code": 1})
+        return
+    # Live at _acp_get but died before the session/prompt write landed: the
+    # context preamble never reached copilot, so undo the once-per-session mark
+    # and let the next turn re-inject. A post-delivery failure keeps the mark
+    # (re-injecting would double the context).
+    if not delivered and injected_ctx is not None:
+        _context_rollback(session, injected_ctx)
 
 
 def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None,
@@ -2413,12 +2479,11 @@ def _start_turn(session: str, model: str | None, prompt: str, images: list,
     # concurrency guard above would treat as a permanently in-flight turn).
     injected_ctx = None
     try:
-        preamble = _context_preamble(session, context_path or "")
+        preamble, injected_ctx = _context_preamble(session, context_path or "")
     except Exception:
-        preamble = ""
+        preamble, injected_ctx = "", None
     if preamble:
         prompt = preamble + prompt
-        injected_ctx = (context_path or "").strip()
     # Bridge: with no explicit revive id, resume whatever real copilot session
     # this label last used (ACP v4 or legacy uuid5). This is what survives an
     # AcpProc death, a hal-ui restart, or a chat_fast lane toggle. An explicit
