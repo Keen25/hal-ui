@@ -319,6 +319,9 @@
         <option value="claude-sonnet-4.5">sonnet-4.5</option>
         <option value="gpt-5.4">gpt-5.4</option>
       </select>
+      <select id="ctx" title="Session context (org/product/persona) injected on the first turn">
+        <option value="">no context</option>
+      </select>
       <textarea id="prompt" rows="1" placeholder="Message HAL…" autofocus></textarea>
       <button id="tohive" type="button" class="ghost" title="Queue this session's work as a hive task">→ Hive</button>
       <button id="stop" type="button" class="stopbtn" title="Stop the current turn" style="display:none">■ Stop</button>
@@ -507,6 +510,8 @@
         <input id="s-hive_token" type="password" placeholder="blank = ~/.hive/worker.token (leave blank to keep)" />
         <label class="muted">Default model</label>
         <select id="s-default_model"><option value="">default</option><option value="claude-sonnet-4.5">sonnet-4.5</option><option value="gpt-5.4">gpt-5.4</option></select>
+        <label class="muted">Default context</label>
+        <select id="s-default_context" title="Org/product/persona context applied to new chat sessions (replaces Agent Wrapper's context path)"><option value="">no context</option></select>
         <label class="muted">Fast chat</label>
         <label class="row2" style="gap:8px;cursor:pointer"><input id="s-chat_fast" type="checkbox" style="width:auto" /> <span class="muted">Disable MCP servers in chat for faster startup (~5-7s/msg). Turn off if you need MCP tools mid-chat.</span></label>
         <label class="muted">Fast-lane context</label>
@@ -710,7 +715,7 @@
   function newSession() {
     const sid = newSid();
     const n = state.order.length + 1;
-    state.sessions[sid] = { label:"Session " + n, model: (cur() ? cur().model : "") || window.__defaultModel || "", messages:[] };
+    state.sessions[sid] = { label:"Session " + n, model: (cur() ? cur().model : "") || window.__defaultModel || "", ctxPath: (cur() ? cur().ctxPath : "") || window.__defaultContext || "", messages:[] };
     state.order.push(sid); state.active = sid; save(); renderStrip(); renderLog(); syncModel(); renderPending(); $("#prompt").focus();
   }
   // Open a work item / PR / issue as a fresh chat session with pinned context (composer stays empty).
@@ -718,6 +723,7 @@
     const sid = newSid();
     state.sessions[sid] = { label: label || ("Session " + (state.order.length + 1)),
       model: (cur() ? cur().model : "") || window.__defaultModel || "",
+      ctxPath: (cur() ? cur().ctxPath : "") || window.__defaultContext || "",
       ctx: ctx || null, ctxSent: false, messages:[] };
     state.order.push(sid); state.active = sid; save();
     document.querySelector('.tab[data-view="chat"]').click();
@@ -926,7 +932,36 @@
   }
   function onHistInput() { renderHistory(); scheduleDiskSearch(); }
   $("#hist-q").addEventListener("input", onHistInput);
-  function syncModel() { $("#model").value = cur().model || ""; }
+  function syncModel() { $("#model").value = cur().model || ""; syncCtx(); }
+
+  // --- session context picker (org/product/persona; replaces Agent Wrapper) ---
+  // Populate #ctx from the composed context tree; each node's full path becomes
+  // an option, indented by depth so the Pillar/Product hierarchy reads clearly.
+  function ctxOptions(node, depth, out){
+    if(node.path){
+      const pad = "\u00A0\u00A0".repeat(Math.max(0, depth-1));
+      out.push(`<option value="${esc(node.path)}">${pad}${esc(node.name)}</option>`);
+    }
+    for(const c of (node.children||[])) ctxOptions(c, depth+1, out);
+  }
+  function fillCtxSelect(tree){
+    const sel = $("#ctx"); if(!sel) return;
+    const prev = sel.value;
+    const out = [`<option value="">no context</option>`];
+    if(tree && tree.available) ctxOptions(tree, 0, out);
+    sel.innerHTML = out.join("");
+    if([...sel.options].some(o => o.value === prev)) sel.value = prev;
+    syncCtx();
+  }
+  function syncCtx(){ const sel=$("#ctx"); if(sel) sel.value = (cur() && cur().ctxPath) || ""; }
+  function fillDefaultCtxSelect(tree){
+    const sel = $("#s-default_context"); if(!sel) return;
+    const prev = sel.value;
+    const out = [`<option value="">no context</option>`];
+    if(tree && tree.available) ctxOptions(tree, 0, out);
+    sel.innerHTML = out.join("");
+    if([...sel.options].some(o => o.value === prev)) sel.value = prev;
+  }
 
   // Populate the three model <select>s from the live catalog (/api/models),
   // so they mirror the console's picker instead of a hard-coded list. Falls
@@ -1049,6 +1084,7 @@
   promptEl.addEventListener("input",()=>{promptEl.style.height="auto";promptEl.style.height=Math.min(promptEl.scrollHeight,160)+"px";});
   promptEl.addEventListener("keydown",(e)=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();form.requestSubmit();}});
   $("#model").addEventListener("change", () => { cur().model = $("#model").value; save(); });
+  $("#ctx").addEventListener("change", () => { cur().ctxPath = $("#ctx").value || ""; save(); });
 
   const pendingQ = {};  // sid -> [{text, atts},...] messages waiting for the current turn to finish
   const pendingAtt = {}; // sid -> [{mime, data, dataUrl},...] images pasted into the composer
@@ -1167,6 +1203,7 @@
       url += `&copilot=${encodeURIComponent(s.copilotId)}`;
       if (s.copilotCwd) url += `&cwd=${encodeURIComponent(s.copilotCwd)}`;
     }
+    if (s.ctxPath) url += `&ctx=${encodeURIComponent(s.ctxPath)}`;   // session context (org/product/persona)
     const source = new EventSource(url);
     wireStream(sid, source, bot);
   }
@@ -1281,9 +1318,11 @@
   }
 
   // pull default model from settings for new sessions
-  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); }).catch(()=>{});
+  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; window.__defaultContext = c.default_context||""; if(window.__ctxTree){ fillDefaultCtxSelect(window.__ctxTree); $("#s-default_context").value=window.__defaultContext; } applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); }).catch(()=>{});
   // populate model selectors from the live catalog (mirrors the console picker)
   fetch("/api/models").then(r=>r.json()).then(d=>{ if(!d.error){ window.__models=d; fillModelSelects(d); } }).catch(()=>{});
+  // populate the session-context picker from the composed context tree
+  fetch("/api/context/tree").then(r=>r.json()).then(t=>{ window.__ctxTree=t; fillCtxSelect(t); fillDefaultCtxSelect(t); $("#s-default_context").value=window.__defaultContext||""; }).catch(()=>{});
 
   /* ================= HIVE ================= */
   const ACTIVE = new Set(["queued","pending","claimed","running","probing","reviewing","needs_attention","merging"]);
@@ -1997,6 +2036,8 @@
       $("#s-ado_upn").value=c.ado_upn||"";
       $("#s-hive_url").value=c.hive_url||"";
       $("#s-default_model").value=c.default_model||"";
+      if(window.__ctxTree) fillDefaultCtxSelect(window.__ctxTree);
+      $("#s-default_context").value=c.default_context||"";
       $("#s-chat_fast").checked=c.chat_fast!==false;
       $("#s-ado_pat").placeholder=c.ado_pat_set?"•••• set (leave blank to keep)":"blank = use az login";
       $("#s-hive_token").placeholder=c.hive_token_set?"•••• set (leave blank to keep)":"blank = ~/.hive/worker.token";
@@ -2046,6 +2087,7 @@
     e.preventDefault(); const m=$("#set-msg"); m.className=""; m.textContent="";
     const payload={ ado_org:$("#s-ado_org").value.trim(), ado_upn:$("#s-ado_upn").value.trim(),
       hive_url:$("#s-hive_url").value.trim(), default_model:$("#s-default_model").value,
+      default_context:$("#s-default_context").value,
       chat_fast:$("#s-chat_fast").checked,
       chat_mcp_servers:[...document.querySelectorAll("#s-chat_mcp_servers-list input[data-mcp]:checked")].map(el=>el.dataset.mcp),
       ado_pat:$("#s-ado_pat").value, hive_token:$("#s-hive_token").value };
@@ -2053,6 +2095,7 @@
       const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
       const c=await r.json();
       window.__defaultModel=c.default_model||"";
+      window.__defaultContext=c.default_context||"";
       applyHive(c.hive_enabled!==false);
       $("#s-ado_pat").value=""; $("#s-hive_token").value=""; loadSettings();
       m.className="msgbox ok"; m.textContent="saved"; 

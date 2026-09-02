@@ -106,6 +106,9 @@ DEFAULT_CONFIG = {
     "hive_url": os.environ.get("HIVE_URL", ""),
     "hive_token": "",       # optional override; blank => ~/.hive/worker.token
     "default_model": "",
+    "default_context": "",  # session context path (e.g. "ActiveRolesPillar/ActiveRoles")
+                            # applied to new chat sessions; "" => no context. Replaces
+                            # Agent Wrapper's per-launch context-path prompt.
     "chat_fast": True,      # disable MCP servers in the chat lane for faster startup
     "chat_mcp_servers": [],  # names (from ~/.copilot/mcp-config.json) to keep warm in
                               # the fast ACP lane too, e.g. ["one-identity"]. Each boot
@@ -399,6 +402,275 @@ def _session_map_put(label: str, sid: str | None) -> None:
             _chmod_600(_SESSION_MAP_FILE)
         except OSError:
             pass
+
+
+# ======================================================================
+# Session context (formerly Agent Wrapper's job)
+# ----------------------------------------------------------------------
+# Agent Wrapper used to prompt for a "context path", concatenate that path's
+# markdown down the tree into ~/AGENTS.md, and launch copilot with cwd=~ so the
+# CLI read it. With AW gone, that ~/AGENTS.md is a frozen snapshot every hal-ui
+# session silently inherits. hal-ui now owns this: it composes the SAME context
+# on demand from the still-live source of truth
+# (~/.agents/.github/agents/context/**), and injects it into a session WITHOUT
+# touching the working directory — so a session opened on a real repo keeps that
+# repo's own AGENTS.md and file-access root, and simply gets the selected
+# org/product/persona context prepended as authoritative guidance on its first
+# turn (the lane-agnostic equivalent of what AW's AGENTS.md did).
+#
+# Design is deliberately "profile-shaped": compose_context() takes a spec dict
+# (currently just {"context_path": ...}) so a future Profiles feature can pass
+# model/mcp/skills alongside it without a refactor.
+# ======================================================================
+
+# The oi-eng/.github checkout that holds the shared context tree. Detected once;
+# overridable via env for non-standard layouts.
+def _detect_context_repo_root() -> str:
+    env = os.environ.get("HALUI_CONTEXT_ROOT", "").strip()
+    cands = [env] if env else []
+    cands += [
+        os.path.expanduser("~/.agents/.github/agents/context"),
+        os.path.expanduser("~/.github/agents/context"),
+    ]
+    for c in cands:
+        if c and os.path.isdir(c):
+            return c
+    return cands[-1]
+
+
+CONTEXT_REPO_ROOT = _detect_context_repo_root()
+# Personal context that AW appended after the repo context (persona, overview,
+# auth notes). Kept last so product context sets the stage and persona/identity
+# closes it — matching the old ~/AGENTS.md ordering.
+PERSONAL_CONTEXT_DIRS = [os.path.expanduser("~/.agents/context")]
+PERSONAL_INSTRUCTIONS_FILES = [os.path.expanduser("~/.aw/personal-instructions.md")]
+# Where composed AGENTS.md bundles are materialized (for --add-dir trust of any
+# bundled skills, and for preview). Never the session cwd.
+CONTEXTS_OUT_DIR = os.path.join(CONFIG_DIR, "contexts")
+
+
+def _ctx_slug(context_path: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "-", (context_path or "").strip("/")).strip("-")
+    return s.lower() or "root"
+
+
+def _within_root(path: str, root: str) -> bool:
+    """True if path (after resolving symlinks) is root or lives under it. Blocks a
+    symlink inside the context repo from escaping to arbitrary files."""
+    try:
+        rp = os.path.realpath(path)
+        rr = os.path.realpath(root)
+    except OSError:
+        return False
+    return rp == rr or rp.startswith(rr + os.sep)
+
+
+def _md_files_sorted(d: str, confine_root: str | None = None) -> list[str]:
+    """Name-sorted .md files directly in d. When confine_root is given, drop any
+    whose resolved path escapes that root (symlink guard); personal dirs pass
+    None because they legitimately live outside the context repo."""
+    try:
+        names = [n for n in os.listdir(d)
+                 if n.lower().endswith(".md") and os.path.isfile(os.path.join(d, n))]
+    except OSError:
+        return []
+    out = []
+    for n in sorted(names):
+        full = os.path.join(d, n)
+        if confine_root is not None and not _within_root(full, confine_root):
+            continue
+        out.append(full)
+    return out
+
+
+def _context_path_segments(context_path: str) -> list[str]:
+    """Sanitized path segments under the context repo, rejecting traversal."""
+    segs = []
+    for part in (context_path or "").replace("\\", "/").split("/"):
+        part = part.strip()
+        if not part or part in (".", ".."):
+            continue
+        segs.append(part)
+    return segs
+
+
+def _context_source_files(context_path: str) -> list[str]:
+    """Ordered list of markdown files AW would have concatenated for this path:
+    repo context root files, then each segment down the chain, then personal
+    context. Every level's files are name-sorted (numeric prefixes give the
+    intended order)."""
+    files: list[str] = []
+    files += _md_files_sorted(CONTEXT_REPO_ROOT, confine_root=CONTEXT_REPO_ROOT)
+    cur = CONTEXT_REPO_ROOT
+    for seg in _context_path_segments(context_path):
+        cur = os.path.join(cur, seg)
+        # Confine each descended dir to the repo root so a symlinked subdir can't
+        # escape and pull in arbitrary markdown.
+        if not os.path.isdir(cur) or not _within_root(cur, CONTEXT_REPO_ROOT):
+            break
+        files += _md_files_sorted(cur, confine_root=CONTEXT_REPO_ROOT)
+    for pd in PERSONAL_CONTEXT_DIRS:
+        files += _md_files_sorted(pd)
+    for pf in PERSONAL_INSTRUCTIONS_FILES:
+        try:
+            if os.path.isfile(pf) and os.path.getsize(pf) > 0:
+                files.append(pf)
+        except OSError:
+            continue
+    return files
+
+
+def _strip_aw_boilerplate(body: str) -> str:
+    """Remove the obsolete Agent Wrapper self-description that leads the shared
+    team repo's 01_general.md. That block claims the file "was automatically
+    generated by Agent Wrapper" and describes AW's launch flow — false now that
+    AW is retired and hal-ui composes context itself. We can't edit the shared
+    repo here, so strip it at compose time.
+
+    Only the LEADING run of paragraphs is considered: we drop leading paragraphs
+    that are the "# AGENTS.md" title or mention "Agent Wrapper", and stop at the
+    first real content paragraph — so a legitimate later mention (e.g. a
+    migration note in some other file) is preserved and nothing else is touched.
+    """
+    if "Agent Wrapper" not in body:
+        return body
+    paras = re.split(r"\n\s*\n", body)
+    i = 0
+    while i < len(paras):
+        p = paras[i].strip()
+        if p == "" or p == "# AGENTS.md" or "Agent Wrapper" in p:
+            i += 1
+            continue
+        break
+    return "\n\n".join(paras[i:]).strip()
+
+
+def compose_context(spec: dict) -> str:
+    """Concatenate the context markdown for a spec into one document.
+
+    spec: {"context_path": "<Pillar>/<Product>/..."} (profile-shaped; extra keys
+    are ignored today, reserved for future model/mcp/skills profiles).
+    Returns "" when the path resolves to no content."""
+    context_path = (spec or {}).get("context_path", "") or ""
+    parts: list[str] = []
+    for fp in _context_source_files(context_path):
+        try:
+            body = Path(fp).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        body = _strip_aw_boilerplate(body)
+        if body:
+            parts.append(body)
+    return "\n\n---\n\n".join(parts)
+
+
+def _materialize_context(spec: dict) -> tuple[str, str]:
+    """Compose + write the bundle to CONTEXTS_OUT_DIR/<slug>/AGENTS.md.
+    Returns (composed_text, bundle_dir). bundle_dir is "" when there is no
+    content. The dir is safe to --add-dir (legacy lane) so any bundled
+    .github/skills would be trusted; it is never used as the session cwd."""
+    context_path = (spec or {}).get("context_path", "") or ""
+    text = compose_context(spec)
+    if not text:
+        return "", ""
+    bundle = os.path.join(CONTEXTS_OUT_DIR, _ctx_slug(context_path))
+    try:
+        os.makedirs(bundle, exist_ok=True)
+        Path(os.path.join(bundle, "AGENTS.md")).write_text(text, encoding="utf-8")
+    except OSError:
+        return text, ""
+    return text, bundle
+
+
+def _context_tree() -> dict:
+    """Nested pickable tree of the context repo: every directory that (directly
+    or transitively) contains a .md file becomes a node. Leaf .md files are not
+    listed individually — a node's own files are always included when its path is
+    selected. Shape: {name, path, children:[...]}."""
+    root = CONTEXT_REPO_ROOT
+
+    def walk(d: str, rel: str) -> dict | None:
+        children = []
+        has_md = False
+        try:
+            entries = sorted(os.listdir(d))
+        except OSError:
+            entries = []
+        for name in entries:
+            full = os.path.join(d, name)
+            if os.path.isdir(full):
+                # Don't follow a symlinked dir that escapes the repo root (guards
+                # against exposing external trees or a symlink cycle).
+                if os.path.islink(full) and not _within_root(full, root):
+                    continue
+                sub = walk(full, f"{rel}/{name}" if rel else name)
+                if sub is not None:
+                    children.append(sub)
+            elif name.lower().endswith(".md"):
+                has_md = True
+        if not has_md and not children:
+            return None
+        return {"name": os.path.basename(d) or "context",
+                "path": rel, "children": children}
+
+    node = walk(root, "")
+    if node is None:
+        return {"name": "context", "path": "", "children": [], "available": False}
+    node["available"] = True
+    return node
+
+
+# Per-session context state: the context_path last injected, so we prepend the
+# preamble once per session and re-inject only when the selection changes. Reset
+# when a session is closed.
+_ctx_state: dict[str, str] = {}
+_ctx_lock = threading.Lock()
+
+
+def _context_preamble(session: str, context_path: str) -> str:
+    """Return the context block to prepend to this turn's prompt, or "" if the
+    session's context is unchanged (already injected) or empty. Marks the
+    session as injected for this context_path. Lane-agnostic: works for both the
+    ACP and legacy lanes because it rides in the prompt text, exactly like AW's
+    AGENTS.md rode in copilot's system prompt."""
+    context_path = (context_path or "").strip()
+    with _ctx_lock:
+        if _ctx_state.get(session) == context_path:
+            return ""
+    if not context_path:
+        with _ctx_lock:
+            _ctx_state[session] = ""
+        return ""
+    text, _bundle = _materialize_context({"context_path": context_path})
+    with _ctx_lock:
+        _ctx_state[session] = context_path
+    if not text:
+        return ""
+    return (
+        "The following is your operating context for this session (project, "
+        "persona, conventions, and workflow rules). Treat it as authoritative "
+        "system guidance for the entire session, then respond to the user's "
+        "message that follows it.\n\n"
+        "===== BEGIN SESSION CONTEXT =====\n"
+        f"{text}\n"
+        "===== END SESSION CONTEXT =====\n\n"
+        "User message:\n"
+    )
+
+
+def _context_forget(session: str) -> None:
+    with _ctx_lock:
+        _ctx_state.pop(session, None)
+
+
+def _context_rollback(session: str, context_path: str) -> None:
+    """Undo the once-per-session injection mark after a turn failed to launch, so
+    the next turn re-injects the context. Only rolls back if the session's mark
+    still matches the path we injected (a concurrent selection change wins)."""
+    context_path = (context_path or "").strip()
+    with _ctx_lock:
+        if _ctx_state.get(session) == context_path:
+            _ctx_state.pop(session, None)
 
 
 # --- tiny TTL cache for GitHub (gh calls are ~1s each) -----------------
@@ -1963,13 +2235,17 @@ _live_lock = threading.Lock()
 
 
 def _run_acp_turn(session, model, prompt, images, lt: LiveTurn,
-                  copilot_id=None, copilot_cwd=None):
+                  copilot_id=None, copilot_cwd=None, injected_ctx=None):
     """Fast lane: run one turn on the persistent ACP process, buffering events.
     When copilot_id is set (a revived on-disk session) the process boots by
     session/load-ing that id so the turn continues its real context."""
     try:
         acp = _acp_get(session, model, load_id=copilot_id, cwd=copilot_cwd)
     except Exception as exc:
+        # The ACP process never launched, so the context preamble we prepended was
+        # never delivered — undo the once-per-session mark so the retry re-injects.
+        if injected_ctx is not None:
+            _context_rollback(session, injected_ctx)
         lt.append("error", {"message": f"acp launch failed: {exc}"})
         lt.append("done", {"code": 1})
         return
@@ -1984,7 +2260,8 @@ def _run_acp_turn(session, model, prompt, images, lt: LiveTurn,
         lt.append("done", {"code": 1})
 
 
-def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
+def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None,
+                         injected_ctx=None):
     """Legacy lane (chat_fast OFF => full MCP): spawn `copilot -p ...` per turn,
     parse its JSONL, buffer events. Survives browser close because it runs in the
     turn worker thread, not the HTTP request.
@@ -2007,6 +2284,10 @@ def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 cwd=os.path.expanduser("~"), text=True, bufsize=1)
     except Exception as exc:
+        # Child never spawned — the prepended context preamble wasn't delivered;
+        # undo the once-per-session mark so the next turn re-injects it.
+        if injected_ctx is not None:
+            _context_rollback(session, injected_ctx)
         emit("error", {"message": f"launch failed: {exc}"})
         emit("done", {})
         return
@@ -2100,7 +2381,8 @@ def _run_subprocess_turn(session, model, prompt, lt: LiveTurn, copilot_id=None):
 
 
 def _start_turn(session: str, model: str | None, prompt: str, images: list,
-                copilot_id: str | None = None, copilot_cwd: str | None = None) -> LiveTurn:
+                copilot_id: str | None = None, copilot_cwd: str | None = None,
+                context_path: str | None = None) -> LiveTurn:
     """Begin a turn in a background worker thread that buffers its SSE events into
     a LiveTurn. Returns the buffer immediately so the HTTP request can relay it.
     Because the turn runs off-thread, a browser close does not end it — a reopened
@@ -2123,6 +2405,20 @@ def _start_turn(session: str, model: str | None, prompt: str, images: list,
         if prev is not None and not prev.done:
             return prev
         _live_turns[session] = lt
+    # Prepend the selected session context (org/product/persona) on the first
+    # turn of a session, or whenever the selection changes. Rides in the prompt
+    # text so it works identically in both lanes and never touches cwd. Empty
+    # when no context is selected or it was already injected. Guarded so a
+    # compose failure can't leave the registered LiveTurn un-finished (which the
+    # concurrency guard above would treat as a permanently in-flight turn).
+    injected_ctx = None
+    try:
+        preamble = _context_preamble(session, context_path or "")
+    except Exception:
+        preamble = ""
+    if preamble:
+        prompt = preamble + prompt
+        injected_ctx = (context_path or "").strip()
     # Bridge: with no explicit revive id, resume whatever real copilot session
     # this label last used (ACP v4 or legacy uuid5). This is what survives an
     # AcpProc death, a hal-ui restart, or a chat_fast lane toggle. An explicit
@@ -2136,9 +2432,11 @@ def _start_turn(session: str, model: str | None, prompt: str, images: list,
         try:
             if fast:
                 _run_acp_turn(session, model, prompt, images, lt,
-                              copilot_id=copilot_id, copilot_cwd=copilot_cwd)
+                              copilot_id=copilot_id, copilot_cwd=copilot_cwd,
+                              injected_ctx=injected_ctx)
             else:
-                _run_subprocess_turn(session, model, prompt, lt, copilot_id=copilot_id)
+                _run_subprocess_turn(session, model, prompt, lt,
+                                     copilot_id=copilot_id, injected_ctx=injected_ctx)
         finally:
             lt.finish()
 
@@ -2279,6 +2577,7 @@ class Handler(BaseHTTPRequestHandler):
         images = _attach_take(attach_ids) if attach_ids else []
         copilot_id = (qs.get("copilot", [""])[0]).strip() or None
         copilot_cwd = (qs.get("cwd", [""])[0]).strip() or None
+        context_path = (qs.get("ctx", [""])[0]).strip() or None
         if not prompt and not images:
             self.send_error(400, "missing prompt")
             return
@@ -2292,7 +2591,8 @@ class Handler(BaseHTTPRequestHandler):
         # DO NOT cancel — the worker keeps running and a reopened tab reattaches via
         # /api/chat/resume. Lane (ACP vs subprocess) is chosen inside _start_turn.
         lt = _start_turn(session, model, prompt, images,
-                         copilot_id=copilot_id, copilot_cwd=copilot_cwd)
+                         copilot_id=copilot_id, copilot_cwd=copilot_cwd,
+                         context_path=context_path)
         self._relay_live(lt, 0)
 
     # --- routing -------------------------------------------------------
@@ -2309,6 +2609,7 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/api/chat/close":
             session = (parse_qs(p.query).get("session", [""])[0] or "").strip()
             _acp_close(session)
+            _context_forget(session)
             self._json(200, {"closed": bool(session)})
         elif p.path == "/api/hive/status":
             if not _hive_enabled():
@@ -2363,6 +2664,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, cached(key, 30.0, lambda: _sf_crs(products)))
         elif p.path == "/api/models":
             self._json(200, cached("models", 600.0, _list_models))
+        elif p.path == "/api/context/tree":
+            self._json(200, cached("context_tree", 60.0, _context_tree))
+        elif p.path == "/api/context/compose":
+            qs = parse_qs(p.query)
+            cp = (qs.get("path", [""])[0]).strip()
+            text = compose_context({"context_path": cp})
+            self._json(200, {"path": cp, "chars": len(text), "text": text})
         elif p.path == "/api/sessions":
             self._json(200, cached("sessions", 20.0, _list_sessions))
         elif p.path == "/api/sessions/search":
