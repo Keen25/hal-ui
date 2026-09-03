@@ -108,13 +108,29 @@ if ($code -eq 200) {
 
 # --- prerequisite (non-fatal): install the sf CLI if missing -----------------
 # The Salesforce/CR tab and the Settings Reconnect button need the `sf` CLI.
-# Install it via npm when absent; a failed/impossible install only warns.
-if ($null -ne (Get-Command sf -ErrorAction SilentlyContinue)) {
+# Detect it beyond PATH (npm global prefix / %AppData%\npm hold sf.cmd, which is
+# often not on a service/shell PATH), install via npm when truly absent, then
+# re-check so we don't reinstall on every run. A failed/impossible install only
+# warns.
+function Test-SfInstalled {
+  if ($null -ne (Get-Command sf -ErrorAction SilentlyContinue)) { return $true }
+  $dirs = @()
+  try { $p = (npm prefix -g 2>$null); if ($p) { $dirs += $p.Trim() } } catch {}
+  if ($env:APPDATA) { $dirs += (Join-Path $env:APPDATA 'npm') }
+  foreach ($d in $dirs) {
+    foreach ($n in @('sf.cmd', 'sf.exe', 'sf.ps1', 'sf')) {
+      if (Test-Path (Join-Path $d $n)) { return $true }
+    }
+  }
+  return $false
+}
+
+if (Test-SfInstalled) {
   # present - nothing to do
 } elseif ($null -ne (Get-Command npm -ErrorAction SilentlyContinue)) {
   Write-Host "-> Salesforce CLI ('sf') not found - installing via npm..."
   npm install --global @salesforce/cli
-  if ($LASTEXITCODE -eq 0) {
+  if (($LASTEXITCODE -eq 0) -and (Test-SfInstalled)) {
     Write-Host "OK: Installed sf." -ForegroundColor Green
   } else {
     Write-Host "! Failed to install 'sf' automatically. Install manually:" -ForegroundColor Yellow

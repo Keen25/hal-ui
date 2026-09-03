@@ -73,14 +73,21 @@ fi
 
 # Prerequisite (non-fatal): the Salesforce/CR tab and the Settings Reconnect
 # button need the `sf` CLI. Detect it the way server.py's _resolve_sf() does
-# (PATH or an nvm-installed sf); if missing, install it via npm. A failed or
-# impossible install only warns — it never fails the update.
-if command -v sf >/dev/null 2>&1 \
-   || ls "$HOME"/.nvm/versions/node/*/bin/sf >/dev/null 2>&1; then
+# (PATH, an nvm-installed sf, or the npm global prefix); if missing, install it
+# via npm and re-check. A failed or impossible install only warns — it never
+# fails the update.
+_sf_present() {
+  command -v sf >/dev/null 2>&1 && return 0
+  ls "$HOME"/.nvm/versions/node/*/bin/sf >/dev/null 2>&1 && return 0
+  local pref; pref="$(npm prefix -g 2>/dev/null)"
+  [ -n "$pref" ] && [ -x "$pref/bin/sf" ] && return 0
+  return 1
+}
+if _sf_present; then
   :
 elif command -v npm >/dev/null 2>&1; then
   echo "→ Salesforce CLI ('sf') not found — installing via npm…"
-  if npm install --global @salesforce/cli; then
+  if npm install --global @salesforce/cli && _sf_present; then
     echo "✓ Installed sf ($(command -v sf 2>/dev/null || echo 'restart shell to pick up PATH'))."
   else
     echo "! Failed to install 'sf' automatically. Install manually:" >&2

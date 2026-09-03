@@ -44,23 +44,60 @@ AZ_BIN = shutil.which("az") or "/usr/bin/az"
 def _resolve_sf() -> tuple[str, str]:
     """Locate the `sf` CLI and the bin dir that must be on PATH to run it.
 
-    Under systemd the service PATH is only /usr/local/bin:/usr/bin, which
-    contains neither the nvm-installed `sf` nor the `node` its shebang
-    (`#!/usr/bin/env -S node`) needs. shutil.which("sf") therefore fails and the
-    CR tab silently disappears even though the sf auth token is valid on disk.
-    Fall back to the nvm node bin dirs so the integration works regardless of
-    the inherited PATH. Returns (sf_path, bin_dir); bin_dir is "" when unknown."""
+    A background/systemd service (Linux) or a Windows service inherits a minimal
+    PATH that often lacks the npm/nvm bin dir where `sf` lives, so
+    shutil.which("sf") fails and the CR tab reports "sf CLI not found" even
+    though the auth token is valid on disk. Fall back to the well-known npm
+    global locations per platform. Returns (sf_path, bin_dir); bin_dir is ""
+    when unknown."""
     found = shutil.which("sf")
     if found:
         return found, os.path.dirname(found)
     import glob as _glob
-    # Prefer the highest node version that ships an sf binary.
+    if os.name == "nt":
+        # npm global installs sf.cmd/sf.ps1 into the global prefix, which
+        # defaults to %AppData%\npm and is frequently absent from a service PATH.
+        dirs = []
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            dirs.append(os.path.join(appdata, "npm"))
+        try:
+            pref = subprocess.run(["npm", "prefix", "-g"], capture_output=True,
+                                  text=True, timeout=10).stdout.strip()
+            if pref:
+                dirs.append(pref)
+        except Exception:
+            pass
+        for d in dirs:
+            for name in ("sf.cmd", "sf.exe", "sf.ps1", "sf"):
+                p = os.path.join(d, name)
+                if os.path.exists(p):
+                    return p, d
+        return "sf", ""
+    # POSIX: prefer the highest nvm node version that ships an sf binary, then
+    # the npm global prefix (homebrew / system node).
     cands = sorted(_glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin/sf")),
                    reverse=True)
+    try:
+        pref = subprocess.run(["npm", "prefix", "-g"], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+        if pref:
+            cands.append(os.path.join(pref, "bin", "sf"))
+    except Exception:
+        pass
     for c in cands:
         if os.path.exists(c):
             return c, os.path.dirname(c)
     return "sf", ""
+
+
+def _sf_argv(args: list) -> list:
+    """Build the argv to launch `sf`. On Windows the npm shim is `sf.cmd`, which
+    CreateProcess can't execute directly (subprocess raises WinError 193), so it
+    must be run through `cmd /c`."""
+    if os.name == "nt" and SF_BIN.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/c", SF_BIN, *args]
+    return [SF_BIN, *args]
 
 
 SF_BIN, SF_BIN_DIR = _resolve_sf()
@@ -1249,7 +1286,7 @@ def _sf_run(args: list, timeout: float = 60) -> dict:
     """Run an `sf` subcommand with --json and return the parsed object, or
     {'error': ...} on any failure."""
     try:
-        out = subprocess.run([SF_BIN, *args, "--json"],
+        out = subprocess.run(_sf_argv([*args, "--json"]),
                              capture_output=True, text=True, timeout=timeout,
                              env=_sf_env())
     except FileNotFoundError:
@@ -1385,8 +1422,9 @@ def _sf_reconnect_start() -> dict:
     def worker():
         env = _sf_env()
         env.update(_desktop_env())
-        cmd = [SF_BIN, "org", "login", "web",
-               "--instance-url", "https://login.salesforce.com", "--alias", "90729"]
+        cmd = _sf_argv(["org", "login", "web",
+                        "--instance-url", "https://login.salesforce.com",
+                        "--alias", "90729"])
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, env=env)
