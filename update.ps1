@@ -105,3 +105,11 @@ if ($code -eq 200) {
   Write-Host ("FAIL: Health check failed: {0} returned {1}" -f $Health, $code) -ForegroundColor Red
   exit 1
 }
+
+# --- prerequisite advisory (non-fatal) -------------------------------------
+# The Salesforce/CR tab and the Settings Reconnect button need the `sf` CLI.
+# Warn if it's not on PATH; don't fail the update.
+if ($null -eq (Get-Command sf -ErrorAction SilentlyContinue)) {
+  Write-Host "! Salesforce CLI ('sf') not found - the Salesforce/CR tab will be hidden." -ForegroundColor Yellow
+  Write-Host "    Install it with:  npm install --global @salesforce/cli"
+}

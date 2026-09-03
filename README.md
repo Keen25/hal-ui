@@ -209,6 +209,11 @@ cd $env:USERPROFILE\hal-ui ; git pull --ff-only ; Restart-Service hal-ui
 - Python 3.10+
 - [`copilot`](https://github.com/github/copilot-cli) CLI on `PATH`
 - `gh` CLI (for GitHub views), `az` CLI (for ADO views) — optional per view
+- [`sf`](https://developer.salesforce.com/tools/salesforcecli) CLI (Salesforce)
+  — required for the Salesforce/CR tab and the Settings **Reconnect** button; the
+  tab silently disappears without it. Install:
+  `npm install --global @salesforce/cli`. Under systemd, an nvm-installed `sf`
+  is auto-discovered (see `_resolve_sf` in `server.py`).
 
 ## Roadmap
 - Per-turn token/cost usage surfaced in the chat UI (ACP `usage_update`).

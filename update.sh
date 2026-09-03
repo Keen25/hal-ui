@@ -70,3 +70,12 @@ else
   echo "✗ Health check failed: $HEALTH returned $code" >&2
   exit 1
 fi
+
+# Prerequisite advisory (non-fatal): the Salesforce/CR tab and the Settings
+# Reconnect button need the `sf` CLI. Mirror server.py's _resolve_sf(): accept
+# an sf on PATH or an nvm-installed one, else warn (don't fail the update).
+if ! command -v sf >/dev/null 2>&1 \
+   && ! ls "$HOME"/.nvm/versions/node/*/bin/sf >/dev/null 2>&1; then
+  echo "! Salesforce CLI ('sf') not found — the Salesforce/CR tab will be hidden." >&2
+  echo "    Install it with:  npm install --global @salesforce/cli" >&2
+fi
