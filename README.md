@@ -111,6 +111,41 @@ server.py (Python stdlib http.server, threaded)
 - `SessionManager` in `localStorage`; `EventSource` for streaming.
 - Views: Chat · Hive · GitHub · ADO · Settings.
 
+## Install
+
+First-time setup on a clean box (Linux/macOS):
+
+```bash
+# 1. Clone
+git clone https://github.com/Keen25/hal-ui.git ~/hal-ui
+cd ~/hal-ui
+
+# 2. Prerequisites (see Requirements below):
+#    - Python 3.10+                         (system package)
+#    - copilot CLI on PATH                  (required)
+#    - gh / az CLIs                         (optional, per view)
+#    - sf CLI (Salesforce/CR tab)           installed automatically in step 3
+npm install --global @salesforce/cli       # or let update.sh do it (step 3)
+
+# 3. Install autostart + go live (also auto-installs sf if npm is present)
+mkdir -p ~/.config/systemd/user
+cp hal-ui.service ~/.config/systemd/user/
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now hal-ui.service
+./update.sh                                 # health-check + ensure sf present
+# open http://127.0.0.1:8900
+```
+
+`update.sh` is safe to run on a fresh checkout: it fast-forwards (no-op the
+first time), restarts the service, health-checks it, and installs the `sf` CLI
+via npm if it's missing. On **Windows**, clone the repo, register `server.py`
+under a [WinSW](https://github.com/winsw/winsw) service id `hal-ui`, then run
+`update.ps1`.
+
+Runtime config (`~/.config/hal-ui/config.json`) is created on first launch;
+open **Settings** in the UI to fill in tokens and connect Salesforce.
+
 ## Run
 
 ```bash
@@ -210,8 +245,10 @@ cd $env:USERPROFILE\hal-ui ; git pull --ff-only ; Restart-Service hal-ui
 - [`copilot`](https://github.com/github/copilot-cli) CLI on `PATH`
 - `gh` CLI (for GitHub views), `az` CLI (for ADO views) — optional per view
 - [`sf`](https://developer.salesforce.com/tools/salesforcecli) CLI (Salesforce)
-  — required for the Salesforce/CR tab and the Settings **Reconnect** button; the
-  tab silently disappears without it. Install:
+  — required for the Salesforce/CR tab and the Settings **Reconnect** button.
+  Without it, Settings shows `sf CLI not found` and the CR tab stays empty.
+  `update.sh` / `update.ps1` auto-install it via npm when missing (falls back to
+  a warning if npm is unavailable); to install manually run
   `npm install --global @salesforce/cli`. Under systemd, an nvm-installed `sf`
   is auto-discovered (see `_resolve_sf` in `server.py`).
 

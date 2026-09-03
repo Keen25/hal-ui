@@ -106,10 +106,22 @@ if ($code -eq 200) {
   exit 1
 }
 
-# --- prerequisite advisory (non-fatal) -------------------------------------
+# --- prerequisite (non-fatal): install the sf CLI if missing -----------------
 # The Salesforce/CR tab and the Settings Reconnect button need the `sf` CLI.
-# Warn if it's not on PATH; don't fail the update.
-if ($null -eq (Get-Command sf -ErrorAction SilentlyContinue)) {
-  Write-Host "! Salesforce CLI ('sf') not found - the Salesforce/CR tab will be hidden." -ForegroundColor Yellow
-  Write-Host "    Install it with:  npm install --global @salesforce/cli"
+# Install it via npm when absent; a failed/impossible install only warns.
+if ($null -ne (Get-Command sf -ErrorAction SilentlyContinue)) {
+  # present - nothing to do
+} elseif ($null -ne (Get-Command npm -ErrorAction SilentlyContinue)) {
+  Write-Host "-> Salesforce CLI ('sf') not found - installing via npm..."
+  npm install --global @salesforce/cli
+  if ($LASTEXITCODE -eq 0) {
+    Write-Host "OK: Installed sf." -ForegroundColor Green
+  } else {
+    Write-Host "! Failed to install 'sf' automatically. Install manually:" -ForegroundColor Yellow
+    Write-Host "    npm install --global @salesforce/cli"
+  }
+} else {
+  Write-Host "! Salesforce CLI ('sf') not found and npm is unavailable - the CR tab" -ForegroundColor Yellow
+  Write-Host "  will show 'sf CLI not found'. Install Node/npm, then:"
+  Write-Host "    npm install --global @salesforce/cli"
 }
