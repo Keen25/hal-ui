@@ -526,7 +526,7 @@
       <form class="addform" id="sf-panel" style="max-width:640px;margin-top:18px" onsubmit="return false">
         <div class="toolbar" style="padding-left:0"><strong>Salesforce</strong><span class="muted">CR triage org connection</span></div>
         <div id="sf-status-line" class="msgbox">checking…</div>
-        <div class="row2" style="margin-top:8px"><span class="grow muted">Re-auth opens a browser on the HAL desktop. If it doesn't, use the link shown below.</span><button id="sf-reconnect-btn" type="button">Reconnect</button></div>
+        <div class="row2" style="margin-top:8px"><span class="grow muted">Re-auth opens a browser on the machine running HAL-UI. If it doesn't, use the link shown below.</span><button id="sf-reconnect-btn" type="button">Reconnect</button></div>
         <div id="sf-reconnect-msg"></div>
       </form>
     </div>
@@ -2077,9 +2077,9 @@
     btn.disabled=true; m.className="msgbox"; m.textContent="starting web login…";
     try{
       const d=await (await fetch("/api/sf/reconnect",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})).json();
-      if(d.url){ m.className="msgbox"; m.innerHTML=`Complete login in the HAL desktop browser, or open: <a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.url)}</a>`; }
+      if(d.url){ m.className="msgbox"; m.innerHTML=`Complete login in the browser on the HAL-UI host, or open: <a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.url)}</a>`; }
       else if(d.ok||d.done){ m.className="msgbox ok"; m.textContent="authorized"; }
-      else { m.className="msgbox"; m.textContent="browser opened on HAL desktop — complete login there"; }
+      else { m.className="msgbox"; m.textContent="browser opened on the HAL-UI host — complete login there"; }
       pollSfLogin();
     }catch(err){ btn.disabled=false; m.className="msgbox err"; m.textContent=err.message; }
   });

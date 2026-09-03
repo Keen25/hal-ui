@@ -1345,7 +1345,14 @@ def _desktop_env() -> dict:
     """Best-effort DISPLAY/XAUTHORITY for the logged-in HAL desktop so a
     subprocess (the sf web-login browser) can open a window. The systemd user
     service inherits no DISPLAY, so we lift it from a live desktop process (same
-    uid => readable), falling back to :0 + the newest /run/user xauth cookie."""
+    uid => readable), falling back to :0 + the newest /run/user xauth cookie.
+
+    Non-POSIX hosts (Windows) have no X11/DISPLAY concept — `sf` opens the
+    native default browser directly — so we return an empty mapping. This also
+    avoids calling os.getuid(), which does not exist on Windows and would
+    otherwise raise AttributeError and wedge the reconnect worker."""
+    if os.name != "posix" or not os.path.isdir("/proc"):
+        return {}
     try:
         for pid in os.listdir("/proc"):
             if not pid.isdigit():
@@ -1364,10 +1371,11 @@ def _desktop_env() -> dict:
     except OSError:
         pass
     out = {"DISPLAY": ":0"}
-    import glob as _glob
-    xs = sorted(_glob.glob(f"/run/user/{os.getuid()}/xauth_*"))
-    if xs:
-        out["XAUTHORITY"] = xs[-1]
+    if hasattr(os, "getuid"):
+        import glob as _glob
+        xs = sorted(_glob.glob(f"/run/user/{os.getuid()}/xauth_*"))
+        if xs:
+            out["XAUTHORITY"] = xs[-1]
     return out
 
 
@@ -1420,12 +1428,12 @@ def _sf_reconnect_start() -> dict:
     url_evt = threading.Event()
 
     def worker():
-        env = _sf_env()
-        env.update(_desktop_env())
-        cmd = _sf_argv(["org", "login", "web",
-                        "--instance-url", "https://login.salesforce.com",
-                        "--alias", "90729"])
         try:
+            env = _sf_env()
+            env.update(_desktop_env())
+            cmd = _sf_argv(["org", "login", "web",
+                            "--instance-url", "https://login.salesforce.com",
+                            "--alias", "90729"])
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, env=env)
         except Exception as exc:
