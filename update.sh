@@ -71,11 +71,23 @@ else
   exit 1
 fi
 
-# Prerequisite advisory (non-fatal): the Salesforce/CR tab and the Settings
-# Reconnect button need the `sf` CLI. Mirror server.py's _resolve_sf(): accept
-# an sf on PATH or an nvm-installed one, else warn (don't fail the update).
-if ! command -v sf >/dev/null 2>&1 \
-   && ! ls "$HOME"/.nvm/versions/node/*/bin/sf >/dev/null 2>&1; then
-  echo "! Salesforce CLI ('sf') not found — the Salesforce/CR tab will be hidden." >&2
-  echo "    Install it with:  npm install --global @salesforce/cli" >&2
+# Prerequisite (non-fatal): the Salesforce/CR tab and the Settings Reconnect
+# button need the `sf` CLI. Detect it the way server.py's _resolve_sf() does
+# (PATH or an nvm-installed sf); if missing, install it via npm. A failed or
+# impossible install only warns — it never fails the update.
+if command -v sf >/dev/null 2>&1 \
+   || ls "$HOME"/.nvm/versions/node/*/bin/sf >/dev/null 2>&1; then
+  :
+elif command -v npm >/dev/null 2>&1; then
+  echo "→ Salesforce CLI ('sf') not found — installing via npm…"
+  if npm install --global @salesforce/cli; then
+    echo "✓ Installed sf ($(command -v sf 2>/dev/null || echo 'restart shell to pick up PATH'))."
+  else
+    echo "! Failed to install 'sf' automatically. Install manually:" >&2
+    echo "    npm install --global @salesforce/cli" >&2
+  fi
+else
+  echo "! Salesforce CLI ('sf') not found and npm is unavailable — the CR tab" >&2
+  echo "  will show 'sf CLI not found'. Install Node/npm, then:" >&2
+  echo "    npm install --global @salesforce/cli" >&2
 fi
