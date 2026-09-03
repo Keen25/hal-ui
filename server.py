@@ -26,6 +26,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -1412,54 +1413,181 @@ def _sf_status() -> dict:
 
 _sf_login_lock = threading.Lock()
 _sf_login_state = {"running": False, "url": "", "done": False,
-                   "ok": False, "msg": ""}
+                   "ok": False, "msg": "", "cancelled": False}
+_sf_login_proc = None  # live Popen of the in-flight `sf org login web`
+
+# Overall cap on a web-login attempt: enough to complete a real interactive
+# SSO + MFA round-trip (kept at the original 300s — the wedge was never the
+# timeout firing, it was the blocked stdout read below it never letting the
+# wait run; a shorter cap would only risk killing a slow-but-legitimate login).
+# An abandoned login is now recovered immediately via Cancel rather than by a
+# short deadline.
+_SF_LOGIN_TIMEOUT = 300.0
+
+# Grace period granted to a signalled process group to exit before POSIX
+# escalates SIGTERM -> SIGKILL (and the bound on how long a Windows taskkill may
+# run). Kept short so a Cancel POST can't block an HTTP worker thread for long.
+_SF_KILL_GRACE = 5.0
+
+
+def _kill_proc_tree(proc, grace: float = _SF_KILL_GRACE) -> None:
+    """Terminate a launched process *and every child it spawned*.
+
+    `sf` is invoked on Windows as `cmd /c sf.cmd ...`, which spawns a separate
+    `node` process running the OAuth web-server flow (a localhost redirect
+    listener). proc.kill() reaps only the cmd.exe shell and orphans that node —
+    it keeps listening, so a stalled login can't be cleanly cancelled and its
+    state leaks. taskkill /T /F force-kills the whole tree. On POSIX we signal
+    the process group (the login Popen is started with start_new_session=True):
+    SIGTERM first, then SIGKILL if the group ignores it — a node OAuth listener
+    that survives SIGTERM would keep the localhost redirect port bound and
+    defeat the reconnect fix on Linux exactly as the orphaned node did on
+    Windows. Safe to call with proc=None (no-op)."""
+    if proc is None:
+        return
+    try:
+        if os.name == "nt":
+            try:
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               capture_output=True, timeout=grace + 5.0)
+            except Exception:
+                # taskkill missing/timed out: at least reap the launched shell.
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        else:
+            try:
+                pgid = os.getpgid(proc.pid)
+            except Exception:
+                pgid = None
+            if pgid is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except Exception:
+                pass
+            # poll() (not wait()) so we don't contend with the worker thread's
+            # own proc.wait(); both take Popen's internal waitpid lock, so the
+            # returncode is observed consistently by whichever reaps first.
+            deadline = time.time() + grace
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if proc.poll() is None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def _sf_reconnect_start() -> dict:
     """Kick off `sf org login web` for the Quest org in the background. Opens a
     browser on the HAL desktop (DISPLAY lifted from the live session) and also
-    returns the login URL so it can be completed manually. Returns as soon as
-    the URL is known (or ~8s), leaving the flow running; SF caches are cleared
-    when it finishes so the CR tab reappears without a restart."""
+    returns the login URL when the CLI surfaces one (headless Linux prints a
+    fallback URL; Windows opens the browser silently). Returns as soon as the URL
+    is known (or ~8s), leaving the flow running; SF caches are cleared when it
+    finishes so the CR tab reappears without a restart. The attempt is bounded by
+    _SF_LOGIN_TIMEOUT and cancellable, so a stalled login never permanently blocks
+    reconnect (Windows especially: the login server is a child node process, not
+    the launched cmd shell, so it must be tree-killed)."""
+    global _sf_login_proc
     with _sf_login_lock:
         if _sf_login_state["running"]:
             return {"started": True, "already": True, "url": _sf_login_state["url"]}
-        _sf_login_state.update(running=True, url="", done=False, ok=False, msg="")
+        _sf_login_state.update(running=True, url="", done=False, ok=False,
+                               msg="", cancelled=False)
+        _sf_login_proc = None
     url_evt = threading.Event()
 
     def worker():
+        global _sf_login_proc
         try:
             env = _sf_env()
             env.update(_desktop_env())
             cmd = _sf_argv(["org", "login", "web",
                             "--instance-url", "https://login.salesforce.com",
                             "--alias", "90729"])
+            popen_kw = {}
+            if os.name != "nt":
+                popen_kw["start_new_session"] = True  # own process group => killpg
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, env=env)
+                                    stderr=subprocess.STDOUT, text=True, env=env,
+                                    **popen_kw)
         except Exception as exc:
             with _sf_login_lock:
                 _sf_login_state.update(running=False, done=True, ok=False,
                                        msg=str(exc)[:200])
             url_evt.set()
             return
-        for line in proc.stdout or []:
-            m = re.search(r"https?://\S+", line)
-            if m:
-                with _sf_login_lock:
-                    if not _sf_login_state["url"]:
-                        _sf_login_state["url"] = m.group(0)
-                url_evt.set()
-        try:
-            rc = proc.wait(timeout=300)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            rc = -1
-        _sf_cache_clear()
         with _sf_login_lock:
-            _sf_login_state.update(running=False, done=True, ok=(rc == 0),
-                                   msg="authorized" if rc == 0 else
-                                       ("timed out" if rc == -1 else f"exit {rc}"))
-        url_evt.set()
+            _sf_login_proc = proc
+            # A Cancel can arrive in the window between running=True (set by the
+            # caller) and this assignment, when _sf_login_proc was still None. In
+            # that case cancel only flags `cancelled` (it has no proc to kill),
+            # so tear the process down here instead of orphaning it and running a
+            # full, now-uncancellable login.
+            cancel_pending = bool(_sf_login_state.get("cancelled"))
+        if cancel_pending:
+            _kill_proc_tree(proc)
+
+        # Drain stdout in a side thread so the main worker can enforce an overall
+        # timeout. On Windows `sf org login web` prints nothing until it exits, so
+        # reading inline (as before) blocked past any timeout and — with a
+        # non-tree kill — orphaned the login server; on headless Linux it prints a
+        # fallback login URL we still want to surface.
+        def _read():
+            for line in proc.stdout or []:
+                m = re.search(r"https?://\S+", line)
+                if m:
+                    with _sf_login_lock:
+                        if not _sf_login_state["url"]:
+                            _sf_login_state["url"] = m.group(0)
+                    url_evt.set()
+        rdr = threading.Thread(target=_read, daemon=True)
+        rdr.start()
+
+        rc = None
+        timed_out = False
+        try:
+            try:
+                rc = proc.wait(timeout=_SF_LOGIN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                _kill_proc_tree(proc)
+                timed_out = True
+                try:
+                    rc = proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    rc = -1
+            rdr.join(timeout=2)
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+            _sf_cache_clear()
+        finally:
+            # Guarantee the terminal state runs even if something above raises,
+            # so `running` can never stick True forever (the exact wedge this
+            # change fixes) and Cancel isn't left waiting on a worker reset.
+            with _sf_login_lock:
+                _sf_login_proc = None
+                cancelled = _sf_login_state.get("cancelled")
+                ok = (rc == 0 and not timed_out and not cancelled)
+                _sf_login_state.update(
+                    running=False, done=True, ok=ok,
+                    msg=("authorized" if ok else
+                         "cancelled" if cancelled else
+                         "timed out" if timed_out else
+                         f"exit {rc}" if rc is not None else "error"))
+            url_evt.set()
 
     threading.Thread(target=worker, daemon=True).start()
     url_evt.wait(timeout=8)
@@ -1467,6 +1595,28 @@ def _sf_reconnect_start() -> dict:
         return {"started": True, "url": _sf_login_state["url"],
                 "done": _sf_login_state["done"], "ok": _sf_login_state["ok"],
                 "msg": _sf_login_state["msg"]}
+
+
+def _sf_reconnect_cancel() -> dict:
+    """Abort an in-flight web login and reset state so Reconnect works again.
+    Tree-kills the login process (Windows: the child node OAuth server, not just
+    the cmd shell). If the login is still spawning (proc not yet published), we
+    only flag `cancelled` and keep `running` True — the worker sees the flag the
+    moment it publishes the proc and tears it down, so a cancel can't be lost in
+    the start->Popen window (which would otherwise leave an uncancellable login
+    and let the next Reconnect start a second concurrent one)."""
+    with _sf_login_lock:
+        if not _sf_login_state["running"]:
+            # Nothing live; clear any stale flag so future attempts aren't blocked.
+            _sf_login_state.update(running=False, cancelled=False)
+            return {"cancelled": False, "running": False}
+        # Live or still spawning: mark cancelled. `running` stays True until the
+        # worker's terminal update, so the frontend keeps polling until it flips
+        # to done/"cancelled" instead of being told we're idle prematurely.
+        _sf_login_state["cancelled"] = True
+        proc = _sf_login_proc
+    _kill_proc_tree(proc)  # no-op if still spawning; worker kills on publish
+    return {"cancelled": True, "running": True}
 
 
 def _sf_status_payload() -> dict:
@@ -2840,6 +2990,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(code, data)
         elif p.path == "/api/sf/reconnect":
             self._json(200, _sf_reconnect_start())
+        elif p.path == "/api/sf/reconnect/cancel":
+            self._json(200, _sf_reconnect_cancel())
         elif p.path == "/api/settings":
             save_config(body if isinstance(body, dict) else {})
             # settings that affect ADO identity/token invalidate caches

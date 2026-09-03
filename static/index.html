@@ -526,7 +526,7 @@
       <form class="addform" id="sf-panel" style="max-width:640px;margin-top:18px" onsubmit="return false">
         <div class="toolbar" style="padding-left:0"><strong>Salesforce</strong><span class="muted">CR triage org connection</span></div>
         <div id="sf-status-line" class="msgbox">checking…</div>
-        <div class="row2" style="margin-top:8px"><span class="grow muted">Re-auth opens a browser on the machine running HAL-UI. If it doesn't, use the link shown below.</span><button id="sf-reconnect-btn" type="button">Reconnect</button></div>
+        <div class="row2" style="margin-top:8px"><span class="grow muted">Re-auth opens a browser on the machine running HAL-UI. If it doesn't, use the link shown below.</span><button id="sf-reconnect-cancel-btn" type="button" style="display:none">Cancel</button><button id="sf-reconnect-btn" type="button">Reconnect</button></div>
         <div id="sf-reconnect-msg"></div>
       </form>
     </div>
@@ -2067,7 +2067,9 @@
       if(lg.done||!lg.running){
         clearInterval(__sfPoll); __sfPoll=null;
         const m=$("#sf-reconnect-msg"); $("#sf-reconnect-btn").disabled=false;
+        $("#sf-reconnect-cancel-btn").style.display="none";
         if(s.connected||lg.ok){ m.className="msgbox ok"; m.textContent="authorized — CR tab enabled"; applySf(true); }
+        else if(lg.msg==="cancelled"){ m.className="msgbox"; m.textContent="login cancelled"; }
         else if(lg.done){ m.className="msgbox err"; m.textContent="login ended: "+(lg.msg||"not connected"); }
       }
     },3000);
@@ -2080,8 +2082,33 @@
       if(d.url){ m.className="msgbox"; m.innerHTML=`Complete login in the browser on the HAL-UI host, or open: <a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.url)}</a>`; }
       else if(d.ok||d.done){ m.className="msgbox ok"; m.textContent="authorized"; }
       else { m.className="msgbox"; m.textContent="browser opened on the HAL-UI host — complete login there"; }
+      if(!(d.ok||d.done)) $("#sf-reconnect-cancel-btn").style.display="";
       pollSfLogin();
     }catch(err){ btn.disabled=false; m.className="msgbox err"; m.textContent=err.message; }
+  });
+  $("#sf-reconnect-cancel-btn").addEventListener("click",async()=>{
+    const cbtn=$("#sf-reconnect-cancel-btn"), m=$("#sf-reconnect-msg");
+    cbtn.disabled=true;
+    try{
+      const r=await fetch("/api/sf/reconnect/cancel",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+      if(!r.ok) throw new Error("cancel failed ("+r.status+")");
+      const d=await r.json();
+      if(d.cancelled){
+        // Login is being torn down; keep polling so the UI flips to the terminal
+        // "login cancelled" state (which also hides Cancel and re-enables Reconnect).
+        m.className="msgbox"; m.textContent="cancelling login…";
+        if(!__sfPoll) pollSfLogin();
+      }else{
+        // Nothing was live to cancel — reset straight to idle.
+        cbtn.style.display="none"; $("#sf-reconnect-btn").disabled=false;
+        m.className="msgbox"; m.textContent="nothing to cancel";
+      }
+    }catch(e){
+      m.className="msgbox err"; m.textContent=e.message||"cancel failed";
+    }finally{
+      cbtn.disabled=false;
+    }
+    loadSfStatus();
   });
   $("#setf").addEventListener("submit",async(e)=>{
     e.preventDefault(); const m=$("#set-msg"); m.className=""; m.textContent="";
