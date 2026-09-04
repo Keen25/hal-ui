@@ -1265,8 +1265,12 @@ def _ado_my_testcases():
 #   Status != 'Completed'  AND  Type__c = 'R&D'  AND  R_D_Queue__c IN (products)
 # ======================================================================
 _SF_DEFAULT_PRODUCTS = ["ActiveRolesServer", "PasswordManager"]
+# Support_Product__c became a lookup (reference) field on the new RDE Salesforce
+# instance, so it returns an 18-char record Id, not a name. Pull the related
+# record's Name via the __r relationship for a readable product label.
 _SF_CR_FIELDS = ("Id,Name,Status__c,CR_Priority__c,Case_Subject__c,"
-                 "Support_Product__c,R_D_Queue__c,CreatedDate,LastModifiedDate,"
+                 "Support_Product__c,Support_Product__r.Name,"
+                 "R_D_Queue__c,CreatedDate,LastModifiedDate,"
                  "Case_Number__c,External_Tracking_ID__c,OwnerId,Owner.Type,"
                  "Owner.Name,At_Risk__c,Case_Escalated__c")
 
@@ -1708,7 +1712,11 @@ def _sf_cr_row(r: dict, base: str) -> dict:
         "priority": r.get("CR_Priority__c") or "",
         "prio_n": _sf_prio_n(r.get("CR_Priority__c")),
         "subject": r.get("Case_Subject__c") or "",
-        "product": r.get("Support_Product__c") or "",
+        # Support_Product__c is a lookup; its scalar value is the record Id.
+        # Prefer the resolved relationship Name, fall back to the Id so a null
+        # lookup degrades to a value rather than a blank cell.
+        "product": ((r.get("Support_Product__r") or {}).get("Name")
+                    or r.get("Support_Product__c") or ""),
         "queue": r.get("R_D_Queue__c") or "",
         "created": r.get("CreatedDate") or "",
         "modified": r.get("LastModifiedDate") or "",
