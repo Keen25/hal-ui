@@ -50,9 +50,6 @@ export class HalError extends Error {
  */
 function hintFor(path, status) {
     if (status !== 404) return "";
-    if (path.startsWith("/api/hive/")) {
-        return "The Hive is disabled. Set a Hive URL in HAL-UI Settings to enable it.";
-    }
     if (path.startsWith("/api/sf/")) {
         return "Salesforce is disabled. Install the `sf` CLI and connect an org in HAL-UI Settings.";
     }
@@ -166,12 +163,6 @@ export async function ensureUp() {
                 : `Check logs: journalctl --user -u ${SERVICE} -n50`,
     });
 }
-
-export const hive = {
-    status: () => request("/api/hive/status"),
-    task: (id) => request(`/api/hive/task?id=${encodeURIComponent(id)}`),
-    add: (payload) => request("/api/hive/add", { method: "POST", body: payload }),
-};
 
 export const salesforce = {
     status: () => request("/api/sf/status"),

@@ -84,8 +84,8 @@ Two files. No build step. No `pip install`, no `npm install`. Just
 
 ## GitHub Copilot plugin
 
-HAL-UI ships as a GitHub Copilot plugin so the agent can read the Hive and the
-CR queue without a browser tab. The extension is **transport only** — it calls
+HAL-UI ships as a GitHub Copilot plugin so the CR queue and the dashboard are
+reachable without a browser tab. The extension is **transport only** — it calls
 the same loopback REST API the web UI calls, so no logic is duplicated.
 
 ### Surfaces
@@ -94,18 +94,21 @@ the same loopback REST API the web UI calls, so no logic is duplicated.
 |------|------|--------------|
 | Canvas | `hal-ui` | Embeds HAL-UI in the Copilot side panel, deep-linked to one tab. |
 | Action | `show_hal_view` | Switches the open canvas to another tab. |
-| Tool | `hal_hive_status` | Queue counts, worker fleet (host, lane, caps, online), tasks. In-flight only by default — the queue holds hundreds of finished ones. |
-| Tool | `hal_hive_task` | One task in full: lease, attempts, progress, error, log tail. |
-| Tool | `hal_hive_add` | Queues a task. A **write** — the agent is told to confirm with you first. |
 | Tool | `hal_sf_crs` | Collaboration Requests, split into assigned-to-you and unassigned. |
 
 Deep links use `?view=<tab>#view=<tab>`; valid tabs are `chat`, `hive`,
 `github`, `gists`, `ado`, `tests`, `sf`, `history`, `settings`. A tab whose
 feature is disabled bounces back to Chat, same as clicking it.
 
-Azure DevOps and GitHub *My Work* are deliberately **not** exposed as tools —
-Copilot already ships an Azure DevOps plugin and a native My Work view. Both
-tabs stay reachable through the canvas.
+Three surfaces are deliberately **not** exposed as tools:
+
+- **The Hive** — served by [hal-hive](https://github.com/Keen25/hal-hive)'s own
+  MCP server (`hive_mcp.py`), which talks to the queue directly. Proxying it
+  through here would add a hop and make a *dashboard* a required link in the
+  hive's control path: kill HAL-UI and the agent loses the queue for no reason.
+  The Hive tab stays reachable through the canvas.
+- **Azure DevOps** and **GitHub *My Work*** — Copilot already ships an Azure
+  DevOps plugin and a native My Work view. Both tabs stay on the canvas.
 
 ### Install
 
