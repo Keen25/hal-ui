@@ -2865,6 +2865,22 @@ class Handler(BaseHTTPRequestHandler):
         self._relay_live(lt, 0)
 
     # --- routing -------------------------------------------------------
+    def do_HEAD(self):
+        """Liveness probe. BaseHTTPRequestHandler answers 501 to HEAD, which
+        makes HAL-UI look dead to any embedder that health-checks before it
+        opens a frame (the Copilot canvas does exactly that). Answer the root
+        cheaply and 404 everything else rather than duplicating GET routing."""
+        p = urlparse(self.path)
+        if p.path in ("", "/", "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
     def do_GET(self):
         p = urlparse(self.path)
         if p.path == "/api/chat":

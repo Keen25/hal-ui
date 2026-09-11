@@ -1298,6 +1298,27 @@
     if (prevView && prevView !== t.dataset.view) nAckView(prevView);
   });
 
+  // Deep-linking: ?view=<name> or #view=<name> selects a top-level tab so an
+  // embedder (the Copilot canvas) can open HAL-UI straight on Hive or CRs.
+  // Both forms are honoured on purpose: a host that reloads the frame carries
+  // the query string, a host that only rewrites the fragment fires hashchange.
+  // A view whose feature is switched off bounces back to Chat via
+  // applyHive/applySf once /api/settings lands, so no guard is needed here.
+  function requestedView() {
+    const hash = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+    const qs = new URLSearchParams(location.search || "");
+    return (hash.get("view") || qs.get("view") || "").trim().toLowerCase();
+  }
+  function routeFromUrl() {
+    const want = requestedView();
+    if (!want) return;
+    const tab = document.querySelector('.tab[data-view="' + CSS.escape(want) + '"]');
+    if (!tab || tab.classList.contains("active")) return;
+    tab.click();
+  }
+  addEventListener("hashchange", routeFromUrl);
+  routeFromUrl();
+
   // boot chat
   renderStrip(); renderLog(); syncModel(); renderPending();
   // reattach to any turns that were still running server-side when we last closed

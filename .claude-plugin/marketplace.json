@@ -1,0 +1,33 @@
+{
+  "name": "hal-ui-copilot-plugin-marketplace",
+  "metadata": {
+    "description": "HAL-UI plugin marketplace for GitHub Copilot.",
+    "version": "0.1.0"
+  },
+  "owner": {
+    "name": "Arpad Fodor",
+    "url": "https://github.com/Keen25"
+  },
+  "plugins": [
+    {
+      "name": "hal-ui-copilot-plugin",
+      "source": "./",
+      "description": "HAL hive queue control and Salesforce Collaboration Request triage, surfaced as a Copilot canvas and agent tools.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Arpad Fodor",
+        "url": "https://github.com/Keen25"
+      },
+      "homepage": "https://github.com/Keen25/hal-ui",
+      "repository": "https://github.com/Keen25/hal-ui",
+      "keywords": [
+        "hal",
+        "hive",
+        "salesforce",
+        "copilot",
+        "canvas",
+        "task-queue"
+      ]
+    }
+  ]
+}
