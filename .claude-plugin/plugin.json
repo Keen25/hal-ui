@@ -1,6 +1,6 @@
 {
   "name": "hal-ui-copilot-plugin",
-  "description": "Bring the HAL hive queue and Salesforce Collaboration Requests into GitHub Copilot as a canvas plus agent tools.",
+  "description": "The HAL-UI dashboard as a GitHub Copilot canvas, plus an agent tool for Salesforce Collaboration Requests. Hive queue control lives in hal-hive's MCP server, not here.",
   "version": "0.1.0",
   "author": {
     "name": "Arpad Fodor"

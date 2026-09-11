@@ -79,8 +79,8 @@ Two files. No build step. No `pip install`, no `npm install`. Just
 - **Hive drawer auto-poll** — an open task drawer refreshes progress + log tail
   every 4s while the task is non-terminal, then stops.
 - **GitHub Copilot plugin** — the same server doubles as a Copilot plugin: a
-  canvas that embeds any HAL-UI tab in the Copilot side panel, plus agent tools
-  for the Hive and the CR queue. See [GitHub Copilot plugin](#github-copilot-plugin).
+  canvas that embeds any HAL-UI tab in the Copilot side panel, plus an agent tool
+  for the CR queue. See [GitHub Copilot plugin](#github-copilot-plugin).
 
 ## GitHub Copilot plugin
 
