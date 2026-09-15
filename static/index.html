@@ -1149,17 +1149,21 @@
     });
   }
 
-  // upload staged images, return their server-side attachment ids
+  // upload staged images, return their server-side attachment ids plus any
+  // per-image failures. Failures must surface: a silently dropped attachment
+  // makes the turn run text-only and the reply look inexplicably blind.
   async function uploadAtts(atts) {
-    const ids = [];
+    const ids = [], errors = [];
     for (const a of (atts || [])) {
       try {
         const r = await fetch("/api/chat/attach", { method:"POST", headers:{"Content-Type":"application/json"},
           body: JSON.stringify({ mime:a.mime, data:a.data }) });
-        const j = await r.json(); if (j.id) ids.push(j.id);
-      } catch(e) {}
+        const j = await r.json().catch(()=>({}));
+        if (j.id) ids.push(j.id);
+        else errors.push(j.error || `attach failed (HTTP ${r.status})`);
+      } catch(e) { errors.push("attach failed: " + (e && e.message ? e.message : e)); }
     }
-    return ids;
+    return { ids, errors };
   }
 
   function renderPending() {
@@ -1196,7 +1200,8 @@
     if (s.ctx && s.ctx.preamble && !s.ctxSent) { sendText = s.ctx.preamble + text; s.ctxSent = true; }
     busy[sid] = true; save(); renderStrip(); if (sid===state.active) { renderLog(); renderPending(); }
 
-    const ids = await uploadAtts(atts);  // stage images server-side, reference by id
+    const { ids, errors } = await uploadAtts(atts);  // stage images server-side, reference by id
+    if (errors.length) { bot.text = "[attachment error: " + errors.join("; ") + "]\n\n"; liveUpdate(sid); }
     let url = `/api/chat?session=${encodeURIComponent(sid)}&model=${encodeURIComponent(s.model||"")}&prompt=${encodeURIComponent(sendText)}`;
     if (ids.length) url += `&attach=${encodeURIComponent(ids.join(","))}`;
     if (s.copilotId) {                                 // revived on-disk session: resume its real copilot session
@@ -1214,6 +1219,10 @@
     es[sid] = source;
     const s = state.sessions[sid];
     const finish = () => {
+      // A failing turn emits `error` AND `done`; without this guard finish()
+      // runs twice and drains two queued messages for a single completed turn.
+      if (finish._done) return;
+      finish._done = true;
       bot.streaming = false; busy[sid] = false; delete finishers[sid];
       try { source.close(); } catch(e){} delete es[sid];
       delete _streamEl[sid]; delete _rafPending[sid];   // drop streaming-bubble cache
@@ -1235,7 +1244,18 @@
     source.addEventListener("delta",(ev)=>{ bot.text += JSON.parse(ev.data).text; liveUpdate(sid); });
     source.addEventListener("message",(ev)=>{ const d=JSON.parse(ev.data); if(d.text) bot.text=d.text; if(d.tools&&d.tools.length) bot.tools=d.tools; liveUpdate(sid); });
     source.addEventListener("done",(ev)=>{ const d=JSON.parse(ev.data||"{}"); if(d.code&&d.code!==0&&d.stderr&&!bot.text) bot.text="[exit "+d.code+": "+d.stderr+"]"; finish(); });
-    source.addEventListener("error",()=>{ if(!bot.text) bot.text="[stream error — is server.py running?]"; finish(); });
+    source.addEventListener("error",(ev)=>{
+      // Two distinct cases arrive on this listener:
+      //  * a server-sent `event: error` (has .data) — show what actually failed,
+      //    e.g. "acp launch failed: ...". The old generic text hid these.
+      //  * a transport-level EventSource failure (no .data) — the connection died.
+      let msg = "";
+      if (ev && ev.data) { try { msg = JSON.parse(ev.data).message || ev.data; } catch(e) { msg = String(ev.data); } }
+      if (msg) bot.text += (bot.text ? "\n\n" : "") + "[" + msg + "]";
+      else if (!bot.text) bot.text = "[stream error — is server.py running?]";
+      liveUpdate(sid);
+      finish();
+    });
   }
 
   // Reattach to a turn that was still running server-side when the tab closed.
