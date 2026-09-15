@@ -1785,9 +1785,16 @@ def _mcp_server_names() -> list[str]:
 def _acp_mcp_servers(names: list[str] | None = None) -> list[dict]:
     """Convert selected entries from `~/.copilot/mcp-config.json` (copilot CLI
     format) into the ACP `session/new.mcpServers` shape: [{name, command, args,
-    env: [{name,value}]}] for local/stdio servers, [{name, type:"http", url}]
-    for http ones. Unknown/missing names are silently skipped so a stale saved
-    selection never breaks session boot. names=None reads the live setting."""
+    env: [{name,value}]}] for local/stdio servers, [{name, type, url, headers:
+    [{name,value}]}] for http/sse ones. Unknown/missing names are silently
+    skipped so a stale saved selection never breaks session boot. names=None
+    reads the live setting.
+
+    The ACP schema requires `headers` on an http/sse entry as a *mandatory
+    array* of {name,value} pairs. Omitting the key (no headers configured) or
+    passing the copilot-config {k: v} mapping straight through both fail
+    `session/new` with -32602 Invalid params, which kills the whole ACP lane —
+    and with it every image-bearing turn, since images force that lane."""
     if names is None:
         names = load_config().get("chat_mcp_servers", [])
     raw = _mcp_config_raw()
@@ -1796,10 +1803,14 @@ def _acp_mcp_servers(names: list[str] | None = None) -> list[dict]:
         cfg = raw.get(name)
         if not cfg:
             continue
-        if cfg.get("type") == "http":
-            entry = {"name": name, "type": "http", "url": cfg.get("url", "")}
-            if cfg.get("headers"):
-                entry["headers"] = cfg["headers"]
+        if cfg.get("type") in ("http", "sse"):
+            entry = {"name": name, "type": cfg["type"], "url": cfg.get("url", ""),
+                     "headers": []}
+            hdrs = cfg.get("headers")
+            if isinstance(hdrs, dict):
+                entry["headers"] = [{"name": k, "value": v} for k, v in hdrs.items()]
+            elif isinstance(hdrs, list):
+                entry["headers"] = hdrs
             out.append(entry)
         elif cfg.get("command"):
             out.append({
