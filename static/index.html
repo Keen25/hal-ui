@@ -36,6 +36,7 @@
   .tab.active { color:var(--txt); background:var(--panel2); border-color:var(--line); }
   .hive-off .tab[data-view="hive"], .hive-off #tohive { display:none !important; }
   .sf-off .tab[data-view="sf"] { display:none !important; }
+  .ado-off .tab[data-view="ado"], .ado-off .tab[data-view="tests"] { display:none !important; }
   /* unread notifications: per-tab count badge + per-row "updated" dot */
   .tab .nbadge { display:none; margin-left:6px; min-width:16px; height:16px; padding:0 4px;
     border-radius:8px; background:var(--bad); color:#fff; font-size:11px; line-height:16px;
@@ -1336,9 +1337,16 @@
     if(!enabled && $("#view-sf").classList.contains("active"))
       document.querySelector('.tab[data-view="chat"]').click();
   }
+  // Azure DevOps is optional too: hidden (ADO + Tests tabs) when no org/PAT/az
+  // login is configured, i.e. there's no way to reach ADO.
+  function applyAdo(enabled){
+    document.body.classList.toggle("ado-off", !enabled);
+    if(!enabled && ($("#view-ado").classList.contains("active") || $("#view-tests").classList.contains("active")))
+      document.querySelector('.tab[data-view="chat"]').click();
+  }
 
   // pull default model from settings for new sessions
-  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; window.__defaultContext = c.default_context||""; if(window.__ctxTree){ fillDefaultCtxSelect(window.__ctxTree); $("#s-default_context").value=window.__defaultContext; } applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); }).catch(()=>{});
+  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; window.__defaultContext = c.default_context||""; if(window.__ctxTree){ fillDefaultCtxSelect(window.__ctxTree); $("#s-default_context").value=window.__defaultContext; } applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); applyAdo(c.ado_enabled!==false); }).catch(()=>{});
   // populate model selectors from the live catalog (mirrors the console picker)
   fetch("/api/models").then(r=>r.json()).then(d=>{ if(!d.error){ window.__models=d; fillModelSelects(d); } }).catch(()=>{});
   // populate the session-context picker from the composed context tree
@@ -1623,8 +1631,8 @@
     const jobs=[];
     if(typeof loadGithub==="function") jobs.push(loadGithub());
     if(typeof loadGists==="function") jobs.push(loadGists());
-    if(typeof loadAdo==="function") jobs.push(loadAdo());
-    if(typeof loadTests==="function") jobs.push(loadTests());
+    if(!document.body.classList.contains("ado-off") && typeof loadAdo==="function") jobs.push(loadAdo());
+    if(!document.body.classList.contains("ado-off") && typeof loadTests==="function") jobs.push(loadTests());
     if(!document.body.classList.contains("sf-off") && typeof loadSf==="function") jobs.push(loadSf());
     if(!document.body.classList.contains("hive-off") && typeof loadHive==="function") jobs.push(loadHive());
     try{ await Promise.allSettled(jobs); }catch(e){}
@@ -2062,6 +2070,7 @@
       $("#s-ado_pat").placeholder=c.ado_pat_set?"•••• set (leave blank to keep)":"blank = use az login";
       $("#s-hive_token").placeholder=c.hive_token_set?"•••• set (leave blank to keep)":"blank = ~/.hive/worker.token";
       renderMcpServerList(await loadMcpServerNames(), Array.isArray(c.chat_mcp_servers)?c.chat_mcp_servers:[]);
+      applyAdo(c.ado_enabled!==false);
       loadSfStatus();
     }catch(e){}
   }
@@ -2144,6 +2153,7 @@
       window.__defaultModel=c.default_model||"";
       window.__defaultContext=c.default_context||"";
       applyHive(c.hive_enabled!==false);
+      applyAdo(c.ado_enabled!==false);
       $("#s-ado_pat").value=""; $("#s-hive_token").value=""; loadSettings();
       m.className="msgbox ok"; m.textContent="saved"; 
     }catch(err){ m.className="msgbox err"; m.textContent=err.message; }

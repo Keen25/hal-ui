@@ -380,6 +380,7 @@ def masked_config() -> dict:
         out[k + "_set"] = bool(cfg.get(k))
     out["hive_enabled"] = _hive_enabled()
     out["sf_enabled"] = _sf_enabled()
+    out["ado_enabled"] = _ado_enabled()
     return out
 
 # Fixed namespace so a given browser session always maps to the same copilot
@@ -1034,6 +1035,31 @@ def _ado_request(url: str, method: str = "GET", body: dict | None = None):
                 continue
             return last
     return last
+
+
+def _ado_enabled() -> bool:
+    """ADO integration is optional: enabled only when an org is configured and
+    we have a way to authenticate (a PAT, or a logged-in `az` CLI). Hides the
+    ADO + Tests tabs when Azure DevOps isn't connected."""
+    cfg = load_config()
+    if not (cfg.get("ado_org") or "").strip():
+        return False
+    if cfg.get("ado_pat"):
+        return True
+    if not os.path.exists(AZ_BIN):
+        return False
+
+    def producer():
+        try:
+            out = subprocess.run(
+                [AZ_BIN, "account", "show", "--query", "user.name", "-o", "tsv"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return out.returncode == 0 and bool(out.stdout.strip())
+        except Exception:
+            return False
+
+    return cached("ado_az_login", 300.0, producer)
 
 
 def _ado_identity(org: str) -> str:
@@ -2922,11 +2948,17 @@ class Handler(BaseHTTPRequestHandler):
                                        lambda: _github_gist_detail(gid),
                                        keep=lambda v: "error" not in v))
         elif p.path == "/api/ado/mywork":
-            self._json(200, cached("ado_mywork", 30.0, _ado_mywork,
-                                   keep=lambda v: "error" not in v))
+            if not _ado_enabled():
+                self._json(404, {"error": "ado disabled"})
+            else:
+                self._json(200, cached("ado_mywork", 30.0, _ado_mywork,
+                                       keep=lambda v: "error" not in v))
         elif p.path == "/api/ado/testcases":
-            self._json(200, cached("ado_testcases", 30.0, _ado_my_testcases,
-                                   keep=lambda v: "error" not in v))
+            if not _ado_enabled():
+                self._json(404, {"error": "ado disabled"})
+            else:
+                self._json(200, cached("ado_testcases", 30.0, _ado_my_testcases,
+                                       keep=lambda v: "error" not in v))
         elif p.path == "/api/sf/products":
             if not _sf_enabled():
                 self._json(404, {"error": "salesforce disabled"})
@@ -3017,6 +3049,7 @@ class Handler(BaseHTTPRequestHandler):
             with _cache_lock:
                 _cache.pop("ado_mywork", None)
                 _cache.pop("ado_testcases", None)
+                _cache.pop("ado_az_login", None)
             with _az_lock:
                 _az_token.update(tok="", exp=0.0)
             self._json(200, masked_config())
