@@ -128,12 +128,12 @@ marketplace manifests if you prefer to install the repo as a plugin instead.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `HALUI_URL` | `http://127.0.0.1:8900` | Base URL of the HAL-UI server. |
-| `HALUI_HEALTH` | *(falls back to `HALUI_URL`)* | Health-probe URL, if it differs. |
+| `HALUI_HEALTH` | `$HALUI_URL/` | URL probed for liveness only, as in `update.sh`. Never used for API calls. |
 | `HALUI_SERVICE` | `hal-ui` | Service name used to auto-start a stopped server. |
 
 If HAL-UI is not running the extension starts the service once and waits up to
-15s. It never stops or restarts it, and it refuses to start anything that is not
-on loopback.
+15s. It never stops or restarts it, and it refuses to start anything unless both
+`HALUI_URL` and `HALUI_HEALTH` are on loopback (`localhost`, `127.x`, `[::1]`).
 
 ## Architecture
 
@@ -150,7 +150,7 @@ server.py (Python stdlib http.server, threaded)
         │  same REST API, no duplicated logic
 extensions/hal-ui (GitHub Copilot extension, Node, zero deps)
    ├── canvas  ── embeds the UI in the Copilot side panel
-   └── tools   ── hive status/detail/add, Salesforce CRs
+   └── tool    ── Salesforce CRs (hal_sf_crs); Hive control lives in hal-hive
 ```
 
 ### Backend — `server.py`

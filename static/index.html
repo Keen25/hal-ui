@@ -1296,6 +1296,7 @@
     if (t.dataset.view === "chat") $("#prompt").focus();
     // leaving a data view marks everything currently in it as seen
     if (prevView && prevView !== t.dataset.view) nAckView(prevView);
+    syncUrlView(t.dataset.view);
   });
 
   // Deep-linking: ?view=<name> or #view=<name> selects a top-level tab so an
@@ -1316,8 +1317,20 @@
     if (!tab || tab.classList.contains("active")) return;
     tab.click();
   }
+  // When deep-linked, keep the URL in step with manual tab clicks. Otherwise an
+  // embedder asking for the view it originally opened sees an unchanged URL,
+  // nothing navigates, and the tab doesn't switch back. replaceState fires no
+  // hashchange and adds no history. Plain browser visits (no view=) are left alone.
+  function syncUrlView(view) {
+    if (!requestedView()) return;
+    const u = new URL(location.href);
+    u.searchParams.set("view", view);
+    u.hash = "view=" + encodeURIComponent(view);
+    if (u.href !== location.href) history.replaceState(history.state, "", u);
+  }
   addEventListener("hashchange", routeFromUrl);
-  routeFromUrl();
+  // Initial route runs at the end of this script: switching tabs touches state
+  // (NOTIF_VIEWS, loaders) that is declared further down.
 
   // boot chat
   renderStrip(); renderLog(); syncModel(); renderPending();
@@ -2155,6 +2168,8 @@
       navigator.serviceWorker.register("/sw.js").catch(() => {});
     });
   }
+
+  routeFromUrl();
 </script>
 </body>
 </html>

@@ -109,6 +109,9 @@ const tools = [
                     : [];
                 const limit = clamp(args.limit, 1, 200, 50);
                 const scope = String(args.scope || "all").toLowerCase();
+                if (!["all", "mine", "unassigned"].includes(scope)) {
+                    throw new Error(`invalid scope ${JSON.stringify(args.scope)}: use all, mine or unassigned`);
+                }
 
                 const data = await salesforce.crs(products);
                 const out = { products: products.length ? products : "all" };
@@ -137,7 +140,7 @@ session = await joinSession({
             id: "hal-ui",
             displayName: "HAL-UI",
             description:
-                "Open the HAL-UI control plane: hive queue and fleet, Salesforce Collaboration Requests, ADO and GitHub work views.",
+                "Open the HAL-UI dashboard (read-only view): hive queue and fleet, Salesforce Collaboration Requests, ADO and GitHub work views. Hive control is not available here; use hal-hive's MCP server.",
             inputSchema: canvasInputSchema,
             actions: [
                 {

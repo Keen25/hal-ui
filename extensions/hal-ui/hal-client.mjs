@@ -26,8 +26,23 @@ const POLL_INTERVAL_MS = 250;
 
 /** Base URL of the running HAL-UI, without a trailing slash. */
 export function baseUrl() {
-    const raw = (process.env.HALUI_URL || process.env.HALUI_HEALTH || DEFAULT_BASE).trim();
+    const raw = (process.env.HALUI_URL || "").trim() || DEFAULT_BASE;
     return raw.replace(/\/+$/, "");
+}
+
+/** URL probed for liveness. Same meaning as HALUI_HEALTH in update.sh / update.ps1. */
+export function healthUrl() {
+    return (process.env.HALUI_HEALTH || "").trim() || `${baseUrl()}/`;
+}
+
+/** True when `url` points at this machine, so starting a local service can help. */
+export function isLoopback(url) {
+    try {
+        const host = new URL(url).hostname.toLowerCase();
+        return host === "localhost" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host);
+    } catch {
+        return false;
+    }
 }
 
 /** Error carrying an actionable hint, so the agent can tell the user what to fix. */
@@ -101,25 +116,28 @@ function startCommand() {
         : `systemctl --user start ${SERVICE}`;
 }
 
-/** True when HAL-UI answers on the configured base URL. */
-export async function isUp() {
+async function probe(method) {
     try {
-        const res = await fetch(baseUrl() + "/", {
-            method: "HEAD",
+        const res = await fetch(healthUrl(), {
+            method,
             signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
         });
-        return res.ok;
+        if (method === "GET") await res.body?.cancel();
+        return res;
     } catch {
-        // Older HAL-UI builds have no do_HEAD and answer 501; fall back to GET.
-        try {
-            const res = await fetch(baseUrl() + "/", {
-                signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
-            });
-            return res.ok;
-        } catch {
-            return false;
-        }
+        return null;
     }
+}
+
+/** True when HAL-UI answers on the configured health URL. */
+export async function isUp() {
+    const head = await probe("HEAD");
+    if (head?.ok) return true;
+    // A server that answered at all but rejected HEAD (older HAL-UI builds have
+    // no do_HEAD and reply 501) is still up; confirm with GET. fetch() resolves
+    // on any HTTP status, so this must key off the status, not a throw.
+    if (!head) return false;
+    return Boolean((await probe("GET"))?.ok);
 }
 
 /**
@@ -131,15 +149,23 @@ export async function isUp() {
 export async function ensureUp() {
     if (await isUp()) return { started: false };
 
-    if (process.env.HALUI_URL && !/^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(baseUrl())) {
-        throw new HalError(`HAL-UI is not reachable at ${baseUrl()}`, {
-            hint: "HALUI_URL points at a remote host, so it cannot be started from here.",
+    if (!isLoopback(baseUrl()) || !isLoopback(healthUrl())) {
+        throw new HalError(`HAL-UI is not reachable at ${healthUrl()}`, {
+            hint: "HALUI_URL / HALUI_HEALTH point at a remote host, so it cannot be started from here.",
+        });
+    }
+
+    // SERVICE is spliced into a PowerShell command line on Windows, so refuse
+    // anything that isn't a plain service name rather than risk injection.
+    if (!/^[\w.-]+$/.test(SERVICE)) {
+        throw new HalError(`refusing to start service with unsafe name ${JSON.stringify(SERVICE)}`, {
+            hint: "Set HALUI_SERVICE to a plain service name (letters, digits, . _ -).",
         });
     }
 
     const [cmd, args] =
         process.platform === "win32"
-            ? ["powershell", ["-NoProfile", "-Command", `Start-Service ${SERVICE}`]]
+            ? ["powershell", ["-NoProfile", "-Command", `Start-Service -Name '${SERVICE}'`]]
             : ["systemctl", ["--user", "start", SERVICE]];
 
     try {
