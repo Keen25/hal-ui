@@ -1317,7 +1317,41 @@
     if (t.dataset.view === "chat") $("#prompt").focus();
     // leaving a data view marks everything currently in it as seen
     if (prevView && prevView !== t.dataset.view) nAckView(prevView);
+    syncUrlView(t.dataset.view);
   });
+
+  // Deep-linking: ?view=<name> or #view=<name> selects a top-level tab so an
+  // embedder (the Copilot canvas) can open HAL-UI straight on Hive or CRs.
+  // Both forms are honoured on purpose: a host that reloads the frame carries
+  // the query string, a host that only rewrites the fragment fires hashchange.
+  // A view whose feature is switched off bounces back to Chat via
+  // applyHive/applySf once /api/settings lands, so no guard is needed here.
+  function requestedView() {
+    const hash = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+    const qs = new URLSearchParams(location.search || "");
+    return (hash.get("view") || qs.get("view") || "").trim().toLowerCase();
+  }
+  function routeFromUrl() {
+    const want = requestedView();
+    if (!want) return;
+    const tab = document.querySelector('.tab[data-view="' + CSS.escape(want) + '"]');
+    if (!tab || tab.classList.contains("active")) return;
+    tab.click();
+  }
+  // When deep-linked, keep the URL in step with manual tab clicks. Otherwise an
+  // embedder asking for the view it originally opened sees an unchanged URL,
+  // nothing navigates, and the tab doesn't switch back. replaceState fires no
+  // hashchange and adds no history. Plain browser visits (no view=) are left alone.
+  function syncUrlView(view) {
+    if (!requestedView()) return;
+    const u = new URL(location.href);
+    u.searchParams.set("view", view);
+    u.hash = "view=" + encodeURIComponent(view);
+    if (u.href !== location.href) history.replaceState(history.state, "", u);
+  }
+  addEventListener("hashchange", routeFromUrl);
+  // Initial route runs at the end of this script: switching tabs touches state
+  // (NOTIF_VIEWS, loaders) that is declared further down.
 
   // boot chat
   renderStrip(); renderLog(); syncModel(); renderPending();
@@ -2164,6 +2198,8 @@
       navigator.serviceWorker.register("/sw.js").catch(() => {});
     });
   }
+
+  routeFromUrl();
 </script>
 </body>
 </html>

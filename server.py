@@ -2808,7 +2808,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_static(self, rel: str):
+    def _serve_static(self, rel: str, head: bool = False):
         if rel in ("", "/"):
             rel = "index.html"
         target = (STATIC_DIR / rel.lstrip("/")).resolve()
@@ -2830,7 +2830,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Service-Worker-Allowed", "/")
             self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        self.wfile.write(body)
+        if not head:
+            self.wfile.write(body)
 
     # --- SSE chat ------------------------------------------------------
     def _relay_live(self, lt: "LiveTurn", from_idx: int):
@@ -2902,6 +2903,20 @@ class Handler(BaseHTTPRequestHandler):
         self._relay_live(lt, 0)
 
     # --- routing -------------------------------------------------------
+    def do_HEAD(self):
+        """Liveness probe. BaseHTTPRequestHandler answers 501 to HEAD, which
+        makes HAL-UI look dead to any embedder that health-checks before it
+        opens a frame (the Copilot canvas does exactly that). Static files get
+        the same status, type and length GET would send; API routes 404 rather
+        than duplicating GET routing (and their side effects)."""
+        p = urlparse(self.path)
+        if p.path.startswith("/api/"):
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self._serve_static(p.path, head=True)
+
     def do_GET(self):
         p = urlparse(self.path)
         if p.path == "/api/chat":

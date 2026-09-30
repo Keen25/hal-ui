@@ -78,6 +78,62 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   org/topic context.
 - **Hive drawer auto-poll** — an open task drawer refreshes progress + log tail
   every 4s while the task is non-terminal, then stops.
+- **GitHub Copilot plugin** — the same server doubles as a Copilot plugin: a
+  canvas that embeds any HAL-UI tab in the Copilot side panel, plus an agent tool
+  for the CR queue. See [GitHub Copilot plugin](#github-copilot-plugin).
+
+## GitHub Copilot plugin
+
+HAL-UI ships as a GitHub Copilot plugin so the CR queue and the dashboard are
+reachable without a browser tab. The extension is **transport only** — it calls
+the same loopback REST API the web UI calls, so no logic is duplicated.
+
+### Surfaces
+
+| Kind | Name | What it does |
+|------|------|--------------|
+| Canvas | `hal-ui` | Embeds HAL-UI in the Copilot side panel, deep-linked to one tab. |
+| Action | `show_hal_view` | Switches the open canvas to another tab. |
+| Tool | `hal_sf_crs` | Collaboration Requests, split into assigned-to-you and unassigned. |
+
+Deep links use `?view=<tab>#view=<tab>`; valid tabs are `chat`, `hive`,
+`github`, `gists`, `ado`, `tests`, `sf`, `history`, `settings`. A tab whose
+feature is disabled bounces back to Chat, same as clicking it.
+
+Three surfaces are deliberately **not** exposed as tools:
+
+- **The Hive** — served by [hal-hive](https://github.com/Keen25/hal-hive)'s own
+  MCP server (`hive_mcp.py`), which talks to the queue directly. Proxying it
+  through here would add a hop and make a *dashboard* a required link in the
+  hive's control path: kill HAL-UI and the agent loses the queue for no reason.
+  The Hive tab stays reachable through the canvas.
+- **Azure DevOps** and **GitHub *My Work*** — Copilot already ships an Azure
+  DevOps plugin and a native My Work view. Both tabs stay on the canvas.
+
+### Install
+
+The extension lives in `extensions/hal-ui/` and needs no build step and no
+dependencies. Copy it into your Copilot user extensions directory:
+
+```bash
+mkdir -p ~/.copilot/extensions
+cp -r ~/hal-ui/extensions/hal-ui ~/.copilot/extensions/
+```
+
+Then reload extensions in Copilot. `.claude-plugin/` carries plugin +
+marketplace manifests if you prefer to install the repo as a plugin instead.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HALUI_URL` | `http://127.0.0.1:8900` | Base URL of the HAL-UI server. |
+| `HALUI_HEALTH` | `$HALUI_URL/` | URL probed for liveness only, as in `update.sh`. Never used for API calls. |
+| `HALUI_SERVICE` | `hal-ui` | Service name used to auto-start a stopped server. |
+
+If HAL-UI is not running the extension starts the service once and waits up to
+15s. It never stops or restarts it, and it refuses to start anything unless both
+`HALUI_URL` and `HALUI_HEALTH` are on loopback (`localhost`, `127.x`, `[::1]`).
 
 ## Architecture
 
@@ -90,6 +146,11 @@ server.py (Python stdlib http.server, threaded)
    ├── gh CLI             (GitHub My Work)
    ├── az + ADO REST      (PBIs / PRs)
    └── Hive REST :5001    (fleet / queue)
+        ▲
+        │  same REST API, no duplicated logic
+extensions/hal-ui (GitHub Copilot extension, Node, zero deps)
+   ├── canvas  ── embeds the UI in the Copilot side panel
+   └── tool    ── Salesforce CRs (hal_sf_crs); Hive control lives in hal-hive
 ```
 
 ### Backend — `server.py`

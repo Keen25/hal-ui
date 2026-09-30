@@ -1,0 +1,33 @@
+{
+  "name": "hal-ui-copilot-plugin-marketplace",
+  "metadata": {
+    "description": "HAL-UI plugin marketplace for GitHub Copilot.",
+    "version": "0.1.0"
+  },
+  "owner": {
+    "name": "Arpad Fodor",
+    "url": "https://github.com/Keen25"
+  },
+  "plugins": [
+    {
+      "name": "hal-ui-copilot-plugin",
+      "source": "./",
+      "description": "The HAL-UI dashboard as a Copilot canvas (hive, Salesforce CRs, history, settings), plus an agent tool for Salesforce Collaboration Request triage.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Arpad Fodor",
+        "url": "https://github.com/Keen25"
+      },
+      "homepage": "https://github.com/Keen25/hal-ui",
+      "repository": "https://github.com/Keen25/hal-ui",
+      "keywords": [
+        "hal",
+        "hive",
+        "salesforce",
+        "copilot",
+        "canvas",
+        "task-queue"
+      ]
+    }
+  ]
+}
