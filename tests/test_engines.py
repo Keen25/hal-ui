@@ -102,7 +102,7 @@ class BootErrorTest(unittest.TestCase):
         msg = self._proc(["Open the following link to authenticate the ACP server: "
                           "https://accounts.google.com/o/oauth2/v2/auth?x"])._boot_error(queue.Empty())
         self.assertIn("did not answer", msg)
-        self.assertIn("server.py --login antigravity", msg)
+        self.assertIn("Sign in", msg)
 
     def test_plain_error_has_no_login_hint(self):
         msg = self._proc(["some warning"])._boot_error(RuntimeError("boom"))

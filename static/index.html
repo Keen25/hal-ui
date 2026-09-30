@@ -288,6 +288,8 @@
     </div>
     <div id="attstrip"></div>
     <div class="chatbar" id="chatbar" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:4px 0;font-size:12px">
+      <label class="muted" style="display:flex;gap:5px;align-items:center">engine
+        <select id="chat-engine" title="Coding-agent CLI backing chat (global; same as Settings → Engine). Takes effect on the next turn." style="font-size:12px;padding:3px 6px"></select></label>
       <label class="muted" style="display:flex;gap:5px;align-items:center">dir
         <input id="chat-wd" placeholder="(default)" title="Working directory for this chat's turns" style="width:220px;font-size:12px;padding:3px 6px" /></label>
       <label class="muted" style="display:flex;gap:5px;align-items:center">permissions
@@ -466,6 +468,17 @@
         <select id="s-engine"><option value="copilot">GitHub Copilot CLI</option></select>
         <span class="muted" style="font-size:11px">Coding-agent CLI backing chat. Every engine speaks ACP (fast chat lane); only Copilot also supports the legacy lane and session history. Uninstalled engines are listed but can't be selected; <em>experimental</em> ones use the ACP-registry launch command but haven't been smoke-tested.</span>
         <span id="s-engine-hint" class="muted" style="font-size:11px;display:none"></span>
+        <label class="muted">Engine sign-in</label>
+        <div>
+          <div class="row2" style="gap:8px"><span class="grow muted" style="font-size:11px">Checks the selected engine can start a session. Agents that need a browser login (e.g. Google Antigravity) show a sign-in link here.</span>
+            <button id="eng-login-btn" type="button">Sign in / test</button>
+            <button id="eng-login-cancel" type="button" class="ghost" style="display:none">Cancel</button></div>
+          <div id="eng-login-status" class="msgbox" style="display:none;margin-top:6px"></div>
+          <div id="eng-login-paste" style="display:none;margin-top:6px">
+            <span class="muted" style="font-size:11px">Browser on another device? After approving, it lands on an unreachable <code>http://127.0.0.1:…</code> page — copy that full address here:</span>
+            <div class="row2" style="gap:8px;margin-top:4px"><input id="eng-login-url" class="grow" placeholder="http://127.0.0.1:12345/?state=…&amp;code=…" /><button id="eng-login-send" type="button">Submit</button></div>
+          </div>
+        </div>
         <label class="muted">Fast chat</label>
         <label class="row2" style="gap:8px;cursor:pointer"><input id="s-chat_fast" type="checkbox" style="width:auto" /> <span class="muted">Disable MCP servers in chat for faster startup (~5-7s/msg). Turn off if you need MCP tools mid-chat.</span></label>
         <label class="muted">Working directory</label>
@@ -1302,7 +1315,28 @@
   }
 
   // pull default model from settings for new sessions
-  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; window.__engineCaps={engine:c.engine,session_history:c.session_history,legacy_lane:c.legacy_lane}; window.__chatDefaults={cwd:c.chat_cwd||"",perm:c.chat_permission_mode||"auto"}; applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); applyEngineCaps(); }).catch(()=>{});
+  fetch("/api/settings").then(r=>r.json()).then(c=>{ window.__defaultModel = c.default_model||""; window.__engineCaps={engine:c.engine,session_history:c.session_history,legacy_lane:c.legacy_lane}; window.__chatDefaults={cwd:c.chat_cwd||"",perm:c.chat_permission_mode||"auto"}; applyHive(c.hive_enabled!==false); applySf(c.sf_enabled!==false); applyEngineCaps(); fillChatEngine(c); }).catch(()=>{});
+  // Chat-toolbar engine switcher: lists installed engines only and saves the
+  // global `engine` setting, exactly like Settings → Engine.
+  function fillChatEngine(c){
+    const sel=$("#chat-engine"); if(!sel||!Array.isArray(c.engines)) return;
+    window.__engines=c.engines;
+    sel.innerHTML=c.engines.filter(e=>e.installed!==false||e.id===c.engine)
+      .map(e=>`<option value="${esc(e.id)}">${esc(e.label)}${e.experimental?" (exp.)":""}</option>`).join("");
+    sel.value=c.engine||"copilot"; sel.dataset.cur=sel.value;
+  }
+  $("#chat-engine").addEventListener("change",async(ev)=>{
+    const sel=ev.target, prev=sel.dataset.cur||"copilot";
+    try{
+      const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({engine:sel.value})});
+      const c=await r.json();
+      if(!r.ok) throw new Error(c.error||("save failed ("+r.status+")"));
+      window.__engineCaps={engine:c.engine,session_history:c.session_history,legacy_lane:c.legacy_lane};
+      applyEngineCaps(); fillChatEngine(c);
+      if($("#s-engine")) $("#s-engine").value=c.engine;
+      try{ const md=await (await fetch("/api/models")).json(); if(!md.error){ window.__models=md; fillModelSelects(md); } }catch(_){}
+    }catch(err){ sel.value=prev; alert("Engine switch failed: "+err.message); }
+  });
   // populate model selectors from the live catalog (mirrors the console picker)
   fetch("/api/models").then(r=>r.json()).then(d=>{ if(!d.error){ window.__models=d; fillModelSelects(d); } }).catch(()=>{});
 
@@ -1879,7 +1913,7 @@
       $("#s-chat_permission_mode").value=c.chat_permission_mode||"auto";
       window.__engineCaps={engine:c.engine,session_history:c.session_history,legacy_lane:c.legacy_lane};
       window.__chatDefaults={cwd:c.chat_cwd||"",perm:c.chat_permission_mode||"auto"};
-      applyEngineCaps();
+      applyEngineCaps(); fillChatEngine(c);
       $("#s-ado_pat").placeholder=c.ado_pat_set?"•••• set (leave blank to keep)":"blank = use az login";
       $("#s-hive_token").placeholder=c.hive_token_set?"•••• set (leave blank to keep)":"blank = ~/.hive/worker.token";
       loadSfStatus();
@@ -1892,6 +1926,47 @@
     else { h.textContent=""; h.style.display="none"; }
   }
   $("#s-engine").addEventListener("change",showEngineHint);
+  let __engLoginPoll=null;
+  function renderEngLogin(s){
+    const box=$("#eng-login-status"), busy=!!(s&&s.running);
+    $("#eng-login-btn").disabled=busy; $("#eng-login-cancel").style.display=busy?"":"none";
+    $("#eng-login-paste").style.display=(busy&&s.redirect_port)?"":"none";
+    if(!s||(!s.running&&!s.done&&!s.error)){ box.style.display="none"; return; }
+    box.style.display="";
+    if(s.error){ box.className="msgbox err"; box.textContent=s.error; return; }
+    const label=((window.__engines||[]).find(e=>e.id===s.engine)||{}).label||s.engine;
+    if(s.running){
+      box.className="msgbox";
+      box.innerHTML=s.url
+        ? `${esc(label)}: open <a href="${esc(s.url)}" target="_blank" rel="noopener">this sign-in link</a> and approve access (a tab may also have opened on the HAL desktop). Waiting…`
+        : `${esc(label)}: starting and checking sign-in… ${esc(s.msg||"")}`;
+    } else if(s.ok){ box.className="msgbox ok"; box.textContent=s.msg||"ready"; }
+    else { box.className="msgbox err"; box.textContent=`${label}: ${s.msg||"sign-in failed"}`; }
+  }
+  function pollEngLogin(){
+    if(__engLoginPoll) clearInterval(__engLoginPoll);
+    __engLoginPoll=setInterval(async()=>{
+      let s; try{ s=await (await fetch("/api/engine/login")).json(); }catch(_){ return; }
+      renderEngLogin(s);
+      if(!s.running){ clearInterval(__engLoginPoll); __engLoginPoll=null;
+        if(s.ok){ try{ const md=await (await fetch("/api/models")).json(); if(!md.error){ window.__models=md; fillModelSelects(md); } }catch(_){} } }
+    },1500);
+  }
+  async function engLoginPost(body){
+    const r=await fetch("/api/engine/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const s=await r.json(); renderEngLogin(s); return s;
+  }
+  $("#eng-login-btn").addEventListener("click",async()=>{
+    try{ const s=await engLoginPost({action:"start",engine:$("#s-engine").value}); if(!s.error) pollEngLogin(); }
+    catch(err){ renderEngLogin({error:err.message}); }
+  });
+  $("#eng-login-cancel").addEventListener("click",()=>engLoginPost({action:"cancel"}).catch(()=>{}));
+  $("#eng-login-send").addEventListener("click",async()=>{
+    const u=$("#eng-login-url").value.trim(); if(!u) return;
+    try{ const s=await engLoginPost({action:"callback",url:u}); if(!s.error){ $("#eng-login-url").value=""; pollEngLogin(); } }
+    catch(err){ renderEngLogin({error:err.message}); }
+  });
+  fetch("/api/engine/login").then(r=>r.json()).then(s=>{ if(s.running){ renderEngLogin(s); pollEngLogin(); } }).catch(()=>{});
   function renderSfStatus(s){
     const line=$("#sf-status-line");
     if(!s||s.error){ line.className="msgbox err"; line.textContent="status unavailable"; return; }

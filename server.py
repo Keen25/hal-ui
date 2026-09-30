@@ -287,8 +287,7 @@ ENGINES: dict[str, dict] = {
         "mkdir -p ~/.local/share/antigravity-acp && cd $_ && curl -fsSLO "
         "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.2.1-linux-x86_64.zip "
         "&& unzip -o agy-acp-server-*.zip && rm agy-acp-server-*.zip   "
-        "(then put {\"auth\":{\"type\":\"oauth-personal\"}} in "
-        "~/.gemini/antigravity-acp/settings.json and run: python3 server.py --login antigravity)",
+        "(then Settings → Engine → Sign in)",
         bin_fallbacks=["~/.local/share/antigravity-acp/agy_acp_server.par",
                        "~/.local/bin/antigravity-acp"]),
     "gemini": _acp_engine(
@@ -1420,8 +1419,8 @@ class AcpProc:
         tail = "\n".join(list(self._stderr_tail)[-5:])
         low = (msg + " " + tail).lower()
         if any(k in low for k in ("authenticat", "oauth", "log in", "login", "sign in")):
-            msg += (f" — {self.engine} needs a one-time sign-in: run "
-                    f"`python3 server.py --login {self.engine}` on the HAL-UI host")
+            msg += (f" — {self.engine} needs a one-time sign-in: Settings → Engine → "
+                    f"Sign in (or `python3 server.py --login {self.engine}` on the HAL-UI host)")
         return msg
 
     # --- low level ----------------------------------------------------
@@ -2895,6 +2894,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, _load_transcript(sid, cwd))
         elif p.path == "/api/settings":
             self._json(200, masked_config())
+        elif p.path == "/api/engine/login":
+            self._json(200, _login_public())
         else:
             self._serve_static(p.path)
 
@@ -2935,6 +2936,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json(code, data)
         elif p.path == "/api/sf/reconnect":
             self._json(200, _sf_reconnect_start())
+        elif p.path == "/api/engine/login":
+            b = body if isinstance(body, dict) else {}
+            action = b.get("action") or "start"
+            if action == "cancel":
+                out = _engine_login_cancel()
+            elif action == "callback":
+                out = _engine_login_callback(str(b.get("url") or ""))
+            else:
+                out = _engine_login_start(str(b.get("engine") or _engine_name()).lower())
+            self._json(400 if out.get("error") else 200, out)
         elif p.path == "/api/settings":
             patch = body if isinstance(body, dict) else {}
             prev_engine = _engine_name()
@@ -2986,24 +2997,87 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "Not found")
 
 
-def _engine_login(name: str, timeout: float = 600) -> int:
-    """One-time interactive sign-in for an ACP engine: start it with stderr on
-    this terminal (so any login URL it prints is visible), then initialize +
-    session/new, which such agents block until the browser login completes.
-    Credentials are cached by the agent itself, so later chats boot headless."""
-    if name not in ENGINES:
-        print(f"unknown engine {name!r}; choose from: {', '.join(ENGINES)}", file=sys.stderr)
-        return 2
+# --- Engine sign-in -------------------------------------------------------
+# Some ACP agents (e.g. Google Antigravity) need a one-time browser OAuth. They
+# block session/new, print the consent URL on stderr and wait for Google to
+# redirect to a one-shot http://127.0.0.1:<port>/ listener on THIS host. We run
+# that handshake as a background job so Settings can show the link + status,
+# and — when the browser is on another device and can't reach this host's
+# loopback — accept the redirected URL pasted back and replay it locally.
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+_login_lock = threading.Lock()
+_login_state: dict = {"engine": "", "running": False, "done": False, "ok": False,
+                      "url": "", "msg": "", "log": [], "redirect_port": 0,
+                      "proc": None, "started": 0.0}
+LOGIN_TIMEOUT = 330   # agents' own loopback listeners typically give up at 300s
+
+
+def _login_public() -> dict:
+    with _login_lock:
+        s = dict(_login_state)
+    s.pop("proc", None)
+    s["log"] = list(s["log"])[-8:]
+    return s
+
+
+def _login_set(**kw) -> None:
+    with _login_lock:
+        _login_state.update(kw)
+
+
+def _login_note(line: str) -> None:
+    with _login_lock:
+        _login_state["log"].append(line[:500])
+        del _login_state["log"][:-40]
+        # Latest consent URL wins: an agent that retries its flow opens a new
+        # loopback listener, and a pasted redirect must target that one.
+        for u in _URL_RE.findall(line):
+            if "redirect_uri=" in u or "oauth" in u or "auth" in urllib.parse.urlparse(u).path:
+                _login_state["url"] = u
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+                ru = urllib.parse.urlparse((q.get("redirect_uri") or [""])[0])
+                _login_state["redirect_port"] = (
+                    ru.port if ru.hostname in ("127.0.0.1", "localhost") and ru.port else 0)
+                break
+
+
+def _pick_auth_method(methods: list) -> str | None:
+    ids = [m.get("id") for m in methods or [] if isinstance(m, dict) and m.get("id")]
+    for want in ("oauth-personal", "login", "oauth"):
+        for i in ids:
+            if want in i.lower():
+                return i
+    return ids[0] if ids else None
+
+
+def _login_worker(name: str, timeout: float) -> None:
     e = ENGINES[name]
-    if not _resolve_bin(e["bin_names"], e["bin_fallbacks"]):
-        print(f"{e['label']} not found. Install: {e.get('install', '')}", file=sys.stderr)
-        return 1
-    print(f"Starting {e['label']}; complete any sign-in it prints below "
-          f"(waiting up to {int(timeout)}s)...", flush=True)
-    p = subprocess.Popen(_engine_argv(name), stdin=subprocess.PIPE,
-                         stdout=subprocess.PIPE, stderr=None, text=True, bufsize=1,
-                         cwd=os.path.expanduser("~"), **TEXT_IO)
+    try:
+        p = subprocess.Popen(_engine_argv(name), stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             bufsize=1, cwd=os.path.expanduser("~"), **TEXT_IO)
+    except Exception as exc:
+        _login_set(running=False, done=True, ok=False, msg=f"launch failed: {exc}")
+        return
+    _login_set(proc=p)
+
+    def drain():
+        try:
+            for ln in p.stderr:
+                ln = ln.rstrip("\n")
+                if ln:
+                    _login_note(ln)
+        except Exception:
+            pass
+        finally:
+            try:
+                p.stderr.close()
+            except Exception:
+                pass
+    threading.Thread(target=drain, daemon=True).start()
+
     rid = 0
+    deadline = time.time() + timeout
 
     def call(method, params):
         nonlocal rid
@@ -3011,8 +3085,7 @@ def _engine_login(name: str, timeout: float = 600) -> int:
         p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method,
                                   "params": params}) + "\n")
         p.stdin.flush()
-        end = time.time() + timeout
-        while time.time() < end:
+        while time.time() < deadline:
             line = p.stdout.readline()
             if not line:
                 return {"error": {"message": "agent exited"}}
@@ -3026,31 +3099,144 @@ def _engine_login(name: str, timeout: float = 600) -> int:
                 p.stdin.flush()
             elif obj.get("id") == rid:
                 return obj
-        return {"error": {"message": "timed out"}}
+        return {"error": {"message": f"timed out after {int(timeout)}s"}}
 
+    def err_text(r):
+        err = r.get("error") or {}
+        data = err.get("data") if isinstance(err, dict) else None
+        detail = data.get("message") if isinstance(data, dict) else None
+        return detail or (err.get("message") if isinstance(err, dict) else str(err))
+
+    ok, msg = False, ""
     try:
         init = call("initialize", {"protocolVersion": 1, "clientCapabilities": {
             "fs": {"readTextFile": False, "writeTextFile": False}}})
         if "error" in init:
-            print(f"initialize failed: {init['error']}", file=sys.stderr)
-            return 1
-        res = call("session/new", {"cwd": os.path.expanduser("~"), "mcpServers": []})
-        if "error" in res:
-            err = res["error"]
-            print(f"sign-in not completed: {err.get('message', err)}", file=sys.stderr)
-            methods = [m.get("id") for m in (init.get("result") or {}).get("authMethods") or []]
-            if methods:
-                print(f"agent auth methods: {', '.join(filter(None, methods))} — "
-                      "configure one in the agent's own settings/CLI, then retry.",
-                      file=sys.stderr)
-            return 1
-        print(f"OK — {e['label']} is signed in and ready. Select it in HAL-UI Settings.")
-        return 0
+            msg = f"initialize failed: {err_text(init)}"
+        else:
+            cwd = os.path.expanduser("~")
+            res = call("session/new", {"cwd": cwd, "mcpServers": []})
+            with _login_lock:
+                flow_seen = bool(_login_state["url"])
+            if "error" in res and not flow_seen and "auth" in err_text(res).lower():
+                # Agent wants an explicit ACP authenticate (no settings default).
+                # Skipped once a browser flow ran: that error is the flow's own
+                # failure, and re-authenticating would silently start another.
+                mid = _pick_auth_method((init.get("result") or {}).get("authMethods"))
+                if mid:
+                    _login_note(f"[hal-ui] calling authenticate({mid})")
+                    a = call("authenticate", {"methodId": mid})
+                    res = a if "error" in a else call("session/new",
+                                                      {"cwd": cwd, "mcpServers": []})
+            if "error" in res:
+                msg = err_text(res)
+            else:
+                ok, msg = True, f"{e['label']} is signed in and ready"
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
     finally:
+        try:
+            p.kill()
+            p.wait(timeout=5)
+        except Exception:
+            pass
+        for stream in (p.stdin, p.stdout):
+            try:
+                stream.close()
+            except Exception:
+                pass
+    if not ok:
+        tail = [l for l in _login_public()["log"]
+                if not l.startswith(("    @", "E0", "https://symbolize", "[hal-ui]"))]
+        if tail and tail[-1] not in msg:
+            msg += f" — last agent output: {tail[-1][:300]}"
+    if ok:
+        with _cache_lock:
+            _cache.pop("models:" + name, None)
+    _login_set(running=False, done=True, ok=ok, msg=msg, proc=None)
+
+
+def _engine_login_start(name: str, timeout: float = LOGIN_TIMEOUT) -> dict:
+    if name not in ENGINES:
+        return {"error": f"unknown engine: {name!r}"}
+    e = ENGINES[name]
+    if not _resolve_bin(e["bin_names"], e["bin_fallbacks"]):
+        return {"error": f"{e['label']} not found. Install: {e.get('install', '')}"}
+    with _login_lock:
+        if _login_state["running"]:
+            if _login_state["engine"] == name:
+                s = dict(_login_state)
+                s.pop("proc", None)
+                return s
+            return {"error": f"a sign-in for {_login_state['engine']} is already running"}
+        _login_state.update(engine=name, running=True, done=False, ok=False, url="",
+                            msg="starting…", log=[], redirect_port=0, proc=None,
+                            started=time.time())
+    threading.Thread(target=_login_worker, args=(name, timeout),
+                     name="engine-login", daemon=True).start()
+    return _login_public()
+
+
+def _engine_login_cancel() -> dict:
+    with _login_lock:
+        p = _login_state.get("proc")
+    if p is not None:
         try:
             p.kill()
         except Exception:
             pass
+    return _login_public()
+
+
+def _engine_login_callback(url: str) -> dict:
+    """Replay a pasted OAuth redirect URL against the pending loopback listener.
+    Only http://127.0.0.1|localhost:<the port the agent is listening on>/ is
+    accepted, so this can't be turned into a generic server-side fetch."""
+    with _login_lock:
+        running, port = _login_state["running"], _login_state["redirect_port"]
+    if not running or not port:
+        return {"error": "no sign-in is waiting for a redirect"}
+    u = urllib.parse.urlparse((url or "").strip())
+    if u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost") or u.port != port:
+        return {"error": f"expected the http://127.0.0.1:{port}/?… URL your browser was sent to"}
+    q = urllib.parse.parse_qs(u.query)
+    if not (q.get("code") or q.get("error")):
+        return {"error": "that URL has no code= parameter — copy the full address bar"}
+    target = f"http://127.0.0.1:{port}{u.path or '/'}?{u.query}"
+    try:
+        with urllib.request.urlopen(target, timeout=15) as r:
+            r.read(2048)
+    except urllib.error.HTTPError:
+        pass        # listener answered (it serves its own failure page) — result comes via the job
+    except Exception as exc:
+        return {"error": f"could not reach the sign-in listener: {exc}"}
+    _login_note("[hal-ui] redirect forwarded to the agent")
+    return _login_public()
+
+
+def _engine_login(name: str, timeout: float = LOGIN_TIMEOUT) -> int:
+    """CLI flavour (`server.py --login ENGINE`): same job, printed to the terminal."""
+    s = _engine_login_start(name, timeout)
+    if s.get("error"):
+        print(s["error"], file=sys.stderr)
+        return 1
+    print(f"Signing in to {ENGINES[name]['label']} (up to {int(timeout)}s)...", flush=True)
+    shown = False
+    try:
+        while True:
+            s = _login_public()
+            if s["url"] and not shown:
+                shown = True
+                print(f"\nOpen this link in a browser ON THIS MACHINE:\n  {s['url']}\n"
+                      "(From another device: finish consent, then paste the failed "
+                      "http://127.0.0.1:… address into HAL-UI Settings → Sign in.)", flush=True)
+            if s["done"]:
+                print(("OK — " if s["ok"] else "FAILED — ") + s["msg"])
+                return 0 if s["ok"] else 1
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        _engine_login_cancel()
+        return 130
 
 
 def main():

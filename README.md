@@ -249,32 +249,42 @@ before selecting it — HAL-UI does not drive ACP authentication.
 | `kilo` | Kilo Code CLI | `kilo acp` | `npm i -g @kilocode/cli` |
 | `vibe` | Mistral Vibe | `vibe-acp` | `uv tool install mistral-vibe` |
 
-**One-time sign-in.** Agents that need an interactive login (OAuth) block the
-ACP handshake until it's done, so a chat would just time out. Run
-`python3 server.py --login <engine>` once on the HAL-UI host: it starts the agent
-with its output on your terminal (open the login URL it prints), waits for the
-session to come up, then exits. The agent caches the credentials, so later
-chats start headless. A chat that fails to start because sign-in is missing
-tells you to run this command.
+**Sign-in.** Some agents need a one-time browser login (OAuth) and block the ACP
+handshake until it's done. Use **Settings → Engine sign-in → Sign in / test**:
+HAL-UI starts the agent in the background, shows its consent link and status,
+and reports the agent's own error if it fails. The agent redirects the browser
+to a one-shot `http://127.0.0.1:<port>/` listener on the HAL-UI host, so:
 
-**Google Antigravity.** The `agy` CLI has no ACP mode; Google ships a separate
-ACP server:
+- browser on the HAL-UI host — just approve; it completes by itself;
+- browser on another device — approve, then copy the (unreachable)
+  `http://127.0.0.1:<port>/?…&code=…` address from the address bar into the
+  paste box that appears; HAL-UI forwards it to the listener locally (only that
+  exact loopback port is accepted).
+
+If the agent has no default auth method configured, HAL-UI calls ACP
+`authenticate` with its OAuth method. The agent caches the credentials, so
+later chats start headless. Headless alternative: `python3 server.py --login
+<engine>` prints the link in a terminal. The same button also works as a quick
+"can this engine start a session?" check for any engine.
+
+**Google Antigravity.** The `agy` CLI has no ACP mode and its login is **not**
+shared: Google ships a separate ACP server with its own OAuth token
+(`~/.gemini/antigravity-acp/acp_token.json`). Install it, then sign in as above:
 
 ```bash
 mkdir -p ~/.local/share/antigravity-acp && cd ~/.local/share/antigravity-acp
 curl -fsSLO https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.2.1-linux-x86_64.zip
 unzip -o agy-acp-server-*.zip && rm agy-acp-server-*.zip
-mkdir -p ~/.gemini/antigravity-acp
-echo '{"auth":{"type":"oauth-personal"}}' > ~/.gemini/antigravity-acp/settings.json
-python3 ~/hal-ui/server.py --login antigravity   # open the printed Google login URL
 ```
 
 HAL-UI finds it in `~/.local/share/antigravity-acp/` (or `antigravity-acp` /
-`agy_acp_server.par` on `PATH`). Other auth types (`gemini-api-key` with
-`GEMINI_API_KEY`, `agent-platform`, `oauth-business`) go in the same
-`settings.json`.
+`agy_acp_server.par` on `PATH`). API-key or enterprise auth instead of Google
+login: set `auth.type` in `~/.gemini/antigravity-acp/settings.json`
+(`gemini-api-key` + `GEMINI_API_KEY`, `agent-platform`, `oauth-business`).
 
-The Settings dropdown lists every engine, flags the ones not found on this host
+The engine can be switched in **Settings → Engine** or from the **engine**
+dropdown in the chat toolbar (installed engines only; same global setting,
+applies from the next turn). The Settings dropdown lists every engine, flags the ones not found on this host
 (they can't be selected; the install command is shown), and the binary is
 re-resolved on every save, so installing one while HAL-UI runs needs no restart.
 
