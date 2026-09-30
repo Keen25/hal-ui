@@ -289,7 +289,10 @@ ENGINES: dict[str, dict] = {
         "&& unzip -o agy-acp-server-*.zip && rm agy-acp-server-*.zip   "
         "(then Settings → Engine → Sign in)",
         bin_fallbacks=["~/.local/share/antigravity-acp/agy_acp_server.par",
-                       "~/.local/bin/antigravity-acp"]),
+                       "~/.local/bin/antigravity-acp"],
+        # Smoke-tested (v1.2.1): OAuth sign-in, model catalog, model switch
+        # via set_config_option, and a streamed turn.
+        experimental=False),
     "gemini": _acp_engine(
         "gemini", "Gemini CLI", ["gemini"], ["--acp"],
         "npm i -g @google/gemini-cli   (run `gemini` once to sign in)"),

@@ -267,7 +267,8 @@ later chats start headless. Headless alternative: `python3 server.py --login
 <engine>` prints the link in a terminal. The same button also works as a quick
 "can this engine start a session?" check for any engine.
 
-**Google Antigravity.** The `agy` CLI has no ACP mode and its login is **not**
+**Google Antigravity** (smoke-tested with ACP server 1.2.1: sign-in, model
+catalog, model switch, streamed turns). The `agy` CLI has no ACP mode and its login is **not**
 shared: Google ships a separate ACP server with its own OAuth token
 (`~/.gemini/antigravity-acp/acp_token.json`). Install it, then sign in as above:
 
