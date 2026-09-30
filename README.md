@@ -64,11 +64,14 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   are reaped after `acp_reap_idle`; stderr is drained continuously so a chatty
   engine can't deadlock on a full pipe.
 - **Pluggable engine** — the `engine` setting picks which coding-agent CLI backs
-  chat: `copilot` (default) or `opencode`. Both speak the **same ACP** (Zed Agent
-  Client Protocol) over stdio, so the fast lane is engine-agnostic — only the
-  launch argv differs (`copilot --acp` vs `opencode acp`). The legacy per-turn
-  lane and the on-disk history search parse Copilot's proprietary JSON, so they
-  stay Copilot-only; selecting opencode transparently forces the ACP fast lane.
+  chat: `copilot` (default), `opencode`, or any of the other major ACP agents
+  (Claude Code, Codex, Gemini CLI, Qwen Code, Cursor, goose, Kimi, Auggie,
+  Cline, Kilo, Mistral Vibe — see [Chat engines](#chat-engines)). All speak the
+  **same ACP** (Zed Agent Client Protocol) over stdio, so the fast lane is
+  engine-agnostic — only the launch argv differs (`copilot --acp` vs
+  `opencode acp` vs `gemini --acp` …). The legacy per-turn lane and the on-disk
+  history search parse Copilot's proprietary JSON, so they stay Copilot-only;
+  any other engine transparently forces the ACP fast lane.
 - **Hive drawer auto-poll** — an open task drawer refreshes progress + log tail
   every 4s while the task is non-terminal, then stops.
 
@@ -89,8 +92,11 @@ server.py (Python stdlib http.server, threaded)
 - Python 3 **stdlib only**: `http.server.ThreadingHTTPServer`, thread-per-request.
 - **Engine abstraction** (`ENGINES` registry): each entry maps a CLI to its ACP
   launch argv, legacy oneshot argv, and capability flags (`legacy_lane`,
-  `session_history`). Copilot and opencode are the built-ins; adding another ACP
-  agent is one registry entry.
+  `session_history`). Copilot and opencode have hand-tuned entries; every other
+  agent is a one-line `_acp_engine(...)` call (launch command + install hint)
+  whose model catalog and model switch are read from the spec-standard
+  `session/new` response (`configOptions` model selector →
+  `session/set_config_option`, else `models` → `session/set_model`).
 - Chat, fast lane (`chat_fast` on): persistent ACP process per session
   (`<engine> acp` — JSON-RPC over stdio: `initialize` → `session/new` →
   `session/prompt`, streamed `session/update` → SSE). `session/cancel` powers
@@ -206,8 +212,8 @@ cd $env:USERPROFILE\hal-ui ; git pull --ff-only ; Restart-Service hal-ui
 ### Requirements
 - Python 3.10+
 - [`copilot`](https://github.com/github/copilot-cli) CLI on `PATH` (default engine)
-- [`opencode`](https://opencode.ai) CLI — **optional**, only if you select the
-  opencode engine (see below)
+- Any other supported agent CLI — **optional**, only if you select that engine
+  (see below)
 - `gh` CLI (for GitHub views), `az` CLI (for ADO views) — optional per view
 
 ## Chat engines
@@ -220,6 +226,31 @@ Copilot-only install.
 |--------|:---------------:|:--------------------:|:---------------:|
 | `copilot` (default) | ✅ | ✅ (full MCP) | ✅ |
 | `opencode` | ✅ | — (auto-forced to ACP) | — |
+| any other engine below | ✅ | — (auto-forced to ACP) | — |
+
+Other ACP agents (launch commands from the
+[ACP registry](https://github.com/agentclientprotocol/registry)). They are marked
+**experimental** in the dropdown: protocol handling is spec-generic, but they
+haven't been smoke-tested against HAL-UI. Sign in to each CLI once in a terminal
+before selecting it — HAL-UI does not drive ACP authentication.
+
+| Engine id | Agent | Launched as | Install |
+|-----------|-------|-------------|---------|
+| `claude` | Claude Code (ACP adapter) | `claude-agent-acp` | `npm i -g @agentclientprotocol/claude-agent-acp` |
+| `codex` | OpenAI Codex (ACP adapter) | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp` |
+| `gemini` | Gemini CLI | `gemini --acp` | `npm i -g @google/gemini-cli` |
+| `qwen` | Qwen Code | `qwen --acp` | `npm i -g @qwen-code/qwen-code` |
+| `cursor` | Cursor Agent | `cursor-agent acp` | `curl https://cursor.com/install -fsS \| bash` |
+| `goose` | goose | `goose acp` | [goose install docs](https://block.github.io/goose/docs/getting-started/installation) |
+| `kimi` | Kimi CLI | `kimi acp` | `uv tool install kimi-cli` |
+| `auggie` | Augment Auggie | `auggie --acp` | `npm i -g @augmentcode/auggie` |
+| `cline` | Cline CLI | `cline --acp` | `npm i -g cline` |
+| `kilo` | Kilo Code CLI | `kilo acp` | `npm i -g @kilocode/cli` |
+| `vibe` | Mistral Vibe | `vibe-acp` | `uv tool install mistral-vibe` |
+
+The Settings dropdown lists every engine, flags the ones not found on this host
+(they can't be selected; the install command is shown), and the binary is
+re-resolved on every save, so installing one while HAL-UI runs needs no restart.
 
 The legacy lane and the **on-disk** history search parse Copilot's proprietary
 JSON, so they stay Copilot-only; selecting opencode transparently forces the ACP

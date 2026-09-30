@@ -76,6 +76,9 @@ def _dbg(msg: str) -> None:
 # ``legacy_lane`` are forced onto the ACP lane. Likewise session history
 # (ACP session/list + the on-disk ~/.copilot/session-state transcripts) is a
 # Copilot-only surface, gated by ``session_history``.
+# Any other ACP agent (Claude Code / Codex via their ACP adapters, Gemini CLI,
+# Qwen Code, Cursor, goose, ...) is a one-line _acp_engine() entry: the model
+# catalog + switch are read from the spec-standard session/new response.
 def _resolve_bin(names: list[str], fallbacks: list[str]) -> str | None:
     """Resolve a runnable binary from PATH names then explicit fallbacks.
 
@@ -121,22 +124,92 @@ def _parse_models_copilot(res: dict) -> dict:
     return {"models": out, "default": models.get("currentModelId", "")}
 
 
+def _model_config_option(res: dict) -> dict | None:
+    """The ACP ``configOptions`` entry that selects the model (category "model"
+    or id "model"), or None. Shared by catalog parsing and model switching."""
+    opts = res.get("configOptions") if isinstance(res, dict) else None
+    for opt in opts or []:
+        if isinstance(opt, dict) and (opt.get("category") == "model"
+                                      or opt.get("id") == "model"):
+            return opt
+    return None
+
+
+def _flatten_select_options(options) -> list[dict]:
+    """ACP select options are either flat {value,name} entries or groups
+    {group,name,options:[...]}; flatten both into value/name pairs."""
+    out = []
+    for o in options or []:
+        if not isinstance(o, dict):
+            continue
+        if isinstance(o.get("options"), list):
+            out.extend(_flatten_select_options(o["options"]))
+        elif o.get("value"):
+            out.append(o)
+    return out
+
+
 def _parse_models_opencode(res: dict) -> dict:
     """opencode advertises its catalog under session/new ``configOptions`` — a
     select with id "model" (value/name pairs + currentValue), not Copilot's
     ``models.availableModels``."""
-    out, default = [], ""
-    for opt in res.get("configOptions", []) or []:
-        if opt.get("id") != "model" and opt.get("category") != "model":
-            continue
-        default = opt.get("currentValue", "") or default
-        for o in opt.get("options", []) or []:
-            out.append({"id": o.get("value", ""), "name": o.get("name", ""),
-                        "usage": "", "price": ""})
-        break
+    opt = _model_config_option(res)
+    if not opt:
+        return {"error": "no models returned"}
+    out = [{"id": o.get("value", ""), "name": o.get("name", "") or o.get("value", ""),
+            "usage": "", "price": ""}
+           for o in _flatten_select_options(opt.get("options"))]
     if not out:
         return {"error": "no models returned"}
-    return {"models": out, "default": default}
+    return {"models": out, "default": opt.get("currentValue", "") or ""}
+
+
+def _parse_models_acp(res: dict) -> dict:
+    """Spec-generic catalog parser for any ACP agent: prefer the stable
+    ``configOptions`` model selector, then the (unstable) ``models`` state
+    {availableModels:[{modelId,name}], currentModelId}. Agents that expose
+    neither simply run on their own configured default model."""
+    via_cfg = _parse_models_opencode(res)
+    if "models" in via_cfg:
+        return via_cfg
+    models = (res.get("models") if isinstance(res, dict) else None) or {}
+    out = [{"id": m.get("modelId", ""), "name": m.get("name", "") or m.get("modelId", ""),
+            "usage": "", "price": ""}
+           for m in models.get("availableModels", []) or []
+           if isinstance(m, dict) and m.get("modelId")]
+    if not out:
+        return {"error": "no models returned"}
+    return {"models": out, "default": models.get("currentModelId", "") or ""}
+
+
+def _acp_engine(name: str, label: str, bin_names: list[str], acp_args: list[str],
+                install: str, bin_fallbacks: list[str] | None = None,
+                experimental: bool = True) -> dict:
+    """Descriptor for a generic ACP agent. Everything protocol-level (lane,
+    permissions, model catalog + switch) is spec-driven, so adding an agent
+    only needs its launch command. Such engines run on the ACP lane only, have
+    no History store, and never auto-grant anything broader than allow_once."""
+    return {
+        "name": name,
+        "label": label,
+        "bin_names": bin_names,
+        "bin_fallbacks": bin_fallbacks or [f"~/.local/bin/{bin_names[0]}"],
+        "acp_argv": lambda b, _a=tuple(acp_args): [b, *_a],
+        # None => AcpProc picks set_config_option / set_model from what the
+        # agent advertised in its session/new (or session/load) response.
+        "set_model_op": None,
+        "oneshot_argv": None,
+        "parse_models": _parse_models_acp,
+        "legacy_lane": False,
+        "session_history": False,
+        "session_state_dir": None,
+        "permissive_fallback": False,
+        # Shown in Settings when the binary isn't found.
+        "install": install,
+        # Launch command taken from the ACP registry but not smoke-tested
+        # against HAL-UI; flagged in the Settings dropdown.
+        "experimental": experimental,
+    }
 
 
 ENGINES: dict[str, dict] = {
@@ -164,6 +237,8 @@ ENGINES: dict[str, dict] = {
         # Copilot's permission option vocabulary is known, so when no exact
         # allow_once is offered we may fall back to any allow* / first option.
         "permissive_fallback": True,
+        "install": "npm i -g @github/copilot",
+        "experimental": False,
     },
     "opencode": {
         "name": "opencode",
@@ -192,7 +267,45 @@ ENGINES: dict[str, dict] = {
         "session_state_dir": None,
         # Unverified option vocabulary: never auto-pick a broad/persistent grant.
         "permissive_fallback": False,
+        "install": "curl -fsSL https://opencode.ai/install | bash   (or: npm i -g opencode-ai)",
+        "experimental": False,
     },
+    # --- Other ACP agents (launch commands per the ACP registry,
+    # github.com/agentclientprotocol/registry). Claude Code and Codex have no
+    # native ACP mode, so they go through the official ACP adapter binaries.
+    "claude": _acp_engine(
+        "claude", "Claude Code (claude-agent-acp)", ["claude-agent-acp"], [],
+        "npm i -g @agentclientprotocol/claude-agent-acp   (uses your Claude Code login / ANTHROPIC_API_KEY)"),
+    "codex": _acp_engine(
+        "codex", "OpenAI Codex (codex-acp)", ["codex-acp"], [],
+        "npm i -g @agentclientprotocol/codex-acp   (uses your Codex login / OPENAI_API_KEY)"),
+    "gemini": _acp_engine(
+        "gemini", "Gemini CLI", ["gemini"], ["--acp"],
+        "npm i -g @google/gemini-cli   (run `gemini` once to sign in)"),
+    "qwen": _acp_engine(
+        "qwen", "Qwen Code", ["qwen"], ["--acp"],
+        "npm i -g @qwen-code/qwen-code   (run `qwen` once to sign in)"),
+    "cursor": _acp_engine(
+        "cursor", "Cursor Agent", ["cursor-agent"], ["acp"],
+        "curl https://cursor.com/install -fsS | bash   (then `cursor-agent login`)"),
+    "goose": _acp_engine(
+        "goose", "goose", ["goose"], ["acp"],
+        "see https://block.github.io/goose/docs/getting-started/installation   (then `goose configure`)"),
+    "kimi": _acp_engine(
+        "kimi", "Kimi CLI", ["kimi"], ["acp"],
+        "uv tool install kimi-cli   (run `kimi` once to sign in)"),
+    "auggie": _acp_engine(
+        "auggie", "Augment Auggie", ["auggie"], ["--acp"],
+        "npm i -g @augmentcode/auggie   (then `auggie login`)"),
+    "cline": _acp_engine(
+        "cline", "Cline CLI", ["cline"], ["--acp"],
+        "npm i -g cline   (run `cline` once to sign in)"),
+    "kilo": _acp_engine(
+        "kilo", "Kilo Code CLI", ["kilo", "kilocode"], ["acp"],
+        "npm i -g @kilocode/cli   (run `kilo` once to sign in)"),
+    "vibe": _acp_engine(
+        "vibe", "Mistral Vibe", ["vibe-acp"], [],
+        "uv tool install mistral-vibe   (run `vibe` once to set MISTRAL_API_KEY)"),
 }
 
 
@@ -283,7 +396,7 @@ DEFAULT_CONFIG = {
     "hive_url": HIVE_URL_DEFAULT,
     "hive_token": "",       # optional override; blank => ~/.hive/worker.token
     "default_model": "",
-    "engine": "copilot",    # coding-agent CLI backing the chat lanes: copilot | opencode
+    "engine": "copilot",    # coding-agent CLI backing the chat lanes (any ENGINES key)
     "chat_fast": True,      # disable MCP servers in the chat lane for faster startup
     "chat_idle_timeout": 900,  # legacy lane: reap a copilot -p turn after this many
                                # seconds with zero output (wedged subprocess). 0 = off.
@@ -376,7 +489,12 @@ def masked_config() -> dict:
     # the backend (single source of truth) instead of a hardcoded list that can
     # drift as engines are added/removed.
     out["engine"] = _engine_name(cfg)
-    out["engines"] = [{"id": e["name"], "label": e["label"]}
+    # ``installed`` is live-resolved so the dropdown can flag CLIs that
+    # aren't on this host (the save handler rejects switching to those).
+    out["engines"] = [{"id": e["name"], "label": e["label"],
+                       "installed": bool(_resolve_bin(e["bin_names"], e["bin_fallbacks"])),
+                       "install": e.get("install", ""),
+                       "experimental": bool(e.get("experimental"))}
                       for e in ENGINES.values()]
     # Capability flags for the active engine so the frontend can adapt (e.g.
     # explain an empty History tab, or disable the fast-lane toggle when the
@@ -1171,6 +1289,8 @@ def _build_argv(prompt: str, session: str, model: str | None,
     engine the lane was chosen for, never a concurrently-switched one."""
     sid = copilot_id or _copilot_session_id(session)
     e = ENGINES[engine] if engine else _engine()
+    if not e.get("oneshot_argv"):
+        raise RuntimeError(f"{e['label']} has no legacy per-turn lane (ACP only)")
     return e["oneshot_argv"](_engine_bin(e["name"]), prompt, sid, model)
 
 
@@ -1218,6 +1338,11 @@ class AcpProc:
         # N5). argv below is built from this same captured name.
         self.engine = engine or _engine_name()
         self.session_id: str | None = None
+        # How this agent's session advertised model selection (spec-generic
+        # engines): the configOptions id of its model selector, and/or whether
+        # it exposed the unstable ``models`` state (session/set_model).
+        self._model_cfg_id: str | None = None
+        self._has_models_state = False
         self.dead = False
         self.cwd = _validated_cwd(cwd) if cwd else os.path.expanduser("~")
         # Per-session permission policy (R1): "auto" accepts an offered
@@ -1485,7 +1610,7 @@ class AcpProc:
             # before returning; we have no active turn sink yet, so that replay is
             # harmlessly dropped here — the transcript is shown from /api/session/
             # transcript instead. The session is left ready to continue.
-            self._request("session/load", {
+            res = self._request("session/load", {
                 "sessionId": load_id, "cwd": wd, "mcpServers": [],
             }, timeout=self.BOOT_TIMEOUT)
             self.session_id = load_id
@@ -1494,19 +1619,41 @@ class AcpProc:
                 "cwd": wd, "mcpServers": [],
             }, timeout=self.BOOT_TIMEOUT)
             self.session_id = res.get("sessionId")
+        self._note_model_surface(res)
         if model:
             self.set_model(model)
+
+    def _note_model_surface(self, res) -> None:
+        if not isinstance(res, dict):
+            return
+        opt = _model_config_option(res)
+        self._model_cfg_id = (opt.get("id") or "model") if opt else None
+        self._has_models_state = isinstance(res.get("models"), dict)
+
+    def _auto_model_op(self, model: str):
+        """Spec-driven model switch for engines without a hardcoded op: use
+        the advertised configOptions selector, else session/set_model."""
+        if getattr(self, "_model_cfg_id", None):
+            return ("session/set_config_option",
+                    {"sessionId": self.session_id,
+                     "configId": self._model_cfg_id, "value": model})
+        if getattr(self, "_has_models_state", False):
+            return ("session/set_model",
+                    {"sessionId": self.session_id, "modelId": model})
+        return None   # agent exposes no model selection over ACP
 
     def set_model(self, model: str | None):
         if not model or model == self.model or not self.session_id:
             return
         # Model-switch wire op is engine-specific (Copilot: session/set_model;
         # opencode: session/set_config_option), so it lives in the descriptor of
-        # the engine THIS proc was launched under (review finding N3).
+        # the engine THIS proc was launched under (review finding N3). Generic
+        # ACP engines leave it None and use what their session advertised.
         op = ENGINES.get(self.engine, {}).get("set_model_op")
-        if not op:
+        pair = op(self.session_id, model) if op else self._auto_model_op(model)
+        if not pair:
             return
-        method, params = op(self.session_id, model)
+        method, params = pair
         try:
             self._request(method, params, timeout=30)
             self.model = model
@@ -2778,7 +2925,9 @@ class Handler(BaseHTTPRequestHandler):
                     # accepted without a restart (review finding N2).
                     if not _resolve_bin(ENGINES[name.lower()]["bin_names"],
                                         ENGINES[name.lower()]["bin_fallbacks"]):
-                        self._json(400, {"error": f"{name} binary not found (install it or check PATH)"})
+                        hint = ENGINES[name.lower()].get("install")
+                        self._json(400, {"error": f"{name} binary not found (install it or check PATH)"
+                                                  + (f" — install: {hint}" if hint else "")})
                         return
             # R3: reject a working directory that isn't an existing directory so
             # the user learns at save time instead of every turn failing later.

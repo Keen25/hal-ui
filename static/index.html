@@ -464,7 +464,8 @@
         <select id="s-default_model"><option value="">default</option><option value="claude-sonnet-4.5">sonnet-4.5</option><option value="gpt-5.4">gpt-5.4</option></select>
         <label class="muted">Engine</label>
         <select id="s-engine"><option value="copilot">GitHub Copilot CLI</option></select>
-        <span class="muted" style="font-size:11px">Coding-agent CLI backing chat. opencode uses the shared ACP lane (fast chat only); Copilot supports both lanes and session history.</span>
+        <span class="muted" style="font-size:11px">Coding-agent CLI backing chat. Every engine speaks ACP (fast chat lane); only Copilot also supports the legacy lane and session history. Uninstalled engines are listed but can't be selected; <em>experimental</em> ones use the ACP-registry launch command but haven't been smoke-tested.</span>
+        <span id="s-engine-hint" class="muted" style="font-size:11px;display:none"></span>
         <label class="muted">Fast chat</label>
         <label class="row2" style="gap:8px;cursor:pointer"><input id="s-chat_fast" type="checkbox" style="width:auto" /> <span class="muted">Disable MCP servers in chat for faster startup (~5-7s/msg). Turn off if you need MCP tools mid-chat.</span></label>
         <label class="muted">Working directory</label>
@@ -1862,9 +1863,17 @@
       $("#s-default_model").value=c.default_model||"";
       const eng=$("#s-engine");
       if(Array.isArray(c.engines)&&c.engines.length){
-        eng.innerHTML=c.engines.map(e=>`<option value="${esc(e.id)}">${esc(e.label)}</option>`).join("");
+        window.__engines=c.engines;
+        // An uninstalled engine is disabled (the server rejects it anyway) —
+        // except the active one, so a missing binary never hides the selection.
+        eng.innerHTML=c.engines.map(e=>{
+          const tags=[]; if(e.installed===false) tags.push("not installed"); if(e.experimental) tags.push("experimental");
+          const dis=e.installed===false&&e.id!==c.engine?" disabled":"";
+          return `<option value="${esc(e.id)}"${dis}>${esc(e.label)}${tags.length?" — "+esc(tags.join(", ")):""}</option>`;
+        }).join("");
       }
       eng.value=c.engine||"copilot";
+      showEngineHint();
       $("#s-chat_fast").checked=c.chat_fast!==false;
       $("#s-chat_cwd").value=c.chat_cwd||"";
       $("#s-chat_permission_mode").value=c.chat_permission_mode||"auto";
@@ -1876,6 +1885,13 @@
       loadSfStatus();
     }catch(e){}
   }
+  function showEngineHint(){
+    const h=$("#s-engine-hint"), id=$("#s-engine").value;
+    const e=(window.__engines||[]).find(x=>x.id===id);
+    if(e&&e.installed===false&&e.install){ h.textContent="Not found on this host. Install: "+e.install; h.style.display=""; }
+    else { h.textContent=""; h.style.display="none"; }
+  }
+  $("#s-engine").addEventListener("change",showEngineHint);
   function renderSfStatus(s){
     const line=$("#sf-status-line");
     if(!s||s.error){ line.className="msgbox err"; line.textContent="status unavailable"; return; }
