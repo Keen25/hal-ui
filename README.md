@@ -65,7 +65,7 @@ Two files. No build step. No `pip install`, no `npm install`. Just
   engine can't deadlock on a full pipe.
 - **Pluggable engine** — the `engine` setting picks which coding-agent CLI backs
   chat: `copilot` (default), `opencode`, or any of the other major ACP agents
-  (Claude Code, Codex, Gemini CLI, Qwen Code, Cursor, goose, Kimi, Auggie,
+  (Claude Code, Codex, Google Antigravity, Gemini CLI, Qwen Code, Cursor, goose, Kimi, Auggie,
   Cline, Kilo, Mistral Vibe — see [Chat engines](#chat-engines)). All speak the
   **same ACP** (Zed Agent Client Protocol) over stdio, so the fast lane is
   engine-agnostic — only the launch argv differs (`copilot --acp` vs
@@ -238,6 +238,7 @@ before selecting it — HAL-UI does not drive ACP authentication.
 |-----------|-------|-------------|---------|
 | `claude` | Claude Code (ACP adapter) | `claude-agent-acp` | `npm i -g @agentclientprotocol/claude-agent-acp` |
 | `codex` | OpenAI Codex (ACP adapter) | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp` |
+| `antigravity` | Google Antigravity | `agy_acp_server.par --uid=` | see below |
 | `gemini` | Gemini CLI | `gemini --acp` | `npm i -g @google/gemini-cli` |
 | `qwen` | Qwen Code | `qwen --acp` | `npm i -g @qwen-code/qwen-code` |
 | `cursor` | Cursor Agent | `cursor-agent acp` | `curl https://cursor.com/install -fsS \| bash` |
@@ -247,6 +248,31 @@ before selecting it — HAL-UI does not drive ACP authentication.
 | `cline` | Cline CLI | `cline --acp` | `npm i -g cline` |
 | `kilo` | Kilo Code CLI | `kilo acp` | `npm i -g @kilocode/cli` |
 | `vibe` | Mistral Vibe | `vibe-acp` | `uv tool install mistral-vibe` |
+
+**One-time sign-in.** Agents that need an interactive login (OAuth) block the
+ACP handshake until it's done, so a chat would just time out. Run
+`python3 server.py --login <engine>` once on the HAL-UI host: it starts the agent
+with its output on your terminal (open the login URL it prints), waits for the
+session to come up, then exits. The agent caches the credentials, so later
+chats start headless. A chat that fails to start because sign-in is missing
+tells you to run this command.
+
+**Google Antigravity.** The `agy` CLI has no ACP mode; Google ships a separate
+ACP server:
+
+```bash
+mkdir -p ~/.local/share/antigravity-acp && cd ~/.local/share/antigravity-acp
+curl -fsSLO https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.2.1-linux-x86_64.zip
+unzip -o agy-acp-server-*.zip && rm agy-acp-server-*.zip
+mkdir -p ~/.gemini/antigravity-acp
+echo '{"auth":{"type":"oauth-personal"}}' > ~/.gemini/antigravity-acp/settings.json
+python3 ~/hal-ui/server.py --login antigravity   # open the printed Google login URL
+```
+
+HAL-UI finds it in `~/.local/share/antigravity-acp/` (or `antigravity-acp` /
+`agy_acp_server.par` on `PATH`). Other auth types (`gemini-api-key` with
+`GEMINI_API_KEY`, `agent-platform`, `oauth-business`) go in the same
+`settings.json`.
 
 The Settings dropdown lists every engine, flags the ones not found on this host
 (they can't be selected; the install command is shown), and the binary is

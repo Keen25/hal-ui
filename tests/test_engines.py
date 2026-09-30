@@ -19,7 +19,7 @@ os.environ.setdefault("HALUI_DEBUG", "0")
 
 import server  # noqa: E402
 
-MAJOR = {"copilot", "opencode", "claude", "codex", "gemini", "qwen", "cursor",
+MAJOR = {"copilot", "opencode", "claude", "codex", "antigravity", "gemini", "qwen", "cursor",
          "goose", "kimi", "auggie", "cline", "kilo", "vibe"}
 
 FAKE_AGENT = textwrap.dedent(r'''
@@ -67,7 +67,7 @@ class RegistryTest(unittest.TestCase):
         expect = {"gemini": ["--acp"], "qwen": ["--acp"], "cursor": ["acp"],
                   "goose": ["acp"], "kimi": ["acp"], "auggie": ["--acp"],
                   "cline": ["--acp"], "kilo": ["acp"], "claude": [], "codex": [],
-                  "vibe": []}
+                  "vibe": [], "antigravity": ["--uid="]}
         for name, args in expect.items():
             self.assertEqual(server.ENGINES[name]["acp_argv"]("b"), ["b", *args])
 
@@ -88,6 +88,25 @@ class RegistryTest(unittest.TestCase):
             self.assertIn("install", e)
         self.assertFalse(ids["copilot"]["experimental"])
         self.assertTrue(ids["gemini"]["experimental"])
+
+
+class BootErrorTest(unittest.TestCase):
+    def _proc(self, tail):
+        p = object.__new__(server.AcpProc)
+        p.engine = "antigravity"
+        p._stderr_tail = list(tail)
+        return p
+
+    def test_timeout_with_login_url_points_at_login_helper(self):
+        import queue
+        msg = self._proc(["Open the following link to authenticate the ACP server: "
+                          "https://accounts.google.com/o/oauth2/v2/auth?x"])._boot_error(queue.Empty())
+        self.assertIn("did not answer", msg)
+        self.assertIn("server.py --login antigravity", msg)
+
+    def test_plain_error_has_no_login_hint(self):
+        msg = self._proc(["some warning"])._boot_error(RuntimeError("boom"))
+        self.assertEqual(msg, "boom")
 
 
 class ParseModelsTest(unittest.TestCase):

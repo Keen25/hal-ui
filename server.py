@@ -279,6 +279,18 @@ ENGINES: dict[str, dict] = {
     "codex": _acp_engine(
         "codex", "OpenAI Codex (codex-acp)", ["codex-acp"], [],
         "npm i -g @agentclientprotocol/codex-acp   (uses your Codex login / OPENAI_API_KEY)"),
+    # Google Antigravity: the `agy` CLI has no ACP mode; Google ships a
+    # separate ACP server binary (registry cmd: agy_acp_server.par --uid=).
+    "antigravity": _acp_engine(
+        "antigravity", "Google Antigravity", ["antigravity-acp", "agy_acp_server.par"],
+        ["--uid="],
+        "mkdir -p ~/.local/share/antigravity-acp && cd $_ && curl -fsSLO "
+        "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-1.2.1-linux-x86_64.zip "
+        "&& unzip -o agy-acp-server-*.zip && rm agy-acp-server-*.zip   "
+        "(then put {\"auth\":{\"type\":\"oauth-personal\"}} in "
+        "~/.gemini/antigravity-acp/settings.json and run: python3 server.py --login antigravity)",
+        bin_fallbacks=["~/.local/share/antigravity-acp/agy_acp_server.par",
+                       "~/.local/bin/antigravity-acp"]),
     "gemini": _acp_engine(
         "gemini", "Gemini CLI", ["gemini"], ["--acp"],
         "npm i -g @google/gemini-cli   (run `gemini` once to sign in)"),
@@ -1375,7 +1387,8 @@ class AcpProc:
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         try:
             self._boot(model, load_id, cwd)
-        except Exception:
+        except Exception as exc:
+            boot_exc = exc
             # A failed handshake (missing/incompatible engine, timeout) must not
             # leak the child process + its reader thread — tear it down before
             # propagating so the caller can surface a launch error cleanly.
@@ -1394,7 +1407,22 @@ class AcpProc:
                             pass
             except Exception:
                 pass
-            raise
+            raise RuntimeError(self._boot_error(boot_exc)) from boot_exc
+
+    def _boot_error(self, exc: Exception) -> str:
+        """Human-readable handshake failure. queue.Empty (a timeout) has no
+        message, and agents that need an interactive sign-in (e.g. Antigravity
+        OAuth) block session/new while printing a login URL on stderr — point
+        the user at the one-time `--login` helper instead of a bare timeout."""
+        msg = str(exc) or f"{type(exc).__name__}: no response within {self.BOOT_TIMEOUT}s"
+        if isinstance(exc, queue.Empty):
+            msg = f"{self.engine} did not answer the ACP handshake within {self.BOOT_TIMEOUT}s"
+        tail = "\n".join(list(self._stderr_tail)[-5:])
+        low = (msg + " " + tail).lower()
+        if any(k in low for k in ("authenticat", "oauth", "log in", "login", "sign in")):
+            msg += (f" — {self.engine} needs a one-time sign-in: run "
+                    f"`python3 server.py --login {self.engine}` on the HAL-UI host")
+        return msg
 
     # --- low level ----------------------------------------------------
     def _next_id(self) -> int:
@@ -2958,11 +2986,82 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "Not found")
 
 
+def _engine_login(name: str, timeout: float = 600) -> int:
+    """One-time interactive sign-in for an ACP engine: start it with stderr on
+    this terminal (so any login URL it prints is visible), then initialize +
+    session/new, which such agents block until the browser login completes.
+    Credentials are cached by the agent itself, so later chats boot headless."""
+    if name not in ENGINES:
+        print(f"unknown engine {name!r}; choose from: {', '.join(ENGINES)}", file=sys.stderr)
+        return 2
+    e = ENGINES[name]
+    if not _resolve_bin(e["bin_names"], e["bin_fallbacks"]):
+        print(f"{e['label']} not found. Install: {e.get('install', '')}", file=sys.stderr)
+        return 1
+    print(f"Starting {e['label']}; complete any sign-in it prints below "
+          f"(waiting up to {int(timeout)}s)...", flush=True)
+    p = subprocess.Popen(_engine_argv(name), stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=None, text=True, bufsize=1,
+                         cwd=os.path.expanduser("~"), **TEXT_IO)
+    rid = 0
+
+    def call(method, params):
+        nonlocal rid
+        rid += 1
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method,
+                                  "params": params}) + "\n")
+        p.stdin.flush()
+        end = time.time() + timeout
+        while time.time() < end:
+            line = p.stdout.readline()
+            if not line:
+                return {"error": {"message": "agent exited"}}
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("method") and "id" in obj:
+                p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": obj["id"],
+                                          "result": {}}) + "\n")
+                p.stdin.flush()
+            elif obj.get("id") == rid:
+                return obj
+        return {"error": {"message": "timed out"}}
+
+    try:
+        init = call("initialize", {"protocolVersion": 1, "clientCapabilities": {
+            "fs": {"readTextFile": False, "writeTextFile": False}}})
+        if "error" in init:
+            print(f"initialize failed: {init['error']}", file=sys.stderr)
+            return 1
+        res = call("session/new", {"cwd": os.path.expanduser("~"), "mcpServers": []})
+        if "error" in res:
+            err = res["error"]
+            print(f"sign-in not completed: {err.get('message', err)}", file=sys.stderr)
+            methods = [m.get("id") for m in (init.get("result") or {}).get("authMethods") or []]
+            if methods:
+                print(f"agent auth methods: {', '.join(filter(None, methods))} — "
+                      "configure one in the agent's own settings/CLI, then retry.",
+                      file=sys.stderr)
+            return 1
+        print(f"OK — {e['label']} is signed in and ready. Select it in HAL-UI Settings.")
+        return 0
+    finally:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8900)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--login", metavar="ENGINE",
+                    help="one-time interactive sign-in for an ACP engine, then exit")
     args = ap.parse_args()
+    if args.login:
+        raise SystemExit(_engine_login(args.login.lower()))
     eng = _engine()
     bin_path = _engine_bin(eng["name"])
     if not (bin_path and Path(bin_path).exists()):
